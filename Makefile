@@ -10,8 +10,8 @@ ARCH ?= -march=native
 CXXFLAGS ?= -O3 $(ARCH) -std=c++17 -Wall -Wextra -pthread
 BIN = build
 LIB = include/hgln.hpp include/hgln_gate.h
-KERN = cuda/hgln_kernel.h cuda/hgln_host.h include/hgln_gate.h
-PTXFLAGS = -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version -O3 -Wall -Werror -Icuda -Iinclude -S
+KERN = cuda/hgln_kernel.h cuda/hgln_dims.h cuda/hgln_host.h include/hgln_gate.h
+PTXFLAGS = -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version -O3 -ffp-contract=off -Wall -Werror -Icuda -Iinclude -S
 all: $(BIN)/hgln_d $(BIN)/hgln_f $(BIN)/test_api $(BIN)/cuda_emu $(BIN)/cuda_emu_f
 $(BIN):
 	mkdir -p $(BIN)
@@ -25,7 +25,7 @@ $(BIN)/cuda_emu: cuda/cuda_emu.cpp $(KERN) $(LIB) | $(BIN)
 	$(CXX) -O2 -std=c++20 -pthread -Wno-psabi -Icuda -Iinclude $< -o $@
 $(BIN)/cuda_emu_f: cuda/cuda_emu.cpp $(KERN) $(LIB) | $(BIN)
 	$(CXX) -O2 -std=c++20 -pthread -Wno-psabi -DHG_REAL=float -Icuda -Iinclude $< -o $@
-ptx: cuda/hgln_ptx.cu $(KERN) | $(BIN)
+ptx: cuda/hgln_ptx.cu cuda/hgln_dims.h $(KERN) | $(BIN)
 	$(CLANG) $(PTXFLAGS) --cuda-gpu-arch=sm_70 cuda/hgln_ptx.cu -o $(BIN)/hgln.sm70.ptx
 	$(CLANG) $(PTXFLAGS) --cuda-gpu-arch=sm_80 cuda/hgln_ptx.cu -o $(BIN)/hgln.sm80.ptx
 	$(CLANG) $(PTXFLAGS) --cuda-gpu-arch=sm_70 -DHG_REAL=float cuda/hgln_ptx.cu -o $(BIN)/hgln_f.sm70.ptx

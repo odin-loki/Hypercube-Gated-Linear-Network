@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+From: Odin Loch
+Subject: [PATCH] gpu/cuda_hip: load and launch a caller's own modules
+
+FORGE's CUDA/HIP runtime only runs its own embedded kernels. Add a minimal public API so a caller (here HGLN)
+can load its own PTX / AMDGPU code object on the runtime's context and launch a kernel on the runtime's stream,
+under the runtime's lock and context binding:
+
+  load_module(image, &why) -> handle, module_function(m, name), unload_module(m)
+  max_dynamic_smem(), set_dynamic_smem(fn, bytes)   (CUDA opt-in above 48 KB)
+  launch_kernel(fn, grid[3], block[3], smem, args)  (through launch_s; wait() syncs)
+
+Modules still loaded are unloaded in ~runtime before the context is destroyed. The device handle from init()
+is kept (dev_) for the shared-memory attribute query. Against b135941680664502fec59924f51d3c3dc11e23e9.
+Apply with `patch -p1` from the FORGE root.
+
+diff -ru a/docs/gpu.md b/docs/gpu.md
+--- a/docs/gpu.md
++++ b/docs/gpu.md
+@@ -134,6 +134,7 @@
+ | `argmax_resident(p, n)` | Greedy decode: `forge_argmax` over a device-newer buffer, one `int` read back into page-locked memory (ties: lowest index); `-1` when not resident. Up to 128 blocks scan the buffer and the last one to finish merges their partials (a 248k vocabulary: ~10 µs, against ~85 µs for one block). Wired as the `device_hooks::argmax` hook: with a plain greedy sampler, `session::generate` asks the executor for the logits' argmax instead of downloading them |
+ | `capture_begin`, `capture_end`, `graph_launch` | User stream capture |
+ | `copy_to_peer`, `device_alloc`, `device_free`, `upload`, `download` | Raw device memory and peer copies (host-staged when the APIs differ) |
++| `load_module(image, &why)`, `module_function(m, name)`, `unload_module(m)`, `max_dynamic_smem()`, `set_dynamic_smem(fn, bytes)`, `launch_kernel(fn, grid, block, smem, args)` | A caller's own kernels: load its PTX / code object on the runtime's context and launch on the runtime's stream (`wait()` or a download syncs). Modules are unloaded with the runtime |
+ | `residency()`, `dispatches()`, `memory_pool()`, `charged_bytes()` | Statistics: uploads, downloads, resident and pooled bytes, evictions, per-kernel dispatch counts |
+ | `cuda_hip::counters()` | Process-wide driver call counters (launches, captured, graph launches, copies, syncs) read by `forge bench` and `tools/bench_llm.sh` |
+ 
+diff -ru a/gpu/include/forge/gpu/cuda.hpp b/gpu/include/forge/gpu/cuda.hpp
+--- a/gpu/include/forge/gpu/cuda.hpp
++++ b/gpu/include/forge/gpu/cuda.hpp
+@@ -181,6 +181,7 @@
+         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
+         if (stage_ && f_.host_free) f_.host_free(stage_);
+         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
++        if (f_.unload) for (void* m : user_mods_) f_.unload(m);
+         if (mod_ && f_.unload) f_.unload(mod_);
+         if (ctx_ && f_.ctx_destroy) { f_.ctx_destroy(ctx_); ctx_epoch().fetch_add(1, std::memory_order_acq_rel); }
+         if (lib_) dlclose(lib_);
+@@ -432,6 +433,47 @@
+     void upload(std::uint64_t d, const void* h, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(htod_s(d, h, bytes, stream_), "memcpy HtoD"); sync(); }
+     void download(void* h, std::uint64_t d, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(dtoh_s(h, d, bytes, stream_), "memcpy DtoH"); sync(); }
+ 
++    // Caller modules: run kernels that are not FORGE's own (an application's PTX / AMDGPU code object) on this
++    // runtime's context and stream, next to its own work. A module stays loaded until unload_module() or the
++    // runtime's destruction. Arguments are passed as cuLaunchKernel / hipModuleLaunchKernel take them.
++    // load_module: nullptr + reason when the driver rejects the image (e.g. PTX for a newer sm, another gfx).
++    void* load_module(std::string_view image, std::string* why = nullptr) {
++        std::lock_guard lk(mu_); bind();
++        std::string img(image);   // PTX text must be NUL-terminated
++        void* m = nullptr;
++        if (int r = f_.load(&m, img.data()); r != 0 || !m) { if (why) *why = std::string(api_name(api_)) + ": module load failed (" + std::to_string(r) + ")"; return nullptr; }
++        user_mods_.push_back(m); return m;
++    }
++    void unload_module(void* m) {
++        std::lock_guard lk(mu_); bind(); flush();
++        if (auto it = std::find(user_mods_.begin(), user_mods_.end(), m); it != user_mods_.end()) { user_mods_.erase(it); if (f_.unload) f_.unload(m); }
++    }
++    void* module_function(void* m, const std::string& name) {   // nullptr when the module has no such kernel
++        std::lock_guard lk(mu_); bind();
++        void* f = nullptr; return f_.get_fn(&f, m, name.c_str()) == 0 ? f : nullptr;
++    }
++    // Most dynamic shared memory one block can be given: CUDA's opt-in limit (48 KB when the driver cannot say);
++    // HIP: 64 KB, the LDS per workgroup of current AMD GPUs.
++    std::size_t max_dynamic_smem() {
++        if (api_ != api::cuda) return 64 << 10;
++        std::lock_guard lk(mu_); bind();
++        int v = 0;
++        if (f_.dev_attr && f_.dev_attr(&v, 97 /* MAX_SHARED_MEMORY_PER_BLOCK_OPTIN */, dev_) == 0 && v > 0) return std::size_t(v);
++        return 48 << 10;
++    }
++    // Let fn launch with `bytes` of dynamic shared memory (CUDA: cuFuncSetAttribute above 48 KB). false = not possible.
++    bool set_dynamic_smem(void* fn, std::size_t bytes) {
++        if (bytes > max_dynamic_smem()) return false;
++        if (api_ != api::cuda || bytes <= (48u << 10)) return true;
++        std::lock_guard lk(mu_); bind();
++        return f_.func_attr && f_.func_attr(fn, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(bytes)) == 0;
++    }
++    // Queue fn on the runtime's stream; wait() (or a download) blocks until it has run. Throws on a launch error.
++    void launch_kernel(void* fn, const unsigned grid[3], const unsigned block[3], unsigned smem, void** args) {
++        std::lock_guard lk(mu_); bind(); begin_op();
++        ck(launch_s(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], smem, stream_, args, nullptr), "launch");
++    }
++
+     // Quantised matmul_t (forge_qmatmul_t): y[rows, cols] = x[rows, k] . W[cols, k]^T with W in its encoded rows
+     // (fmt 1 q8_0, 2 q4_k, 3 q6_k, 4 q5_k; rb bytes per row). The encoded weight is uploaded once and stays on the
+     // device for the runtime's lifetime (keyed by host address and size); x/out follow the residency protocol.
+@@ -1587,6 +1629,7 @@
+         if (ordinal_ < 0 || ordinal_ >= n) return "device ordinal " + std::to_string(ordinal_) + " out of range (" + std::to_string(n) + " devices)";
+         int dev = ordinal_;
+         if (api_ == api::cuda && f_.device_get && f_.device_get(&dev, ordinal_) != 0) return "cuDeviceGet failed";
++        dev_ = dev;
+         char buf[256] = {}; f_.name(buf, sizeof buf, dev); name_ = buf;
+         if (int v = 0; api_ == api::cuda && f_.dev_attr && f_.dev_attr(&v, 16 /* MULTIPROCESSOR_COUNT */, dev) == 0 && v > 0) sms_ = unsigned(v);
+         if (api_ == api::cuda) {
+@@ -1611,7 +1654,8 @@
+     api api_;
+     unsigned sms_ = 80;   // streaming multiprocessors (sizes split-K); 80 when the driver cannot say
+     unsigned sms() const { return sms_; }
+-    int ordinal_ = 0;
++    int ordinal_ = 0, dev_ = 0;   // dev_: the driver's device handle (CUDA) / ordinal (HIP)
++    std::vector<void*> user_mods_;   // load_module()
+     void* lib_ = nullptr; void* ctx_ = nullptr; void* mod_ = nullptr; void* stream_ = nullptr;
+     fns f_;
+     std::string name_, arch_;
