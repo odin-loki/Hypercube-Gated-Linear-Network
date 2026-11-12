@@ -1,0 +1,51 @@
+// cuda_emu.cpp - runs the CUDA kernel source on the CPU (each block = a set of std::threads with a barrier) and
+// compares it with the reference C++ network. Tests the kernel's arithmetic, indexing, phase ordering and (to the
+// extent a run can show) its synchronisation. It does NOT test CUDA compilation or GPU behaviour.
+//   cuda_emu d nets T threads
+#define HGLN_EMULATE
+#include <barrier>
+#include <thread>
+#include <memory>
+#include <cstdio>
+#include <cstdlib>
+static thread_local int hg_tid_v = 0, hg_nt_v = 1, hg_bid_v = 0;
+static thread_local std::barrier<>* hg_bar = nullptr;
+#define HG_KERNEL static
+#define HG_DEV static inline
+#define HG_HD
+#define HG_TID (hg_tid_v)
+#define HG_NT (hg_nt_v)
+#define HG_BID (hg_bid_v)
+#define HG_SYNC() hg_bar->arrive_and_wait()
+#include "hgln_host.h"
+using hgln::Net;
+int main(int argc, char** argv) {
+  int d = argc > 1 ? atoi(argv[1]) : 8, nets = argc > 2 ? atoi(argv[2]) : 3, T = argc > 3 ? atoi(argv[3]) : 1500, NT = argc > 4 ? atoi(argv[4]) : 8;
+  HgDims g = hg_dims(d); hgln::Rng rng(12345);
+  std::vector<hreal> X((size_t)T * d), Y((size_t)nets * T);
+  for (int t = 0; t < T; t++) {
+    for (int i = 0; i < d; i++) X[(size_t)t * d + i] = 2 * rng.uni() - 1;
+    hreal y = std::sin(3 * X[(size_t)t * d]) * std::cos(2 * X[(size_t)t * d + 1]) + 0.5 * X[(size_t)t * d + 2 % d] * X[(size_t)t * d + 3 % d];
+    for (int n = 0; n < nets; n++) Y[(size_t)n * T + t] = n % 3 == 0 ? y : (n % 3 == 1 ? -y : 0.5 * y);   // different targets per network
+  }
+  hgln::Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05);
+  std::vector<Net<hreal>> init(nets), ref(nets);
+  for (int n = 0; n < nets; n++) { init[n].init(d, 7 + n, prm); ref[n] = init[n]; }
+  HgHostState st; hg_pack(g, init, st);
+  std::vector<hreal> P((size_t)nets * T);
+  for (int b = 0; b < nets; b++) {                          // blocks run one after another; threads inside a block run concurrently
+    std::barrier<> bar(NT); std::vector<std::thread> th;
+    for (int k = 0; k < NT; k++) th.emplace_back([&, k] {
+      hg_tid_v = k; hg_nt_v = NT; hg_bid_v = b; hg_bar = &bar;
+      hgln_run(g, st.H.data(), st.p.data(), st.W.data(), st.M.data(), st.A.data(), st.m.data(), st.scratch.data(),
+               X.data(), Y.data(), P.data(), st.t.data(), T, (hreal)prm.glr0, (hreal)prm.glr1, (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm); });
+    for (auto& t : th) t.join();
+  }
+  double worstP = 0, worstS = 0;
+  for (int n = 0; n < nets; n++) {
+    for (int t = 0; t < T; t++) { hreal pr = ref[n].predict(&X[(size_t)t * d]); ref[n].learn(Y[(size_t)n * T + t]); worstP = std::max(worstP, std::fabs((double)pr - (double)P[(size_t)n * T + t])); }
+    worstS = std::max(worstS, hg_state_diff(g, st, n, ref[n]));
+  }
+  printf("cuda_emu d=%d nets=%d T=%d threads=%d real=%s: max |prediction diff| = %.3g, max |state diff| = %.3g\n", d, nets, T, NT, sizeof(hreal) == 4 ? "float32" : "float64", worstP, worstS);
+  return 0;
+}
