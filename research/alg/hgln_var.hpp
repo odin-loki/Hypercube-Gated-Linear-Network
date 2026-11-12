@@ -35,7 +35,9 @@ struct Var {
   double theta = 0;          // > 0: Schmitt-trigger flip-flop gates: set = sig(12(z-theta)), reset = sig(12(-z-theta)),
                              //      a = set + (1 - set - reset) a_prev  (theta = 0 is exactly the stateless gate)
   int gate_err = 0, rule_err = 0;  // error that drives the gate steps / the rule steps: 0 mixed es, 1 own (local), 2 global
-  bool credit = false;       // cross-layer latch: route the held part's gradient back to the lower layer's bit
+  bool credit = false;
+  double credit_scale = 1;   // strength of the routed latch credit
+  double glr_scale = 1;      // multiplies the gate learning-rate schedule (glr0, glr1)       // cross-layer latch: route the held part's gradient back to the lower layer's bit
   int theta_mode = 0;        // 0: theta for every bit; 1: only odd units latched (mixed population); 2: theta learned per bit;
                              // 3: stateless settled latch a = set/(set+reset); 4: stateless cross-layer latch (previous state =
                              //    the same unit's bit in the layer this one reads from, same sample; layer 1 stateless)
@@ -186,7 +188,7 @@ struct Layer {
         cb[b] = std::min(std::max(gl * eg_gate * g, -0.05), 0.05);
         if (V.credit && credit_sink) {   // the held part of this bit is the lower layer's decision: credit it there
           const size_t ib = (size_t)k * K + b;
-          const double gl2 = 12 * credit_kap[ib] * dm * hold[ib];
+          const double gl2 = V.credit_scale * 12 * credit_kap[ib] * dm * hold[ib];
           credit_sink[ib] += std::min(std::max(gl * eg_gate * gl2, -0.05), 0.05);
         }
       }
@@ -307,7 +309,7 @@ struct Net {
     return out;
   }
   void learn(double y) {
-    int G = V.layers * V.U; double gl = V.glr1 + (V.glr0 - V.glr1) * std::exp(-(double)t / V.tau), sr2 = 0;
+    int G = V.layers * V.U; double gl = V.glr_scale * (V.glr1 + (V.glr0 - V.glr1) * std::exp(-(double)t / V.tau)), sr2 = 0;
     for (int i = 0; i < G; i++) sr2 += r[i] * r[i];
     std::vector<double> es(G);
     for (int i = 0; i < G; i++) es[i] = (1 - V.glob) * (y - o[i]) + V.glob * (y - out) * r[i] / sr2;
