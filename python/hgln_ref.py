@@ -153,15 +153,18 @@ class HC2(HC):
         s.bu[s.bi] = s.u; s.be[s.bi] = np.abs(e); s.bi = (s.bi + 1) % 64
 
 class HGLN:
-    """3 hidden layers of Wd units (no separate readout). Prediction = competitive mixture over all 3*Wd units."""
-    def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512, competence=True):
+    """3 hidden layers of Wd units (no separate readout). Prediction = competitive mixture over all 3*Wd units.
+    fanout=True: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 both fed by layer 1)."""
+    def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512, competence=True, fanout=False):
         r = np.random.default_rng(seed)
         s.L = [HC2(Wd, d, 16, d, r, glr0), HC2(Wd, Wd, 16, d, r, glr0), HC2(Wd, Wd, 16, d, r, glr0)]
         s.Wd, s.glr0, s.glr1, s.tau, s.mu, s.glob, s.warm, s.t = Wd, glr0, glr1, tau, mu, glob, warm, 0
         s.competence = competence   # False: version 4.3, plain average of the units (no competence weighting)
+        s.fanout = fanout
     def predict(s, x):
-        x = np.asarray(x, float); u = feat(x); a = x
-        for L in s.L: a = L.forward(a, u)
+        x = np.asarray(x, float); u = feat(x)
+        a1 = s.L[0].forward(x, u); a2 = s.L[1].forward(a1, u)
+        s.L[2].forward(a1 if s.fanout else a2, u)
         s.o = np.concatenate([L.pred for L in s.L])
         if s.competence:
             comp = np.concatenate([L.comp() for L in s.L])

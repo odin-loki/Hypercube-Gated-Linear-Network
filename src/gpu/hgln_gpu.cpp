@@ -120,7 +120,7 @@ template <class T> long Bank<T>::samples_seen(std::size_t n) const { return p_ &
 
 static bool same_params(const Params& a, const Params& b) {
   return a.glr0 == b.glr0 && a.glr1 == b.glr1 && a.tau == b.tau && a.glob == b.glob && a.mu == b.mu && a.warm == b.warm &&
-         a.competence == b.competence;
+         a.competence == b.competence && a.units == b.units && a.fanout == b.fanout;
 }
 
 template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::string* why) {
@@ -133,6 +133,8 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
     if (n.d != d) return fail(why, "all networks must have the same d");
     if (!same_params(n.P, nets[0].P)) return fail(why, "all networks must have the same Params (the kernel takes them once)");
   }
+  if (nets[0].P.units != 16 || nets[0].P.fanout)
+    return fail(why, "the GPU kernel supports only Params::units = 16 with fanout off so far");
   const HgDims g = hg_dims(d);
   const std::size_t N = nets.size(), smem = (std::size_t)g.scs * sizeof(T);
   // dense layout (cuda/hgln_dims.h), exactly as hg_pack in cuda/hgln_host.h: raw (unnormalised) hyperplanes and their

@@ -2,7 +2,7 @@
 // hgln_simd.hpp - run-time SIMD dispatch for HGLN's per-sample layer kernels (CMake build with FORGE only).
 // Copyright (C) Odin Loch. Licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).
 //
-// The layer kernels (Layer<T>::forward_k / update_k in hgln.hpp) are compiled once per CPU target in
+// The layer kernels (Layer<T>::gates_k / rules_k / update_k in hgln.hpp, one instance per unit count) are compiled once per CPU target in
 // src/simd/kernels_<target>.cpp, each with that target's flags and -ffp-contract=off. One table of function pointers
 // is chosen for the process on first use, from FORGE's selection (forge::simd::active(): the best target this CPU
 // and OS support, or FORGE_SIMD_TARGET=scalar|avx2|avx512|neon|sve|rvv if that one is usable here). Every table
@@ -18,9 +18,11 @@ template <class T> struct Layer;
 template <class T> struct LayerWork;
 
 namespace simd {
+// One entry per unit count U = 8, 12, 16 (index hgln::unit_index(U)). gates + rules = the layer's forward pass.
 template <class T> struct LayerKernels {
-  void (*forward)(const Layer<T>&, const T* in, const T* u, LayerWork<T>& w, T* xg);
-  void (*update)(Layer<T>&, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w);
+  void (*gates[3])(const Layer<T>&, const T* u, LayerWork<T>& w);
+  void (*rules[3])(const Layer<T>&, const T* in, LayerWork<T>& w, T* xg);
+  void (*update[3])(Layer<T>&, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w);
 };
 struct Table {
   const char* target;                   // "scalar", "avx2", "avx512", "neon", "sve", "rvv"

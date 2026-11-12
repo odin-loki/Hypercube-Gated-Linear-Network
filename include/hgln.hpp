@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// hgln.hpp - Hypercube Gated Linear Network (HGLN v4.2). Header-only C++17, no dependencies beyond the standard library.
+// hgln.hpp - Hypercube Gated Linear Network (HGLN v4.3). Header-only C++17, no dependencies beyond the standard library.
 // Stateless online learner: call predict(x) then learn(y) once per sample.
 // Copyright (C) Odin Loch. Licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).
 //
 // Implementation notes (version 4.2-opt; details and measurements in docs/OPTIMISATION.md). The algorithm is the
 // reference procedure (docs/TGN_impl_spec.md section 4); the data layout is built for SIMD:
-//   * Per-unit work (gates, heatmap, mixture, competence, gate gradients) runs for all 16 units of a layer at once,
+//   * Per-unit work (gates, heatmap, mixture, competence, gate gradients) runs for all U units of a layer at once,
 //     one unit per vector lane: H is [input][hyperplane][unit], p is [input][unit], m is [corner][unit].
+//     U = Params::units (8, 12 or 16) is a run-time value; the kernels are instantiated per U (no padded lanes).
+//   * Per sample, the gates of all three layers (they depend only on the input) run first, then the three
+//     sequential rule stages (Net::infer); with Params::fanout, layers 2 and 3 both read layer 1.
 //   * W is [unit][active column][corner]: the 16 rule dot products of a unit are one 16-wide accumulator.
 //   * After the one-off prune the inactive columns are removed from W (about 40% less work and memory), and the
 //     activity trace A, which only feeds the prune, is freed.
@@ -29,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -40,7 +44,9 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define HGLN_RESTRICT __restrict__
 #define HGLN_INLINE inline __attribute__((always_inline))
+#define HGLN_NOINLINE __attribute__((noinline))
 #else
+#define HGLN_NOINLINE
 #define HGLN_RESTRICT
 #define HGLN_INLINE inline
 #endif
@@ -164,9 +170,10 @@ template <class T> struct LayerWork {
 template <class T> struct Work {
   detail::ABuf<T> u, tmp;                                    // side information (d+1); gather/step temp (max(N1, D))
   LayerWork<T> lw[3];
-  T o[48], r[48], out = 0;
+  detail::ABuf<T> o, r;                                      // the 3U unit predictions and their mixture weights
+  T out = 0;
   template <class NetT> void init(const NetT& net) {
-    u.assign(net.d + 1, 0);
+    u.assign(net.d + 1, 0); o.assign(3 * net.L[0].U, 0); r.assign(3 * net.L[0].U, 0);
     int mx = net.d + 1;
     for (int l = 0; l < 3; l++) { lw[l].init(net.L[l].N1, net.L[l].U); mx = std::max(mx, net.L[l].N1); }
     tmp.assign(mx, 0);
@@ -215,18 +222,67 @@ template <class T, int N> inline Vec<T, N> vzero() { Vec<T, N> r; for (int i = 0
 #endif
 // The 16-lane vector policy the layer kernels are written against (Layer::forward_k / update_k). The SIMD backend
 // (src/simd/) instantiates the same kernels once per CPU target with its own policy.
+// V/load/store/zero: the 16-lane vectors of the corner-lane work (rule dot products; 16 corners). L<N>: N-lane
+// vectors of the unit-lane work (N = the lane block VB of UnitOps below).
 template <class T> struct VxOps {
   typedef Vec<T, 16> V;
   static HGLN_INLINE V load(const T* p) { return vload<T, 16>(p); }
   static HGLN_INLINE void store(T* p, const V& v) { vstore<T, 16>(p, v); }
   static HGLN_INLINE V zero() { return vzero<T, 16>(); }
+  template <int N> struct L {
+    typedef T S; typedef Vec<T, N> V;
+    static HGLN_INLINE V load(const T* p) { return vload<T, N>(p); }
+    static HGLN_INLINE void store(T* p, const V& v) { vstore<T, N>(p, v); }
+    static HGLN_INLINE V zero() { return vzero<T, N>(); }
+  };
+};
+// Two vectors side by side (lanes [0, NA) in a, [NA, NA + NB) in b), element-wise arithmetic: each lane's operations
+// are unchanged. Used for unit counts that are not a power of two (12 = 8 + 4).
+template <class A, class B> struct Pair {
+  typedef typename A::S S;
+  typename A::V a; typename B::V b;
+#define HGLN_PAIR_OP(op)                                                                                              \
+  friend HGLN_INLINE Pair operator op(const Pair& x, const Pair& y) { Pair o; o.a = x.a op y.a; o.b = x.b op y.b; return o; } \
+  friend HGLN_INLINE Pair operator op(const Pair& x, S s) { Pair o; o.a = x.a op s; o.b = x.b op s; return o; }               \
+  friend HGLN_INLINE Pair operator op(S s, const Pair& y) { Pair o; o.a = s op y.a; o.b = s op y.b; return o; }               \
+  friend HGLN_INLINE Pair& operator op##=(Pair& x, const Pair& y) { x.a = x.a op y.a; x.b = x.b op y.b; return x; }
+  HGLN_PAIR_OP(+) HGLN_PAIR_OP(-) HGLN_PAIR_OP(*) HGLN_PAIR_OP(/)
+#undef HGLN_PAIR_OP
+};
+// The unit-lane vectors of a layer with UU units, so that no lane is padding and the accumulators stay in registers:
+// a power of two (8, 16) is one policy vector; otherwise the largest power of two below UU plus the rest
+// (12 = 8 + 4), processed together (measured: float32 d=64 about 10% faster than three 4-lane blocks, float64 equal).
+template <int UU> constexpr int low_pow2(int x = UU) { return x & (x - 1) ? low_pow2<UU>(x & (x - 1)) : x; }   // highest bit
+template <class O, int UU, bool P2 = ((UU & (UU - 1)) == 0)> struct UnitOps {
+  typedef typename O::template L<UU> B;
+  typedef typename B::V V;
+  static HGLN_INLINE V load(const typename B::S* p) { return B::load(p); }
+  static HGLN_INLINE void store(typename B::S* p, const V& v) { B::store(p, v); }
+  static HGLN_INLINE V zero() { return B::zero(); }
+};
+template <class O, int UU> struct UnitOps<O, UU, false> {
+  static constexpr int NA = low_pow2<UU>();
+  typedef typename O::template L<NA> A;
+  static constexpr int NR = UU - NA;
+  typedef UnitOps<O, NR> R;
+  struct RB { typedef typename A::S S; typedef typename R::V V; };
+  typedef Pair<A, RB> V;
+  static HGLN_INLINE V load(const typename A::S* p) { V v; v.a = A::load(p); v.b = R::load(p + NA); return v; }
+  static HGLN_INLINE void store(typename A::S* p, const V& v) { A::store(p, v.a); R::store(p + NA, v.b); }
+  static HGLN_INLINE V zero() { V v; v.a = A::zero(); v.b = R::zero(); return v; }
 };
 }  // namespace detail
+
+// Units per layer (Params::units): one of these. Layers 2 and 3 take the previous layer's U outputs as inputs.
+constexpr int kUnitChoices[3] = {8, 12, 16};
+constexpr int kMaxUnits = 16;
+inline bool valid_units(int u) { return u == 8 || u == 12 || u == 16; }
+inline int unit_index(int u) { return u == 8 ? 0 : (u == 12 ? 1 : 2); }   // index into the per-U kernel entries
 
 // One layer: U units; each unit = 4 hyperplanes -> 16-corner heatmap -> 16 linear rules blended by the heatmap.
 template <class T> struct Layer {
   static constexpr T BETA = 12;
-  static constexpr int U = 16;                               // units per layer
+  int U = 16;                                                // units per layer (8, 12 or 16; Params::units)
   int n = 0, D = 0, N1 = 0;                                  // inputs, side-info size (d+1), inputs+bias
   int nt = 0;                                                // prune target: active inputs kept per unit
   int cs = 0;                                                // column stride of W / cols (max active columns per unit)
@@ -241,8 +297,9 @@ template <class T> struct Layer {
   detail::ABuf<int32_t> cols;                                // U x cs      active column index (ascending, bias last)
   detail::ABuf<int32_t> ncol;                                // U           number of active columns incl. bias
 
-  void init(int n_, int D_, bool competence_ = false) {
-    n = n_; D = D_; N1 = n + 1; cs = N1; pruned = false; has_competence = competence_;
+  void init(int n_, int D_, bool competence_ = false, int units = 16) {
+    if (!valid_units(units)) throw std::invalid_argument("hgln: units per layer must be 8, 12 or 16");
+    U = units; n = n_; D = D_; N1 = n + 1; cs = N1; pruned = false; has_competence = competence_;
     nt = n <= 4 ? n : (int)std::nearbyint(0.6 * n);
     H.assign((size_t)D * U * 4, 0); p.assign((size_t)D * U, 1); W.assign((size_t)U * cs * 16, 0);
     q.assign(4 * U, 1); nq.assign(4 * U, 1); rs.assign(4 * U, 1);
@@ -338,51 +395,77 @@ template <class T> struct Layer {
     return (H.size() + q.size() + nq.size() + rs.size() + p.size() + W.size() + m.size() + A.size()) * sizeof(T) + (cols.size() + ncol.size()) * sizeof(int32_t);
   }
 
-  // ---- [SIMD hook] With HGLN_WITH_FORGE, forward/update call the kernels compiled for this CPU (hgln_simd.hpp,
-  // chosen once at run time); otherwise, and inside the kernel TUs, they are the inline kernels below.
+  // ---- [SIMD hook] With HGLN_WITH_FORGE, gates/rules/update call the kernels compiled for this CPU (hgln_simd.hpp,
+  // chosen once at run time); otherwise, and inside the kernel TUs, they are the inline kernels below. Either way
+  // the kernel is picked once per call by U (template argument UU = U).
+  // forward = gates (depend only on the side information u) then rules (depend on the previous layer's outputs).
 #if defined(HGLN_WITH_FORGE) && !defined(HGLN_SIMD_KERNEL_TU)
-  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg) const { simd::layer_kernels<T>().forward(*this, in, u, w, xg); }
-  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { simd::layer_kernels<T>().update(*this, y, mu, glr, es, u, w); }
+  void gates(const T* u, LayerWork<T>& w) const { simd::layer_kernels<T>().gates[unit_index(U)](*this, u, w); }
+  void rules(const T* in, LayerWork<T>& w, T* xg) const { simd::layer_kernels<T>().rules[unit_index(U)](*this, in, w, xg); }
+  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { simd::layer_kernels<T>().update[unit_index(U)](*this, y, mu, glr, es, u, w); }
 #else
-  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg) const { forward_k<detail::VxOps<T>>(in, u, w, xg); }
-  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { update_k<detail::VxOps<T>>(y, mu, glr, es, u, w); }
+  void gates(const T* u, LayerWork<T>& w) const {
+    switch (U) { case 8: gates_k<detail::VxOps<T>, 8>(u, w); break; case 12: gates_k<detail::VxOps<T>, 12>(u, w); break; default: gates_k<detail::VxOps<T>, 16>(u, w); }
+  }
+  void rules(const T* in, LayerWork<T>& w, T* xg) const {
+    switch (U) { case 8: rules_k<detail::VxOps<T>, 8>(in, w, xg); break; case 12: rules_k<detail::VxOps<T>, 12>(in, w, xg); break; default: rules_k<detail::VxOps<T>, 16>(in, w, xg); }
+  }
+  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) {
+    switch (U) {
+      case 8: update_k<detail::VxOps<T>, 8>(y, mu, glr, es, u, w); break;
+      case 12: update_k<detail::VxOps<T>, 12>(y, mu, glr, es, u, w); break;
+      default: update_k<detail::VxOps<T>, 16>(y, mu, glr, es, u, w);
+    }
+  }
 #endif
+  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg) const { gates(u, w); rules(in, w, xg); }
 
-  // Forward pass for all units. in: n inputs; u: D side-information values; xg: scratch of at least N1.
-  // Lane = unit for everything except the rule dot products (lane = corner). O: 16-lane vector policy (VxOps).
-  template <class O> void forward_k(const T* HGLN_RESTRICT in, const T* HGLN_RESTRICT u, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
-    typedef typename O::V V16;
+  // Forward pass for all units = gates_k then rules_k. in: n inputs; u: D side-information values; xg: scratch of at
+  // least N1. Lane = unit for everything except the rule dot products (lane = corner). O: vector policy (VxOps);
+  // UU: compile-time copy of U (unit-lane work runs on detail::UnitOps<O, UU>, corner-lane work on O::V).
+  template <class O, int UU> HGLN_INLINE void forward_k(const T* HGLN_RESTRICT in, const T* HGLN_RESTRICT u, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
+    gates_k<O, UU>(u, w); rules_k<O, UU>(in, w, xg);
+  }
+  // Gates and heatmap: depend only on u, so all layers' gates can run before any rule stage (Net::infer).
+  template <class O, int UU> HGLN_NOINLINE void gates_k(const T* HGLN_RESTRICT u, LayerWork<T>& w) const {
+    typedef detail::UnitOps<O, UU> Q; typedef typename Q::V VU;
+    // gates: z_b = (H_b . (p * u)) / |H_b| with the stored, unnormalised H_b, i ascending; |p * u|^2 for the update
+    VU z0 = Q::zero(), z1 = z0, z2 = z0, z3 = z0, pp = z0;
+    for (int i = 0; i < D; i++) {
+      const T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * UU];
+      const VU pu = Q::load(&p[(size_t)i * UU]) * u[i];
+      z0 += Q::load(Hi) * pu; z1 += Q::load(Hi + UU) * pu;
+      z2 += Q::load(Hi + 2 * UU) * pu; z3 += Q::load(Hi + 3 * UU) * pu;
+      pp += pu * pu;
+    }
+    gates_finish_k<O, UU>(z0, z1, z2, z3, pp, w);
+  }
+  template <class O, int UU, class VU> HGLN_INLINE void gates_finish_k(const VU& z0, const VU& z1, const VU& z2, const VU& z3, const VU& pp, LayerWork<T>& w) const {
+    typedef detail::UnitOps<O, UU> Q;
+    T* HGLN_RESTRICT zz = w.zn.data();
+    Q::store(zz, z0 * Q::load(&rs[0])); Q::store(zz + UU, z1 * Q::load(&rs[UU]));
+    Q::store(zz + 2 * UU, z2 * Q::load(&rs[2 * UU])); Q::store(zz + 3 * UU, z3 * Q::load(&rs[3 * UU]));
+    Q::store(w.pp.data(), pp);
+    T* HGLN_RESTRICT aw = w.a.data();
+    for (int q = 0; q < 4 * UU; q++) aw[q] = hgln_gate<T>(zz[q]);                 // 4U gates, [b][unit]
+    // 16-corner heatmap h[c] as a tensor product; same multiplication order as the reference (bit 0 first)
+    const VU a0 = Q::load(aw), a1 = Q::load(aw + UU), a2 = Q::load(aw + 2 * UU), a3 = Q::load(aw + 3 * UU);
+    const VU one = Q::zero() + (T)1;
+    const VU b0 = one - a0, b1 = one - a1, b2 = one - a2, b3 = one - a3;
+    VU q1[4] = {b0 * b1, a0 * b1, b0 * a1, a0 * a1}, q2[8];
+    for (int c = 0; c < 4; c++) { q2[c] = q1[c] * b2; q2[c + 4] = q1[c] * a2; }
+    T* HGLN_RESTRICT h = w.h.data();
+    for (int c = 0; c < 8; c++) { Q::store(h + c * UU, q2[c] * b3); Q::store(h + (c + 8) * UU, q2[c] * a3); }
+  }
+  // Rule stage: rule outputs, the unit mixture of the 16 rules, the competence and the clipped unit predictions.
+  template <class O, int UU> HGLN_NOINLINE void rules_k(const T* HGLN_RESTRICT in, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
+    typedef typename O::V V16; typedef detail::UnitOps<O, UU> Q; typedef typename Q::V VU;
     T* HGLN_RESTRICT inp = w.inp.data();
     for (int j = 0; j < n; j++) inp[j] = in[j];
     inp[n] = 1;
-    // gates: z_b = (H_b . (p * u)) / |H_b| with the stored, unnormalised H_b, i ascending; |p * u|^2 for the update
-    V16 z0 = O::zero(), z1 = z0, z2 = z0, z3 = z0, pp = z0;
-    for (int i = 0; i < D; i++) {
-      const T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U];
-      const V16 pu = O::load(&p[(size_t)i * U]) * u[i];
-      z0 += O::load(Hi) * pu; z1 += O::load(Hi + U) * pu;
-      z2 += O::load(Hi + 2 * U) * pu; z3 += O::load(Hi + 3 * U) * pu;
-      pp += pu * pu;
-    }
-    T* HGLN_RESTRICT zz = w.zn.data();
-    O::store(zz, z0 * O::load(&rs[0])); O::store(zz + U, z1 * O::load(&rs[U]));
-    O::store(zz + 2 * U, z2 * O::load(&rs[2 * U])); O::store(zz + 3 * U, z3 * O::load(&rs[3 * U]));
-    O::store(w.pp.data(), pp);
-    T* HGLN_RESTRICT aw = w.a.data();
-    for (int q = 0; q < 4 * U; q++) aw[q] = hgln_gate<T>(zz[q]);                  // 64 gates, [b][unit]
-    // 16-corner heatmap h[c] as a tensor product; same multiplication order as the reference (bit 0 first)
-    {
-      const V16 a0 = O::load(aw), a1 = O::load(aw + U), a2 = O::load(aw + 2 * U), a3 = O::load(aw + 3 * U);
-      const V16 one = O::zero() + (T)1;
-      const V16 b0 = one - a0, b1 = one - a1, b2 = one - a2, b3 = one - a3;
-      V16 q1[4] = {b0 * b1, a0 * b1, b0 * a1, a0 * a1}, q2[8];
-      for (int c = 0; c < 4; c++) { q2[c] = q1[c] * b2; q2[c + 4] = q1[c] * a2; }
-      T* HGLN_RESTRICT h = w.h.data();
-      for (int c = 0; c < 8; c++) { O::store(h + c * U, q2[c] * b3); O::store(h + (c + 8) * U, q2[c] * a3); }
-    }
     // rule outputs f[c][unit]: per unit, gather the active inputs and run 16 dot products as one corner-lane accumulator
     T* HGLN_RESTRICT f = w.f.data();
-    for (int k = 0; k < U; k++) {
+    for (int k = 0; k < UU; k++) {
       const int nc = ncol[k]; const int32_t* HGLN_RESTRICT ck = &cols[(size_t)k * cs];
       T x2 = 0;
       for (int q = 0; q < nc; q++) { T v = inp[ck[q]]; xg[q] = v; x2 += v * v; }
@@ -392,42 +475,42 @@ template <class T> struct Layer {
       for (int q = 0; q < nc; q++) acc += O::load(Wk + q * 16) * xg[q];
       alignas(64) T fa[16];
       O::store(fa, acc);
-      for (int c = 0; c < 16; c++) f[c * U + k] = fa[c];
+      for (int c = 0; c < 16; c++) f[c * UU + k] = fa[c];
     }
     // mixture of the 16 rules (and, with competence, the competence-weighted confidence), all units at once
     const T* HGLN_RESTRICT h = w.h.data();
-    V16 mix = O::zero(), cm = mix;
+    VU mix = Q::zero(), cm = mix;
     if (has_competence) {
-      for (int c = 0; c < 16; c++) { const V16 hc = O::load(h + c * U); mix += hc * O::load(f + c * U); cm += hc * O::load(&m[c * U]); }
-      O::store(w.comp.data(), (O::zero() + (T)1) / (cm + (T)1e-3));
+      for (int c = 0; c < 16; c++) { const VU hc = Q::load(h + c * UU); mix += hc * Q::load(f + c * UU); cm += hc * Q::load(&m[c * UU]); }
+      Q::store(w.comp.data(), (Q::zero() + (T)1) / (cm + (T)1e-3));
     } else {
-      for (int c = 0; c < 16; c++) mix += O::load(h + c * U) * O::load(f + c * U);
+      for (int c = 0; c < 16; c++) mix += Q::load(h + c * UU) * Q::load(f + c * UU);
     }
-    alignas(64) T mx[U];
-    O::store(mx, mix);
-    for (int k = 0; k < U; k++) w.pred[k] = clipv(mx[k], (T)-2, (T)2);
+    alignas(64) T mx[UU];
+    Q::store(mx, mix);
+    for (int k = 0; k < UU; k++) w.pred[k] = clipv(mx[k], (T)-2, (T)2);
   }
 
-  template <class O> void update_k(T y, T mu, T glr, const T* HGLN_RESTRICT es, const T* HGLN_RESTRICT u, const LayerWork<T>& w) {
-    typedef typename O::V V16;
+  template <class O, int UU> HGLN_NOINLINE void update_k(T y, T mu, T glr, const T* HGLN_RESTRICT es, const T* HGLN_RESTRICT u, const LayerWork<T>& w) {
+    typedef typename O::V V16; typedef detail::UnitOps<O, UU> Q; typedef typename Q::V VU;
     const T* HGLN_RESTRICT inp = w.inp.data(); const T* HGLN_RESTRICT h = w.h.data(); const T* HGLN_RESTRICT f = w.f.data();
-    const V16 esv = O::load(es);
+    const VU esv = Q::load(es);
     // competence map: m[c] += 0.02 * h[c] * (e^2 - m[c]), e = the unit's own error
     if (has_competence) {
-      const V16 e = (O::zero() + y) - O::load(w.pred.data()), e2 = e * e;
+      const VU e = (Q::zero() + y) - Q::load(w.pred.data()), e2 = e * e;
       for (int c = 0; c < 16; c++) {
-        T* HGLN_RESTRICT mc = &m[c * U];
-        const V16 mv = O::load(mc);
-        O::store(mc, mv + (T)0.02 * O::load(h + c * U) * (e2 - mv));
+        T* HGLN_RESTRICT mc = &m[c * UU];
+        const VU mv = Q::load(mc);
+        Q::store(mc, mv + (T)0.02 * Q::load(h + c * UU) * (e2 - mv));
       }
     }
     // gate gradient: F1_b = sum over corners with bit b set of h*f, F0_b = tot - F1_b (c ascending, as the reference)
-    alignas(64) T cbs[4][U];                                                      // gate steps [b][unit]
-    alignas(64) T c2s[U];
+    alignas(64) T cbs[4][UU];                                                     // gate steps [b][unit]
+    alignas(64) T c2s[UU];
     {
-      V16 tot = O::zero(), F1[4] = {tot, tot, tot, tot}, h2 = tot;
+      VU tot = Q::zero(), F1[4] = {tot, tot, tot, tot}, h2 = tot;
       for (int c = 0; c < 16; c++) {
-        const V16 hc = O::load(h + c * U), hf = hc * O::load(f + c * U);
+        const VU hc = Q::load(h + c * UU), hf = hc * Q::load(f + c * UU);
         tot += hf; h2 += hc * hc;
         if (c & 1) F1[0] += hf;
         if (c & 2) F1[1] += hf;
@@ -436,19 +519,19 @@ template <class T> struct Layer {
       }
       const T* HGLN_RESTRICT aw = w.a.data();
       for (int b = 0; b < 4; b++) {
-        const V16 ab = O::load(aw + b * U), F0 = tot - F1[b];
-        const V16 g = BETA * (F1[b] * ((T)1 - ab) - F0 * ab);
-        alignas(64) T gv[U];
-        O::store(gv, glr * esv * g);
-        for (int k = 0; k < U; k++) cbs[b][k] = clipv(gv[k], (T)-0.05, (T)0.05);
+        const VU ab = Q::load(aw + b * UU), F0 = tot - F1[b];
+        const VU g = BETA * (F1[b] * ((T)1 - ab) - F0 * ab);
+        alignas(64) T gv[UU];
+        Q::store(gv, glr * esv * g);
+        for (int k = 0; k < UU; k++) cbs[b][k] = clipv(gv[k], (T)-0.05, (T)0.05);
       }
       // normalised LMS rate per unit
-      O::store(c2s, (mu * esv) / ((T)1e-3 + h2 * O::load(w.x2.data())));
+      Q::store(c2s, (mu * esv) / ((T)1e-3 + h2 * Q::load(w.x2.data())));
     }
     // rule step: W_c += c2 * h_c * xm for every corner, over the active columns only (lane = corner)
-    for (int k = 0; k < U; k++) {
+    for (int k = 0; k < UU; k++) {
       alignas(64) T sc[16];
-      for (int c = 0; c < 16; c++) sc[c] = c2s[k] * h[c * U + k];
+      for (int c = 0; c < 16; c++) sc[c] = c2s[k] * h[c * UU + k];
       const V16 scv = O::load(sc);
       const int nc = ncol[k]; const int32_t* HGLN_RESTRICT ck = &cols[(size_t)k * cs];
       T* HGLN_RESTRICT Wk = &W[(size_t)k * cs * 16];
@@ -466,27 +549,27 @@ template <class T> struct Layer {
     // H_b is unnormalised, so the same direction is H_b += (cb |H_b|) pu, and |H_b|^2 follows in closed form:
     //   |H_b + s pu|^2 = |H_b|^2 + 2 s (H_b . pu) + s^2 |pu|^2,  s = cb |H_b|,  H_b . pu = |H_b| z_b (from the forward pass)
     // so neither a norm pass nor a renormalisation pass over the D inputs is needed.
-    alignas(64) T cr[4][U], st[4][U];
-    for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) { cr[b][k] = cbs[b][k] * rs[b * U + k]; st[b][k] = cbs[b][k] * nq[b * U + k]; }
+    alignas(64) T cr[4][UU], st[4][UU];
+    for (int b = 0; b < 4; b++) for (int k = 0; k < UU; k++) { cr[b][k] = cbs[b][k] * rs[b * UU + k]; st[b][k] = cbs[b][k] * nq[b * UU + k]; }
     {
-      const V16 r0 = O::load(cr[0]), r1 = O::load(cr[1]), r2 = O::load(cr[2]), r3 = O::load(cr[3]);
-      const V16 s0 = O::load(st[0]), s1 = O::load(st[1]), s2 = O::load(st[2]), s3 = O::load(st[3]);
+      const VU r0 = Q::load(cr[0]), r1 = Q::load(cr[1]), r2 = Q::load(cr[2]), r3 = Q::load(cr[3]);
+      const VU s0 = Q::load(st[0]), s1 = Q::load(st[1]), s2 = Q::load(st[2]), s3 = Q::load(st[3]);
       for (int i = 0; i < D; i++) {
-        const T ui = u[i]; T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U]; T* HGLN_RESTRICT pi = &p[(size_t)i * U];
-        V16 h0 = O::load(Hi), h1 = O::load(Hi + U), h2 = O::load(Hi + 2 * U), h3 = O::load(Hi + 3 * U);
-        const V16 pv = O::load(pi);
-        const V16 dp = ((r0 * h0 * ui + r1 * h1 * ui) + r2 * h2 * ui) + r3 * h3 * ui;   // reference order: dp += cb_b*Hunit_b*u
-        const V16 pu = pv * ui;
-        O::store(Hi, h0 + s0 * pu); O::store(Hi + U, h1 + s1 * pu); O::store(Hi + 2 * U, h2 + s2 * pu); O::store(Hi + 3 * U, h3 + s3 * pu);
-        alignas(64) T np[U];
-        O::store(np, pv + dp);
-        for (int k = 0; k < U; k++) pi[k] = clipv(np[k], (T)0, (T)3);
+        const T ui = u[i]; T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * UU]; T* HGLN_RESTRICT pi = &p[(size_t)i * UU];
+        VU h0 = Q::load(Hi), h1 = Q::load(Hi + UU), h2 = Q::load(Hi + 2 * UU), h3 = Q::load(Hi + 3 * UU);
+        const VU pv = Q::load(pi);
+        const VU dp = ((r0 * h0 * ui + r1 * h1 * ui) + r2 * h2 * ui) + r3 * h3 * ui;   // reference order: dp += cb_b*Hunit_b*u
+        const VU pu = pv * ui;
+        Q::store(Hi, h0 + s0 * pu); Q::store(Hi + UU, h1 + s1 * pu); Q::store(Hi + 2 * UU, h2 + s2 * pu); Q::store(Hi + 3 * UU, h3 + s3 * pu);
+        alignas(64) T np[UU];
+        Q::store(np, pv + dp);
+        for (int k = 0; k < UU; k++) pi[k] = clipv(np[k], (T)0, (T)3);
       }
     }
     const T* zn = w.zn.data(); const T* ppv = w.pp.data();
     bool far = false;
-    for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) {
-      const int j = b * U + k; const T s = st[b][k];
+    for (int b = 0; b < 4; b++) for (int k = 0; k < UU; k++) {
+      const int j = b * UU + k; const T s = st[b][k];
       const T q2 = q[j] + (T)2 * s * (nq[j] * zn[j]) + s * s * ppv[k];
       q[j] = q2; nq[j] = std::sqrt(q2); rs[j] = (T)1 / nq[j];
       far |= !(q2 > (T)1e-6 && q2 < (T)1e6);
@@ -544,23 +627,31 @@ struct Params {
   double mu = 0.3;                  // rule step (normalised LMS)
   int warm = 512;                   // first prune
   bool competence = false;          // true: version 4.2 competence-weighted mixture; false (4.3): plain average of the units
+  int units = 16;                   // units per layer U: 8, 12 or 16 (others throw std::invalid_argument in Net::init).
+                                    // 12 / 8 units: about 0.7x / 0.45x the work and state per network (docs/ALGORITHM.md)
+  bool fanout = false;              // true: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 then
+                                    // run side by side: 2 sequential rule stages per sample); false: the 1-2-3 chain
   Params(double g0 = 0.2, double g1 = 0.05) : glr0(g0), glr1(g1) {}
   static Params v42(double g0 = 0.2, double g1 = 0.05) { Params p(g0, g1); p.competence = true; return p; }
 };
 
-// The network: 3 layers x 16 units, mixture over all 48 units (plain average, or competence-weighted with competence).
+// The network: 3 layers x U units (Params::units), mixture over all 3U units (plain average, or competence-weighted).
+// Per sample, the gates of all 3 layers (they depend only on the input) run first, then the rule stages in order.
 template <class T> struct Net {
   static constexpr long kRenormEvery = 4096;                 // exact renormalisation of the tracked hyperplane norms
   int d = 0; Layer<T> L[3]; long t = 0; Params P;
   Work<T> ws;                                                // scratch for predict()/learn()
   void init(int d_, uint64_t seed = 1, const Params& p = Params()) {
+    if (!valid_units(p.units)) throw std::invalid_argument("hgln: Params::units must be 8, 12 or 16");
     d = d_; P = p; t = 0;
-    L[0].init(d, d + 1, P.competence); L[1].init(16, d + 1, P.competence); L[2].init(16, d + 1, P.competence);
+    const int U = P.units;
+    L[0].init(d, d + 1, P.competence, U); L[1].init(U, d + 1, P.competence, U); L[2].init(U, d + 1, P.competence, U);
     Rng rng(seed); for (auto& l : L) l.random_hyperplanes(rng);
     ws.init(*this);
   }
   T out() const { return ws.out; }
-  const T* outputs() const { return ws.o; }                  // the 48 unit predictions from the last predict()
+  int units() const { return L[0].U; }
+  const T* outputs() const { return ws.o.data(); }           // the 3U unit predictions from the last predict()
 
   // Forward pass into an arbitrary Work. const: safe to call from many threads, each with its own Work.
   T infer(const T* x, Work<T>& w) const {
@@ -568,32 +659,38 @@ template <class T> struct Net {
     T nn = 1; for (int i = 0; i < d; i++) { u[i] = x[i]; nn += x[i] * x[i]; }
     u[d] = 1; nn = std::sqrt(nn); for (int i = 0; i <= d; i++) u[i] /= nn;
     T* xg = w.tmp.data();
-    L[0].forward(x, u, w.lw[0], xg); L[1].forward(w.lw[0].pred.data(), u, w.lw[1], xg); L[2].forward(w.lw[1].pred.data(), u, w.lw[2], xg);
-    for (int l = 0; l < 3; l++) for (int k = 0; k < 16; k++) w.o[l * 16 + k] = w.lw[l].pred[k];
+    const int U = L[0].U, NU = 3 * U;
+    // gates first (independent of the previous layer), then the rule stages, which form the sequential chain
+    L[0].gates(u, w.lw[0]); L[1].gates(u, w.lw[1]); L[2].gates(u, w.lw[2]);
+    L[0].rules(x, w.lw[0], xg); L[1].rules(w.lw[0].pred.data(), w.lw[1], xg);
+    L[2].rules(w.lw[P.fanout ? 0 : 1].pred.data(), w.lw[2], xg);   // fanout: layers 2 and 3 both read layer 1
+    for (int l = 0; l < 3; l++) for (int k = 0; k < U; k++) w.o[l * U + k] = w.lw[l].pred[k];
     T out = 0;
     if (P.competence) {                                      // competence-weighted mixture (version 4.2)
-      T cs = 0, comp[48];
-      for (int l = 0; l < 3; l++) for (int k = 0; k < 16; k++) { comp[l * 16 + k] = w.lw[l].comp[k]; cs += comp[l * 16 + k]; }
-      for (int i = 0; i < 48; i++) { w.r[i] = comp[i] / cs; out += w.r[i] * w.o[i]; }
+      T cs = 0, comp[3 * kMaxUnits];
+      for (int l = 0; l < 3; l++) for (int k = 0; k < U; k++) { comp[l * U + k] = w.lw[l].comp[k]; cs += comp[l * U + k]; }
+      for (int i = 0; i < NU; i++) { w.r[i] = comp[i] / cs; out += w.r[i] * w.o[i]; }
     } else {                                                 // plain average (version 4.3)
-      const T r = (T)1 / 48;
-      for (int i = 0; i < 48; i++) { w.r[i] = r; out += r * w.o[i]; }
+      const T r = (T)1 / NU;
+      for (int i = 0; i < NU; i++) { w.r[i] = r; out += r * w.o[i]; }
     }
     w.out = out;
     return out;
   }
   T predict(const T* x) { return infer(x, ws); }
   void learn(T y) {                   // must follow predict() on the same sample
-    T gl = (T)P.glr1 + (T)(P.glr0 - P.glr1) * std::exp(-(T)t / (T)P.tau), es[48];
+    alignas(64) T es[3 * kMaxUnits];
+    T gl = (T)P.glr1 + (T)(P.glr0 - P.glr1) * std::exp(-(T)t / (T)P.tau);
     T eg = y - ws.out, glob = (T)P.glob;
+    const int U = L[0].U, NU = 3 * U;
     if (P.competence) {                // es_i = own error share + responsibility share r_i / sum r^2 of the mixture error
       T sr2 = 0;
-      for (int i = 0; i < 48; i++) sr2 += ws.r[i] * ws.r[i];
-      for (int i = 0; i < 48; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg * ws.r[i] / sr2;
+      for (int i = 0; i < NU; i++) sr2 += ws.r[i] * ws.r[i];
+      for (int i = 0; i < NU; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg * ws.r[i] / sr2;
     } else {                           // equal weights: r_i / sum r^2 = 1
-      for (int i = 0; i < 48; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg;
+      for (int i = 0; i < NU; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg;
     }
-    for (int l = 0; l < 3; l++) L[l].update(y, (T)P.mu, gl, es + 16 * l, ws.u.data(), ws.lw[l]);
+    for (int l = 0; l < 3; l++) L[l].update(y, (T)P.mu, gl, es + U * l, ws.u.data(), ws.lw[l]);
     t++;
     if (t >= P.warm && t % 64 == 0) for (auto& l : L) l.structure_step();
     if (t % kRenormEvery == 0) for (auto& l : L) l.renormalise();

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // hgln_cli.cpp - command-line tool for HGLN. Copyright (C) Odin Loch. Licensed under the GNU AGPL v3.0 or later (see LICENSE).
-//   hgln_cli parity in.bin out.bin [glr0 glr1 [competence]]           replay a stream from given initial hyperplanes (parity vs NumPy)
-//   hgln_cli bench d nets nsamples [threads]               speed: single thread vs a matched 3x16 MLP, then all nets in
+//   hgln_cli parity in.bin out.bin [glr0 glr1 [competence [units [fanout]]]]
+//                                                          replay a stream from given initial hyperplanes (parity vs NumPy)
+//   hgln_cli bench d nets nsamples [threads [units]]       speed: single thread vs a matched 3x16 MLP, then all nets in
 //                                                          parallel (threads: 0 or omitted = all hardware threads)
-//   hgln_cli classify train.csv test.csv passes [threads]  one-vs-rest classifier, heads trained in parallel;
+//   hgln_cli classify train.csv test.csv passes [threads [units]]
+//                                                          one-vs-rest classifier, heads trained in parallel;
 //                                                          CSV rows: label,f1..fd (features scaled to about [-1,1])
+//   units: units per layer, 8, 12 or 16 (default 16; Params::units)
 //   hgln_cli info                                          build and CPU: SIMD kernel table in use (FORGE build)
 #include "hgln.hpp"
 #include <chrono>
@@ -67,13 +70,16 @@ int main(int argc, char** argv) {
 #endif
     return 0;
   }
-  if (mode == "parity" && argc >= 4) {            // in.bin: int32 d, int32 N, H0,H1,H2 (doubles, 16x4x(d+1) each), X (N*d), y (N)
+  if (mode == "parity" && argc >= 4) {            // in.bin: int32 d, int32 N, H0,H1,H2 (doubles, units x 4 x (d+1) each), X (N*d), y (N)
     FILE* f = fopen(argv[2], "rb"); if (!f) { perror("in.bin"); return 1; }
     int32_t d, N; if (fread(&d, 4, 1, f) != 1 || fread(&N, 4, 1, f) != 1) return 1;
     Params P(argc > 5 ? atof(argv[4]) : 0.2, argc > 5 ? atof(argv[5]) : 0.05);
     P.competence = argc > 6 && atoi(argv[6]) != 0;
+    P.units = argc > 7 ? atoi(argv[7]) : 16;
+    P.fanout = argc > 8 && atoi(argv[8]) != 0;
+    if (!valid_units(P.units)) { fprintf(stderr, "units must be 8, 12 or 16\n"); return 1; }
     Net<real> g; g.init(d, 1, P);
-    for (int l = 0; l < 3; l++) { std::vector<double> buf((size_t)16 * 4 * g.L[l].D);
+    for (int l = 0; l < 3; l++) { std::vector<double> buf((size_t)g.L[l].U * 4 * g.L[l].D);
       if (fread(buf.data(), 8, buf.size(), f) != buf.size()) return 1;
       g.L[l].set_hyperplanes(buf.data()); }
     std::vector<double> X((size_t)N * d), Y(N);
@@ -85,10 +91,13 @@ int main(int argc, char** argv) {
   }
   if (mode == "bench" && argc >= 5) {
     int d = atoi(argv[2]), nets = atoi(argv[3]), N = atoi(argv[4]), threads = argc > 5 ? atoi(argv[5]) : 0;
+    const int units = argc > 6 ? atoi(argv[6]) : 16;
+    if (!valid_units(units)) { fprintf(stderr, "units must be 8, 12 or 16\n"); return 1; }
     if (threads <= 0) threads = hardware_threads();
     Rng rng(88172645463325252ULL);
     std::vector<Net<real>> G(nets); std::vector<MLP> M(nets);
-    for (int k = 0; k < nets; k++) { G[k].init(d, 100 + k); M[k].init(d, rng); }
+    Params prm; prm.units = units;
+    for (int k = 0; k < nets; k++) { G[k].init(d, 100 + k, prm); M[k].init(d, rng); }
     size_t bytes0 = G[0].model_bytes();
     std::vector<real> x(d); auto gen = [&](real& y) { for (int i = 0; i < d; i++) x[i] = (real)(2 * rng.uni() - 1);
       y = (real)(std::sin(3 * x[0]) * std::cos(2 * x[1]) + 0.5 * x[2 % d] * x[3 % d]); };
@@ -112,17 +121,19 @@ int main(int argc, char** argv) {
     t0 = now(); run_streams(G, X.data(), Y.data(), P.data(), N, threads); double tb = us(t0, now()) / N;
     t0 = now(); run_streams(G, X.data(), (const real*)nullptr, P.data(), N, threads); double tbp = us(t0, now()) / N;
     for (real v : P) sink += v;
-    printf("{\"d\":%d,\"nets\":%d,\"real\":\"%s\",\"hgln_us_per_sample\":%.2f,\"hgln_predict_only_us\":%.2f,\"mlp3x16_us_per_sample\":%.2f,"
+    printf("{\"d\":%d,\"nets\":%d,\"units\":%d,\"real\":\"%s\",\"hgln_us_per_sample\":%.2f,\"hgln_predict_only_us\":%.2f,\"mlp3x16_us_per_sample\":%.2f,"
            "\"simd\":\"%s\",\"threads\":%d,\"batched_us_per_sample\":%.2f,\"batched_predict_only_us\":%.2f,"
            "\"model_bytes_per_net_initial\":%zu,\"model_bytes_per_net_after_prune\":%zu,\"sink\":%g}\n",
-           d, nets, sizeof(real) == 4 ? "float32" : "float64", th, tp, tm, simd_target(), threads, tb, tbp, bytes0, G[0].model_bytes(), (double)sink);
+           d, nets, units, sizeof(real) == 4 ? "float32" : "float64", th, tp, tm, simd_target(), threads, tb, tbp, bytes0, G[0].model_bytes(), (double)sink);
     return 0;
   }
   if (mode == "classify" && argc >= 5) {
     std::vector<real> Xtr, Xte; std::vector<int> ytr, yte; int d1, d2;
     if (!read_csv(argv[2], Xtr, ytr, d1) || !read_csv(argv[3], Xte, yte, d2) || d1 != d2) { fprintf(stderr, "bad CSV\n"); return 1; }
     int passes = atoi(argv[4]), threads = argc > 5 ? atoi(argv[5]) : 0, C = 0; for (int v : ytr) C = std::max(C, v + 1);
-    Classifier<real> clf; clf.init(d1, C, 1);
+    Params prm(0.02, 0.02); prm.units = argc > 6 ? atoi(argv[6]) : 16;
+    if (!valid_units(prm.units)) { fprintf(stderr, "units must be 8, 12 or 16\n"); return 1; }
+    Classifier<real> clf; clf.init(d1, C, 1, prm);
     std::vector<int> pred(yte.size());
     for (int ep = 1; ep <= passes; ep++) {
       clf.train_batch(Xtr.data(), ytr.data(), ytr.size(), threads);   // identical to calling train() per sample, in order
@@ -132,6 +143,7 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
-  fprintf(stderr, "usage: hgln_cli parity in.bin out.bin [glr0 glr1] | bench d nets nsamples [threads] | classify train.csv test.csv passes [threads] | info\n");
+  fprintf(stderr, "usage: hgln_cli parity in.bin out.bin [glr0 glr1 [competence [units [fanout]]]] | bench d nets nsamples [threads [units]] |\n"
+                  "       classify train.csv test.csv passes [threads [units]] | info      (units per layer: 8, 12 or 16; default 16)\n");
   return 1;
 }

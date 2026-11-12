@@ -14,9 +14,11 @@ namespace {
 // The header-only kernels as a table, so the same Net code can be run through them.
 struct RefF : detail::VxOps<float> {};
 struct RefD : detail::VxOps<double> {};
-template <class T, class P> void rfwd(const Layer<T>& L, const T* in, const T* u, LayerWork<T>& w, T* xg) { L.template forward_k<P>(in, u, w, xg); }
-template <class T, class P> void rupd(Layer<T>& L, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { L.template update_k<P>(y, mu, glr, es, u, w); }
-const simd::Table header_table = {"header", 0, {&rfwd<float, RefF>, &rupd<float, RefF>}, {&rfwd<double, RefD>, &rupd<double, RefD>}};
+template <class T, class P, int U> void rgat(const Layer<T>& L, const T* u, LayerWork<T>& w) { L.template gates_k<P, U>(u, w); }
+template <class T, class P, int U> void rrul(const Layer<T>& L, const T* in, LayerWork<T>& w, T* xg) { L.template rules_k<P, U>(in, w, xg); }
+template <class T, class P, int U> void rupd(Layer<T>& L, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { L.template update_k<P, U>(y, mu, glr, es, u, w); }
+#define REF_K3(T, P) {{&rgat<T, P, 8>, &rgat<T, P, 12>, &rgat<T, P, 16>}, {&rrul<T, P, 8>, &rrul<T, P, 12>, &rrul<T, P, 16>}, {&rupd<T, P, 8>, &rupd<T, P, 12>, &rupd<T, P, 16>}}
+const simd::Table header_table = {"header", 0, REF_K3(float, RefF), REF_K3(double, RefD)};
 
 int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; std::printf("FAIL %s:%d: ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
@@ -37,10 +39,11 @@ template <class T> std::vector<unsigned char> state(const Net<T>& g) {      // t
 }
 struct Run { std::vector<unsigned char> pred, outs, model, infer; };
 
-// One stream: learn N samples (predictions and the 48 unit outputs recorded every step), then predict-only through
+// One stream: learn N samples (predictions and the 3U unit outputs recorded every step), then predict-only through
 // infer() and run_streams() on a second block. Inputs include values large enough to saturate the gates.
-template <class T> Run run(int d, int N, uint64_t seed) {
+template <class T> Run run(int d, int N, uint64_t seed, int units, bool fanout) {
   Net<T> g; Params P; if (d >= 32) P = Params(0.02, 0.02);
+  P.units = units; P.fanout = fanout; P.competence = units == 12 || fanout;   // both mixtures covered
   g.init(d, seed, P);
   Rng rng(seed * 7919 + 13);
   std::vector<T> x(d);
@@ -51,7 +54,7 @@ template <class T> Run run(int d, int N, uint64_t seed) {
     T y = (T)(std::sin(3 * (double)x[0]) * std::cos(2 * (double)x[1 % d]) + 0.5 * (double)x[2 % d] * (double)x[3 % d]);
     if (t % 5 == 0) y = (T)(y > 0 ? 1 : -1);
     T p = g.predict(x.data()); g.learn(y);
-    put(r.pred, &p, 1); put(r.outs, g.outputs(), 48);
+    put(r.pred, &p, 1); put(r.outs, g.outputs(), 3 * units);
   }
   r.model = state(g);
   const int M = 200; std::vector<T> X((size_t)M * d), out((size_t)2 * M);
@@ -64,17 +67,17 @@ template <class T> Run run(int d, int N, uint64_t seed) {
   return r;
 }
 
-template <class T> void compare_all(int d, int N, uint64_t seed, const std::vector<const simd::Table*>& tabs) {
+template <class T> void compare_all(int d, int N, uint64_t seed, int units, bool fanout, const std::vector<const simd::Table*>& tabs) {
   simd::install(&header_table);
-  const Run ref = run<T>(d, N, seed);
+  const Run ref = run<T>(d, N, seed, units, fanout);
   for (const simd::Table* t : tabs) {
     simd::install(t);
     CHECK(&simd::active() == t, "install(%s)", t->target);
-    const Run got = run<T>(d, N, seed);
+    const Run got = run<T>(d, N, seed, units, fanout);
     const bool ok = got.pred == ref.pred && got.outs == ref.outs && got.model == ref.model && got.infer == ref.infer;
-    CHECK(ok, "%s d=%d %s: differs from the header-only kernels (pred %d outs %d model %d infer %d)", sizeof(T) == 4 ? "float32" : "float64",
-          d, t->target, got.pred == ref.pred, got.outs == ref.outs, got.model == ref.model, got.infer == ref.infer);
-    std::printf("  %-7s %s d=%-3d N=%d: %s (%zu prediction bytes, %zu model bytes)\n", t->target, sizeof(T) == 4 ? "float32" : "float64", d, N,
+    CHECK(ok, "%s d=%d U=%d%s %s: differs from the header-only kernels (pred %d outs %d model %d infer %d)", sizeof(T) == 4 ? "float32" : "float64",
+          d, units, fanout ? " fanout" : "", t->target, got.pred == ref.pred, got.outs == ref.outs, got.model == ref.model, got.infer == ref.infer);
+    std::printf("  %-7s %s d=%-3d U=%-2d%s N=%d: %s (%zu prediction bytes, %zu model bytes)\n", t->target, sizeof(T) == 4 ? "float32" : "float64", d, units, fanout ? " fanout" : "", N,
                 ok ? "bit-identical" : "DIFFERENT", ref.pred.size() + ref.outs.size() + ref.infer.size(), ref.model.size());
   }
 }
@@ -92,11 +95,14 @@ int main() {
   CHECK(simd::table("scalar") != nullptr, "scalar table missing");
   CHECK(simd::table("no-such-target") == nullptr && !simd::force("no-such-target"), "unknown target accepted");
   CHECK(&simd::active() == &chosen, "a failed force() changed the table");
-  for (int d : {3, 8, 64}) {
-    const int N = d == 64 ? 1200 : 2500;     // past the prune at 512 and several structure steps
-    compare_all<float>(d, N, 11 + d, tabs);
-    compare_all<double>(d, N, 11 + d, tabs);
-  }
+  for (int units : {8, 12, 16})
+    for (int d : {3, 8, 64}) {
+      const int N = d == 64 ? 1200 : 2500;     // past the prune at 512 and several structure steps
+      compare_all<float>(d, N, 11 + d, units, false, tabs);
+      compare_all<double>(d, N, 11 + d, units, false, tabs);
+    }
+  compare_all<float>(8, 2500, 19, 16, true, tabs);
+  compare_all<double>(8, 2500, 19, 16, true, tabs);
   for (const simd::Table* t : tabs) { CHECK(simd::force(t->target) && &simd::active() == t, "force(%s)", t->target); }
   simd::install(nullptr);
   CHECK(&simd::active() == &chosen, "install(nullptr) did not return to the automatic choice");

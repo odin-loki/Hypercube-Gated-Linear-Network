@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // test_api.cpp - behavioural tests for the header-only library. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln.hpp"
+#include <algorithm>
 #include <cstdio>
+#include <stdexcept>
 using namespace hgln;
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); fails++; } else printf("ok:   %s\n", msg); } while (0)
@@ -16,6 +18,28 @@ template <class T> double run_stream(Net<T>& n, int d, int N, uint64_t seed, dou
   }
   double var = sy2 / cnt - (sy / cnt) * (sy / cnt); *late_nmse = se / cnt / var; return *late_nmse;
 }
+static Params with_units(int units, bool fanout = false) { Params P; P.units = units; P.fanout = fanout; return P; }
+// every unit keeps exactly round(0.6 n) inputs and its bias column after the prune
+static bool prune_counts_ok(const Net<double>& a) {
+  int good = 0, total = 0;
+  for (int l = 0; l < 3; l++) for (int k = 0; k < a.L[l].U; k++) {
+    int act = 0; for (int j = 0; j < a.L[l].n; j++) act += a.L[l].active(k, j);
+    total++; good += act == (int)std::nearbyint(0.6 * a.L[l].n) && a.L[l].active(k, a.L[l].n);
+  }
+  return a.pruned() && good == total && total == 3 * a.units();
+}
+// export every layer through the dense accessors into a fresh net, import_dense, and check both continue identically
+static bool import_round_trip(int units, int Nwarm) {
+  Net<double> a; a.init(8, 2, with_units(units)); double nm; run_stream(a, 8, Nwarm, 6, &nm); Net<double> b; b.init(8, 99, with_units(units));
+  for (int l = 0; l < 3; l++) { const auto& L = a.L[l]; int U = L.U, D = L.D, N1 = L.N1;
+    std::vector<double> H((size_t)U * 4 * D), p((size_t)U * D), W((size_t)U * 16 * N1), M((size_t)U * N1), A((size_t)U * N1), m((size_t)U * 16);
+    std::vector<double> Q((size_t)U * 4); L.get_hyperplanes_raw(H.data(), Q.data());
+    for (int k = 0; k < U; k++) { for (int i = 0; i < D; i++) p[k * D + i] = L.gate_weight(k, i); for (int c = 0; c < 16; c++) { m[k * 16 + c] = L.competence(k, c); for (int j = 0; j < N1; j++) W[(k * 16 + c) * N1 + j] = L.rule(k, c, j); }
+      for (int j = 0; j < N1; j++) { M[k * N1 + j] = L.active(k, j); A[k * N1 + j] = L.activity(k, j); } }
+    b.L[l].import_dense(H.data(), p.data(), W.data(), M.data(), A.data(), m.data(), L.pruned, Q.data()); }
+  b.t = a.t; std::vector<double> o1, o2; run_stream(a, 8, 800, 7, &nm, &o1); run_stream(b, 8, 800, 7, &nm, &o2);
+  return o1 == o2;
+}
 int main() {
   { Net<double> a, b; a.init(8, 5); b.init(8, 5); double n1, n2; std::vector<double> o1, o2;
     run_stream(a, 8, 1500, 9, &n1, &o1); run_stream(b, 8, 1500, 9, &n2, &o2);
@@ -29,8 +53,7 @@ int main() {
   { Net<float> a; a.init(8, 1); double nm; run_stream(a, 8, 5000, 11, &nm);
     printf("      float32 late NMSE: %.3f\n", nm); CHECK(nm < 0.35, "float32 build learns too"); }
   { Net<double> a; a.init(8, 1); double nm; run_stream(a, 8, 1500, 3, &nm);
-    int pruned = 0, total = 0; for (int l = 0; l < 3; l++) { for (int k = 0; k < 16; k++) { int act = 0; for (int j = 0; j < a.L[l].n; j++) act += a.L[l].active(k, j); total++; int want = (int)std::nearbyint(0.6 * a.L[l].n); pruned += act == want; if (!a.L[l].active(k, a.L[l].n)) pruned -= 1000; } }
-    CHECK(pruned == total, "after warm-up every unit keeps exactly round(0.6 n) inputs and its bias column"); }
+    CHECK(prune_counts_ok(a), "after warm-up every unit keeps exactly round(0.6 n) inputs and its bias column"); }
   { Net<double> a; a.init(8, 1); bool ok = true; Rng rng(5); std::vector<double> x(8);
     for (int t = 0; t < 2000; t++) { for (auto& v : x) v = 2 * rng.uni() - 1; double p = a.predict(x.data()); a.learn(100 * std::sin(10 * x[0]));
       if (!(p == p) || std::fabs(p) > 2.0 + 1e-12) ok = false;
@@ -73,15 +96,57 @@ int main() {
     printf("      model bytes d=8: %zu before prune, %zu after\n", before, a.model_bytes());
     CHECK(a.pruned() && !fresh.pruned() && a.model_bytes() < before, "the prune compacts W and frees the activity trace (model shrinks)"); }
   { // import_dense(export) round trip, before and after the prune, continues bit-identically
-    for (int Nwarm : {300, 900}) {
-      Net<double> a; a.init(8, 2); double nm; run_stream(a, 8, Nwarm, 6, &nm); Net<double> b; b.init(8, 99);
-      for (int l = 0; l < 3; l++) { const auto& L = a.L[l]; int U = 16, D = L.D, N1 = L.N1;
-        std::vector<double> H((size_t)U * 4 * D), p((size_t)U * D), W((size_t)U * 16 * N1), M((size_t)U * N1), A((size_t)U * N1), m((size_t)U * 16);
-        std::vector<double> Q((size_t)U * 4); L.get_hyperplanes_raw(H.data(), Q.data());
-        for (int k = 0; k < U; k++) { for (int i = 0; i < D; i++) p[k * D + i] = L.gate_weight(k, i); for (int c = 0; c < 16; c++) { m[k * 16 + c] = L.competence(k, c); for (int j = 0; j < N1; j++) W[(k * 16 + c) * N1 + j] = L.rule(k, c, j); }
-          for (int j = 0; j < N1; j++) { M[k * N1 + j] = L.active(k, j); A[k * N1 + j] = L.activity(k, j); } }
-        b.L[l].import_dense(H.data(), p.data(), W.data(), M.data(), A.data(), m.data(), L.pruned, Q.data()); }
-      b.t = a.t; std::vector<double> o1, o2; run_stream(a, 8, 800, 7, &nm, &o1); run_stream(b, 8, 800, 7, &nm, &o2);
-      CHECK(o1 == o2, Nwarm < 512 ? "import_dense round trip before the prune continues identically" : "import_dense round trip after the prune continues identically"); } }
+    CHECK(import_round_trip(16, 300), "import_dense round trip before the prune continues identically");
+    CHECK(import_round_trip(16, 900), "import_dense round trip after the prune continues identically"); }
+  // ---- narrower layers (Params::units = 8 or 12)
+  { bool threw = false; try { Net<double> a; a.init(8, 1, with_units(10)); } catch (const std::invalid_argument&) { threw = true; }
+    bool threw2 = false; try { Classifier<float> c; Params P(0.02, 0.02); P.units = 32; c.init(4, 2, 1, P); } catch (const std::invalid_argument&) { threw2 = true; }
+    CHECK(threw && threw2, "Params::units other than 8, 12, 16 throws std::invalid_argument"); }
+  for (int units : {8, 12}) {
+    char msg[200];
+    { Net<double> a; a.init(8, 1, with_units(units)); double nm; run_stream(a, 8, 5000, 11, &nm);
+      printf("      units=%d late NMSE after 5000 samples (d=8): %.3f\n", units, nm);
+      snprintf(msg, sizeof msg, "units=%d: learns the smooth 8-input target (late NMSE < 0.35); 3x%d outputs, layers 2-3 take %d inputs", units, units, units);
+      CHECK(nm < 0.35 && a.units() == units && a.L[1].n == units && a.L[2].n == units && a.ws.o.size() == (size_t)3 * units, msg); }
+    { Net<float> a; a.init(8, 1, with_units(units)); double nm; run_stream(a, 8, 5000, 11, &nm);
+      snprintf(msg, sizeof msg, "units=%d float32 learns too (late NMSE %.3f < 0.35)", units, nm); CHECK(nm < 0.35, msg); }
+    { Net<double> a; a.init(8, 1, with_units(units)); double nm; run_stream(a, 8, 1500, 3, &nm);
+      snprintf(msg, sizeof msg, "units=%d: after warm-up every one of the %d units keeps round(0.6 n) inputs and its bias", units, 3 * units);
+      CHECK(prune_counts_ok(a), msg); }
+    { Net<double> a, b; a.init(8, 5, with_units(units)); b.init(8, 5, with_units(units)); double n1, n2; std::vector<double> o1, o2;
+      run_stream(a, 8, 1500, 9, &n1, &o1); run_stream(b, 8, 1500, 9, &n2, &o2);
+      Net<double> c; c.init(8, 5); std::vector<double> o3; run_stream(c, 8, 1500, 9, &n2, &o3);
+      snprintf(msg, sizeof msg, "units=%d: deterministic (same seed and stream, identical predictions) and different from units=16", units);
+      CHECK(o1 == o2 && o1 != o3, msg); }
+    for (int d : {8, 64}) {
+      Net<double> a, b; a.init(d, 1, with_units(units)); b.init(d, 1);
+      Net<double> a2 = a, b2 = b; double nm; run_stream(a2, d, 700, 2, &nm); run_stream(b2, d, 700, 2, &nm);
+      printf("      d=%d model bytes after the prune: units=%d %zu, units=16 %zu (%.2fx)\n", d, units, a2.model_bytes(), b2.model_bytes(), (double)a2.model_bytes() / b2.model_bytes());
+      snprintf(msg, sizeof msg, "units=%d d=%d: model_bytes smaller than units=16, before and after the prune", units, d);
+      CHECK(a.model_bytes() < b.model_bytes() && a2.model_bytes() < b2.model_bytes(), msg);
+    }
+    snprintf(msg, sizeof msg, "units=%d: import_dense round trip before and after the prune continues identically", units);
+    CHECK(import_round_trip(units, 300) && import_round_trip(units, 900), msg);
+    { Rng rng(4); const int d = 8, N = 800; std::vector<double> X((size_t)N * d); std::vector<int> lab(N);
+      for (int t = 0; t < N; t++) { for (int i = 0; i < d; i++) X[(size_t)t * d + i] = 2 * rng.uni() - 1; lab[t] = X[(size_t)t * d] * X[(size_t)t * d + 1] > 0; }
+      Params P(0.02, 0.02); P.units = units; Classifier<double> a, b; a.init(d, 3, 1, P); b.init(d, 3, 1, P);
+      for (int t = 0; t < N; t++) a.train(&X[(size_t)t * d], lab[t]);
+      b.train_batch(X.data(), lab.data(), N, 3);
+      std::vector<int> pb(N); b.predict_batch(X.data(), N, pb.data(), nullptr, 3); bool same = true;
+      for (int t = 0; t < N; t++) same &= a.predict(&X[(size_t)t * d]) == pb[t];
+      for (int k = 0; k < 3; k++) for (int l = 0; l < 3; l++) same &= a.nets[k].L[l].W.size() == b.nets[k].L[l].W.size() && std::equal(a.nets[k].L[l].W.begin(), a.nets[k].L[l].W.end(), b.nets[k].L[l].W.begin());
+      snprintf(msg, sizeof msg, "units=%d: Classifier train_batch/predict_batch (3 threads) match serial train/predict", units);
+      CHECK(same, msg); }
+  }
+  // ---- fan-out (Params::fanout): layer 3 reads layer 1
+  { Net<double> a, b; a.init(8, 1, with_units(16, true)); b.init(8, 1); double n1, n2; std::vector<double> o1, o2;
+    run_stream(a, 8, 5000, 11, &n1, &o1); run_stream(b, 8, 5000, 11, &n2, &o2);
+    printf("      fanout late NMSE after 5000 samples (d=8): %.3f (chain %.3f)\n", n1, n2);
+    CHECK(n1 < 0.35 && o1 != o2, "fanout: learns the smooth target (late NMSE < 0.35) and differs from the 1-2-3 chain");
+    Net<double> c; c.init(8, 1, with_units(16, true)); std::vector<double> o3; run_stream(c, 8, 5000, 11, &n1, &o3);
+    Net<double> e; e.init(8, 1, with_units(12, true)); double n3; run_stream(e, 8, 5000, 11, &n3);
+    Params pv(0.2, 0.05); pv.competence = true; pv.fanout = true; Net<double> f; f.init(8, 1, pv); double n4; run_stream(f, 8, 5000, 11, &n4);
+    printf("      fanout units=12 late NMSE %.3f; fanout with competence (4.2) %.3f\n", n3, n4);
+    CHECK(o1 == o3 && n3 < 0.35 && n4 < 0.35, "fanout: deterministic; also learns with units=12 and with the competence mixture"); }
   printf(fails ? "%d test(s) FAILED\n" : "all tests passed\n", fails); return fails ? 1 : 0;
 }

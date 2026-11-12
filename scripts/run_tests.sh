@@ -4,8 +4,11 @@
 set -e
 cd "$(dirname "$0")/.."
 echo "== C++ behavioural tests"; ./build/test_api
-echo "== NumPy vs C++ parity (versions 4.3 and 4.2; float64 and float32; d=8 and d=64)"
-for m in v43 v42; do for d in 8 64; do python3 python/parity.py build/hgln_d $d 1e-12 $m; python3 python/parity.py build/hgln_f $d 1e-4 $m; done; done
+echo "== NumPy vs C++ parity (versions 4.3 and 4.2; float64 and float32; d=8 and d=64; 8, 12 and 16 units per layer; fan-out)"
+for u in 8 12 16; do for m in v43 v42; do for d in 8 64; do
+  python3 python/parity.py build/hgln_d $d 1e-12 $m $u; python3 python/parity.py build/hgln_f $d 1e-4 $m $u
+done; done; done
+for d in 8 64; do python3 python/parity.py build/hgln_d $d 1e-12 v43f 16; python3 python/parity.py build/hgln_f $d 1e-4 v43f 16; done
 echo "== CUDA kernel logic on the CPU emulator vs the C++ library (this does NOT run on a GPU)"
 # args: d nets T threads shared competence [far]; competence 0 = 4.3 plain average, 1 = 4.2 competence mixture;
 # far = 1 starts two layers at the edge of the norm range (conditional renormalisation); T > 4096 crosses the periodic one
