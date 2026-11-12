@@ -7,27 +7,36 @@
 #define HG_HD
 #endif
 #define HG_MAXN 128        // largest supported input size d (prune scratch)
-// Persistent state per network: H (3 x 64 hyperplanes x D, row (k*4+b) of layer l at (l*64 + k*4+b)*D, stored
-// UNnormalised as the C++ library keeps them), Q (3 x 64 squared norms |H_b|^2, same row order), p (3 x 16 x D),
-// W (dense U x 16 x N1 per layer), M and A (U x N1 per layer), m (3 x 16 x 16 competence map, only used with
+#define HG_MAXU 16         // largest number of units per layer (Params::units: 8, 12 or 16)
+// U = units per layer (Params::units). Layer 1 takes the d inputs, layers 2 and 3 the U outputs of a previous layer,
+// so N1 = d + 1, U + 1, U + 1 (inputs plus bias). Each unit has 4 hyperplanes and 16 corners (fixed).
+// Persistent state per network: H (3 x 4U hyperplanes x D, row (k*4+b) of layer l at (l*4U + k*4+b)*D, stored
+// UNnormalised as the C++ library keeps them), Q (3 x 4U squared norms |H_b|^2, same row order), p (3 x U x D),
+// W (dense U x 16 x N1 per layer), M and A (U x N1 per layer), m (3 x U x 16 competence map, only used with
 // competence). |H_b| and 1/|H_b| are not stored: they are sqrt(Q) and 1/sqrt(Q), the same bits the library stores.
 struct HgDims {            // flat per-network layout, shared by host and device
-  int d, D, N1[3];
+  int d, D, U, N1[3];
   long wofs[3], mofs[3], ioff[3];
   long Hs, Qs, ps, ms, Ws, Ms;                               // per-network sizes of the persistent arrays
-  long o_u, o_inp, o_a, o_zn, o_pp, o_h, o_f, o_xm, o_pred, o_comp, o_r, o_es, o_cb, o_st, o_c2, o_sc, scs;   // scratch layout
+  long o_u, o_inp, o_a, o_zn, o_pp, o_h, o_f, o_xm, o_pred, o_comp, o_cb, o_st, o_c2, o_sc, scs;   // scratch layout
 };
-HG_HD inline HgDims hg_dims(int d) {
-  HgDims g; g.d = d; g.D = d + 1; g.N1[0] = d + 1; g.N1[1] = 17; g.N1[2] = 17;
-  g.wofs[0] = 0; g.wofs[1] = 256L * g.N1[0]; g.wofs[2] = g.wofs[1] + 256L * 17; g.Ws = g.wofs[2] + 256L * 17;
-  g.mofs[0] = 0; g.mofs[1] = 16L * g.N1[0]; g.mofs[2] = g.mofs[1] + 16L * 17; g.Ms = g.mofs[2] + 16L * 17;
-  g.ioff[0] = 0; g.ioff[1] = g.N1[0]; g.ioff[2] = g.N1[0] + 17;
-  g.Hs = 3L * 64 * g.D; g.Qs = 3L * 64; g.ps = 3L * 16 * g.D; g.ms = 3L * 256;
-  long o = 0; g.o_u = o; o += g.D; g.o_inp = o; o += g.N1[0] + 34; g.o_a = o; o += 192; g.o_zn = o; o += 192;
-  g.o_pp = o; o += 48; g.o_h = o; o += 768; g.o_f = o; o += 768; g.o_xm = o; o += g.Ms; g.o_pred = o; o += 48;
-  g.o_comp = o; o += 48; g.o_r = o; o += 48; g.o_es = o; o += 48; g.o_cb = o; o += 192; g.o_st = o; o += 192;
-  g.o_c2 = o; o += 48; g.o_sc = o; o += 8; g.scs = o;
+// Scratch (per network, in values of the real type): u and the layer-1 input x are double-buffered (u: 2 x D at
+// o_u; inp: 2 x N1[0] for layer 1 at ioff[0] + (sample & 1) * N1[0], then layer 2's and layer 3's U + 1 inputs at
+// ioff[1], ioff[2]) so the next sample's u is computed during the current sample's update; a, zn: 3 x 4U;
+// pp, pred, comp, c2: 3U; h, f: 3 x 16U; xm: the masked inputs, like M; cb, st: 3U x 4; sc: 8 flags.
+HG_HD inline HgDims hg_dims(int d, int U = 16) {
+  HgDims g; g.d = d; g.D = d + 1; g.U = U; g.N1[0] = d + 1; g.N1[1] = U + 1; g.N1[2] = U + 1;
+  const long R = 16L * U;                                    // rule rows per layer (U units x 16 corners)
+  g.wofs[0] = 0; g.wofs[1] = R * g.N1[0]; g.wofs[2] = g.wofs[1] + R * g.N1[1]; g.Ws = g.wofs[2] + R * g.N1[2];
+  g.mofs[0] = 0; g.mofs[1] = (long)U * g.N1[0]; g.mofs[2] = g.mofs[1] + (long)U * g.N1[1]; g.Ms = g.mofs[2] + (long)U * g.N1[2];
+  g.ioff[0] = 0; g.ioff[1] = 2L * g.N1[0]; g.ioff[2] = g.ioff[1] + g.N1[1];
+  g.Hs = 3L * 4 * U * g.D; g.Qs = 3L * 4 * U; g.ps = 3L * U * g.D; g.ms = 3L * R;
+  long o = 0; g.o_u = o; o += 2L * g.D; g.o_inp = o; o += g.ioff[2] + g.N1[2]; g.o_a = o; o += 12L * U; g.o_zn = o; o += 12L * U;
+  g.o_pp = o; o += 3L * U; g.o_h = o; o += 3 * R; g.o_f = o; o += 3 * R; g.o_xm = o; o += g.Ms; g.o_pred = o; o += 3L * U;
+  g.o_comp = o; o += 3L * U; g.o_cb = o; o += 12L * U; g.o_st = o; o += 12L * U; g.o_c2 = o; o += 3L * U; g.o_sc = o; o += 8;
+  g.scs = o;
   return g;
 }
+HG_HD inline bool hg_valid_units(int U) { return U == 8 || U == 12 || U == 16; }
 // Sample count after which the one-off prune has run: the first t >= max(warm, 1) with t % 64 == 0.
 HG_HD inline long hg_prune_time(int warm) { long w = warm < 1 ? 1 : warm; return ((w + 63) / 64) * 64; }

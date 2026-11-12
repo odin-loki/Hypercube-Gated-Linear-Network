@@ -41,7 +41,7 @@ extern "C" int HG_EMU_NAME(unsigned grid, unsigned block, unsigned smem_bytes, v
   if (block < 1 || block > 1024) return 1;
   const HgDims g = *static_cast<const HgDims*>(args[0]);
   auto ptr = [&](int i) { return reinterpret_cast<hreal*>(static_cast<uintptr_t>(*static_cast<const uint64_t*>(args[i]))); };
-  // hgln_run(g, H, Q, p, W, M, A, m, scratch, X, Y, P, tcount, T, glr0, glr1, tau, glob, mu, warm, competence)
+  // hgln_run(g, H, Q, p, W, M, A, m, scratch, X, Y, P, tcount, T, glr0, glr1, tau, glob, mu, warm, competence, units, fanout)
   hreal *H = ptr(1), *Q = ptr(2), *p = ptr(3), *W = ptr(4), *M = ptr(5), *A = ptr(6), *m = ptr(7), *S = ptr(8);
   const hreal *X = ptr(9), *Y = ptr(10); hreal* P = ptr(11);
   long* tc = reinterpret_cast<long*>(static_cast<uintptr_t>(*static_cast<const uint64_t*>(args[12])));
@@ -49,7 +49,9 @@ extern "C" int HG_EMU_NAME(unsigned grid, unsigned block, unsigned smem_bytes, v
   const hreal glr0 = *static_cast<const hreal*>(args[14]), glr1 = *static_cast<const hreal*>(args[15]),
               tau = *static_cast<const hreal*>(args[16]), glob = *static_cast<const hreal*>(args[17]),
               mu = *static_cast<const hreal*>(args[18]);
-  const int warm = *static_cast<const int*>(args[19]), competence = *static_cast<const int*>(args[20]);
+  const int warm = *static_cast<const int*>(args[19]), competence = *static_cast<const int*>(args[20]),
+            units = *static_cast<const int*>(args[21]), fanout = *static_cast<const int*>(args[22]);
+  if (units != g.U || !hg_valid_units(units)) return 1;     // layout and kernel argument disagree
   if (!S && (size_t)smem_bytes < (size_t)g.scs * sizeof(hreal)) return 1;   // the kernel would run past the buffer
   std::vector<double> smem((smem_bytes + sizeof(double) - 1) / sizeof(double));
   for (unsigned b = 0; b < grid; b++) {
@@ -59,7 +61,7 @@ extern "C" int HG_EMU_NAME(unsigned grid, unsigned block, unsigned smem_bytes, v
     th.reserve(block);
     for (unsigned k = 0; k < block; k++) th.emplace_back([&, k] {
       hg_tid_v = (int)k; hg_nt_v = (int)block; hg_bid_v = (int)b; hg_bar = &bar; hg_smem_v = smem.data();
-      hgln_run(g, H, Q, p, W, M, A, m, S, X, Y, P, tc, T, glr0, glr1, tau, glob, mu, warm, competence);
+      hgln_run(g, H, Q, p, W, M, A, m, S, X, Y, P, tc, T, glr0, glr1, tau, glob, mu, warm, competence, units, fanout);
     });
     for (auto& t : th) t.join();
   }

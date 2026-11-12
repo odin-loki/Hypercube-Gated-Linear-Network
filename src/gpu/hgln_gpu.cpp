@@ -133,9 +133,11 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
     if (n.d != d) return fail(why, "all networks must have the same d");
     if (!same_params(n.P, nets[0].P)) return fail(why, "all networks must have the same Params (the kernel takes them once)");
   }
-  if (nets[0].P.units != 16 || nets[0].P.fanout)
-    return fail(why, "the GPU kernel supports only Params::units = 16 with fanout off so far");
-  const HgDims g = hg_dims(d);
+  const int U = nets[0].P.units;
+  if (!hg_valid_units(U)) return fail(why, "Params::units must be 8, 12 or 16 (got " + std::to_string(U) + ")");
+  for (auto& n : nets)
+    if (n.units() != U || n.L[0].has_competence != n.P.competence) return fail(why, "a network's layers do not match its Params (not initialised?)");
+  const HgDims g = hg_dims(d, U);
   const std::size_t N = nets.size(), smem = (std::size_t)g.scs * sizeof(T);
   // dense layout (cuda/hgln_dims.h), exactly as hg_pack in cuda/hgln_host.h: raw (unnormalised) hyperplanes and their
   // squared norms, the exact state the library keeps, so the device continues bit for bit
@@ -145,11 +147,11 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
     t[n] = nets[n].t;
     for (int l = 0; l < 3; l++) {
       const auto& L = nets[n].L[l]; const int N1 = L.N1, D = g.D;
-      L.get_hyperplanes_raw(&H[n * g.Hs + l * 64L * D], &Q[n * g.Qs + l * 64L]);
-      for (int k = 0; k < 16; k++) {
-        for (int i = 0; i < D; i++) p[n * g.ps + l * 16L * D + k * D + i] = L.gate_weight(k, i);
+      L.get_hyperplanes_raw(&H[n * g.Hs + l * 4L * U * D], &Q[n * g.Qs + l * 4L * U]);
+      for (int k = 0; k < U; k++) {
+        for (int i = 0; i < D; i++) p[n * g.ps + (l * (long)U + k) * D + i] = L.gate_weight(k, i);
         for (int c = 0; c < 16; c++) {
-          m[n * g.ms + l * 256L + k * 16 + c] = L.competence(k, c);
+          m[n * g.ms + (l * (long)U + k) * 16 + c] = L.competence(k, c);
           for (int j = 0; j < N1; j++) W[n * g.Ws + g.wofs[l] + (k * 16L + c) * N1 + j] = L.rule(k, c, j);
         }
         for (int j = 0; j < N1; j++) {
@@ -193,10 +195,10 @@ template <class T> bool Bank<T>::run(const T* X, const T* Y, T* P, int samples, 
     I.rt->upload(I.X, X, xb); I.rt->upload(I.Y, Y, yb);
     HgDims g = I.g;
     std::uint64_t S = I.use_smem ? 0 : I.S;
-    int Ts = samples, warm = I.prm.warm, competence = I.prm.competence ? 1 : 0;
+    int Ts = samples, warm = I.prm.warm, competence = I.prm.competence ? 1 : 0, units = g.U, fanout = I.prm.fanout ? 1 : 0;
     T glr0 = (T)I.prm.glr0, glr1 = (T)I.prm.glr1, tau = (T)I.prm.tau, glob = (T)I.prm.glob, mu = (T)I.prm.mu;
     // kernelParams in hgln_run's parameter order (cuda/hgln_kernel.h)
-    void* args[] = {&g, &I.H, &I.Q, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm, &competence};
+    void* args[] = {&g, &I.H, &I.Q, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm, &competence, &units, &fanout};
     const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.opt.threads, 1, 1};
     I.rt->launch_kernel(I.fn, grid, block, I.use_smem ? (unsigned)((std::size_t)g.scs * sizeof(T)) : 0u, args);
     if (P) I.rt->download(P, I.P, yb);
@@ -237,12 +239,12 @@ template <class T> bool Bank<T>::download(std::vector<Net<T>>& nets, std::string
   const long tp = hg_prune_time(I.prm.warm);
   for (std::size_t n = 0; n < N; n++) {
     auto& net = nets[n];
-    if (net.d != I.d || net.L[0].has_competence != I.prm.competence) net.init(I.d, 1, I.prm);   // layer shapes / map
+    if (net.d != I.d || net.units() != g.U || net.L[0].has_competence != I.prm.competence) net.init(I.d, 1, I.prm);   // layer shapes / map
     net.P = I.prm; net.t = t[n];
     const bool pruned = t[n] >= tp;                            // the kernel prunes once, at t == tp
     for (int l = 0; l < 3; l++)
-      net.L[l].import_dense(&H[n * g.Hs + l * 64L * g.D], &p[n * g.ps + l * 16L * g.D], &W[n * g.Ws + g.wofs[l]],
-                            &M[n * g.Ms + g.mofs[l]], &A[n * g.Ms + g.mofs[l]], &m[n * g.ms + l * 256L], pruned, &Q[n * g.Qs + l * 64L]);
+      net.L[l].import_dense(&H[n * g.Hs + l * 4L * g.U * g.D], &p[n * g.ps + (long)l * g.U * g.D], &W[n * g.Ws + g.wofs[l]],
+                            &M[n * g.Ms + g.mofs[l]], &A[n * g.Ms + g.mofs[l]], &m[n * g.ms + l * 16L * g.U], pruned, &Q[n * g.Qs + l * 4L * g.U]);
   }
   return true;
 }

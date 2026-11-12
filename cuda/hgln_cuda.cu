@@ -2,11 +2,13 @@
 // hgln_cuda.cu - host program for the HGLN CUDA kernel. NOT RUN ON A GPU: nvcc was not available. The kernel logic is
 // tested with cuda_emu.cpp and the kernel compiles to PTX with clang (cuda/hgln_ptx.cu); this file has not been compiled.
 // Build: nvcc -O3 -std=c++17 -Iinclude -Icuda cuda/hgln_cuda.cu -o hgln_cuda
-//   hgln_cuda selftest d nets T [v42]  compare the GPU result with the CPU network (max abs prediction / state difference)
-//   hgln_cuda bench d nets T [v42]     time T samples for `nets` independent networks
+//   hgln_cuda selftest d nets T [v42] [units=N] [fanout]  compare the GPU result with the CPU network (max abs
+//                                      prediction / state difference)
+//   hgln_cuda bench d nets T [v42] [units=N] [fanout]     time T samples for `nets` independent networks
 //   v42: the version 4.2 competence-weighted mixture (Params::competence = true); default the 4.3 plain average
-// The per-sample scratch goes in dynamic shared memory when it fits (d <= 128 in float64 fits in 48 KB), otherwise in
-// global memory. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
+//   units=8|12|16: Params::units (default 16); fanout: Params::fanout (layer 3 reads layer 1's outputs)
+// The per-sample scratch goes in dynamic shared memory when it fits (d <= 128 in float64 fits in 48 KB for every
+// unit count), otherwise in global memory. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_host.h"
 #include <cstdio>
 #include <cstdlib>
@@ -37,10 +39,17 @@ static Dev upload(const HgDims& g, HgHostState& st, const std::vector<hreal>& X,
   return v;
 }
 int main(int argc, char** argv) {
-  if (argc < 5) { fprintf(stderr, "usage: hgln_cuda selftest|bench d nets T [v42]\n"); return 1; }
-  std::string mode = argv[1]; int d = atoi(argv[2]), nets = atoi(argv[3]), T = atoi(argv[4]);
-  if (d > HG_MAXN) { fprintf(stderr, "d must be <= %d\n", HG_MAXN); return 1; }
-  HgDims g = hg_dims(d); hgln::Rng rng(12345);
+  if (argc < 5) { fprintf(stderr, "usage: hgln_cuda selftest|bench d nets T [v42] [units=N] [fanout]\n"); return 1; }
+  std::string mode = argv[1]; int d = atoi(argv[2]), nets = atoi(argv[3]), T = atoi(argv[4]), units = 16; bool v42 = false, fanout = false;
+  for (int i = 5; i < argc; i++) {
+    std::string a = argv[i];
+    if (a == "v42") v42 = true;
+    else if (a == "fanout") fanout = true;
+    else if (a.rfind("units=", 0) == 0) units = atoi(a.c_str() + 6);
+    else { fprintf(stderr, "unknown option %s\n", argv[i]); return 1; }
+  }
+  if (d < 1 || d > HG_MAXN || !hg_valid_units(units)) { fprintf(stderr, "need 1 <= d <= %d and units 8, 12 or 16\n", HG_MAXN); return 1; }
+  HgDims g = hg_dims(d, units); hgln::Rng rng(12345);
   std::vector<hreal> X((size_t)T * d), Y((size_t)nets * T);
   for (int t = 0; t < T; t++) {
     for (int i = 0; i < d; i++) X[(size_t)t * d + i] = 2 * rng.uni() - 1;
@@ -48,7 +57,7 @@ int main(int argc, char** argv) {
     for (int n = 0; n < nets; n++) Y[(size_t)n * T + t] = n % 3 == 0 ? y : (n % 3 == 1 ? -y : 0.5 * y);
   }
   hgln::Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05);
-  prm.competence = argc > 5 && std::string(argv[5]) == "v42";
+  prm.competence = v42; prm.units = units; prm.fanout = fanout;
   std::vector<Net<hreal>> init(nets), ref(nets);
   for (int n = 0; n < nets; n++) { init[n].init(d, 7 + n, prm); ref[n] = init[n]; }
   // scratch in dynamic shared memory if the device allows that much per block, else in global memory
@@ -63,7 +72,7 @@ int main(int argc, char** argv) {
   cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
   CK(cudaEventRecord(e0));
   hgln_run<<<nets, threads, use_smem ? smem : 0>>>(g, v.H, v.Q, v.p, v.W, v.M, v.A, v.m, v.S, v.X, v.Y, v.P, v.t, T, (hreal)prm.glr0, (hreal)prm.glr1,
-                              (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm, st.competence);
+                              (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm, st.competence, st.units, st.fanout);
   CK(cudaGetLastError()); CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
   float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
   printf("GPU: %d networks x %d samples in %.2f ms = %.2f us per sample (all networks in parallel)\n", nets, T, ms, 1000.0 * ms / T);
@@ -82,7 +91,8 @@ int main(int argc, char** argv) {
       for (int t = 0; t < T; t++) { hreal pr = ref[n].predict(&X[(size_t)t * d]); ref[n].learn(Y[(size_t)n * T + t]); wp = std::max(wp, std::fabs((double)pr - (double)P[(size_t)n * T + t])); }
       ws = std::max(ws, hg_state_diff(g, st, n, ref[n]));
     }
-    printf("selftest d=%d nets=%d T=%d competence=%d: max |prediction diff| = %.3g, max |state diff| = %.3g (%s)\n", d, nets, T, st.competence, wp, ws,
+    printf("selftest d=%d nets=%d T=%d competence=%d units=%d %s: max |prediction diff| = %.3g, max |state diff| = %.3g (%s)\n", d, nets, T,
+           st.competence, st.units, st.fanout ? "fanout" : "chain", wp, ws,
            sizeof(hreal) == 4 ? "float32" : "float64");
   }
   hreal* bufs[] = {v.H, v.Q, v.p, v.W, v.M, v.A, v.m, v.S, v.X, v.Y, v.P};

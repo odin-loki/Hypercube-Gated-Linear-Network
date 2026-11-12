@@ -128,13 +128,18 @@ if(HGLN_BUILD_TESTS)
   add_dependencies(hgln_test_gpu hgln_mock_cuda hgln_mock_hip)
   set(_mc "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/hgln_mockcuda")
   set(_mh "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/hgln_mockhip")
-  # name | api | environment (beyond the mock's library path)
+  # name | api | environment (beyond the mock's library path) | extra arguments (Params::units / fanout variants)
   set(_cases
     "cuda|cuda|"
     "hip|hip|"
     "cuda_sm70|cuda|MOCK_ARCH=sm_70"
     "hip_gfx1100|hip|MOCK_ARCH=gfx1100"
-    "cuda_small_smem|cuda|MOCK_SMEM_OPTIN=16384")
+    "cuda_small_smem|cuda|MOCK_SMEM_OPTIN=16384"
+    "cuda_u12|cuda||units=12"
+    "hip_u8|hip||units=8"
+    "cuda_u16_fanout|cuda||units=16 fanout"
+    "hip_u12_fanout|hip||units=12 fanout"
+    "cuda_u8_fanout_small_smem|cuda|MOCK_SMEM_OPTIN=16384|units=8 fanout")
   foreach(_c ${_cases})
     string(REPLACE "|" ";" _f "${_c}")
     list(GET _f 0 _name)
@@ -150,7 +155,12 @@ if(HGLN_BUILD_TESTS)
         list(APPEND _env ${_extra})
       endif()
     endif()
-    add_test(NAME hgln_gpu_mock_${_name} COMMAND hgln_test_gpu ${_api})
+    set(_args "")
+    if(_nf GREATER 3)
+      list(GET _f 3 _a)
+      separate_arguments(_args UNIX_COMMAND "${_a}")
+    endif()
+    add_test(NAME hgln_gpu_mock_${_name} COMMAND hgln_test_gpu ${_api} ${_args})
     set_tests_properties(hgln_gpu_mock_${_name} PROPERTIES ENVIRONMENT "${_env}" LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 900)
   endforeach()
   # without a driver library on the path: open() must fail with a reason (skipped when a real driver is installed)
@@ -164,4 +174,6 @@ if(HGLN_BUILD_TESTS)
     add_test(NAME hgln_gpu_cli_selftest_${_api} COMMAND hgln_gpu_cli selftest 8 2 600 ${_api})
     set_tests_properties(hgln_gpu_cli_selftest_${_api} PROPERTIES ENVIRONMENT "${_env}" LABELS gpu TIMEOUT 600)
   endforeach()
+  add_test(NAME hgln_gpu_cli_selftest_cuda_u12_fanout COMMAND hgln_gpu_cli selftest 8 2 600 cuda units=12 fanout v42)
+  set_tests_properties(hgln_gpu_cli_selftest_cuda_u12_fanout PROPERTIES ENVIRONMENT "${_mc}" LABELS gpu TIMEOUT 600)
 endif()

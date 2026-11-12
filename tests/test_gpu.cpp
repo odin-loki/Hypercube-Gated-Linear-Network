@@ -8,6 +8,10 @@
 //                                scratch; both mixtures: 4.3 plain average and 4.2 competence; several calls with
 //                                state resident; download, re-upload, continue; across the prune, the conditional
 //                                renormalisation of an out-of-range layer and the renormalisation at t = 4096)
+//   hgln_test_gpu cuda|hip units=N [fanout]   a shorter set of the same checks for Params::units = N (8, 12 or 16)
+//                                and/or Params::fanout (layer 3 reads layer 1): d = 8, 64, 100; both real types, both
+//                                scratch placements, both mixtures; across the prune, the out-of-range
+//                                renormalisation and the renormalisation at t = 4096
 //   hgln_test_gpu nodriver       open() without a driver must fail with a reason (exit 77 if a driver is present)
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_gpu.hpp"
@@ -34,11 +38,11 @@ static last_fn mock_last(Api api) {
 template <class T> static double state_diff(const Net<T>& a, const Net<T>& b) {
   double mx = 0;
   auto upd = [&](double x, double y) { mx = std::max(mx, std::fabs(x - y)); };
-  if (a.t != b.t || a.d != b.d) return INFINITY;
+  if (a.t != b.t || a.d != b.d || a.units() != b.units() || a.P.fanout != b.P.fanout) return INFINITY;
   for (int l = 0; l < 3; l++) {
     const auto &A = a.L[l], &B = b.L[l];
     if (A.pruned != B.pruned || A.has_competence != B.has_competence) return INFINITY;
-    for (int k = 0; k < 16; k++) {
+    for (int k = 0; k < A.U; k++) {
       for (int q = 0; q < 4; q++) {                       // the exact state: raw rows and squared norms
         upd(A.hyperplane_sqnorm(k, q), B.hyperplane_sqnorm(k, q));
         for (int i = 0; i < A.D; i++) { upd(A.hyperplane_raw(k, q, i), B.hyperplane_raw(k, q, i)); upd(A.hyperplane(k, q, i), B.hyperplane(k, q, i)); }
@@ -87,16 +91,17 @@ template <class T> static double ref_chunk(std::vector<Net<T>>& ref, const std::
 
 // competence: Params::competence (4.2 mixture). far: start layers 1 and 2 with |H|^2 just under 1e6 / just over 1e-6
 // (same directions), so the update soon takes them out of range and the layer renormalisation runs.
+// units, fanout: Params::units and Params::fanout.
 template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch scratch, int threads, const std::vector<int>& chunks,
-                                   bool competence = false, bool far = false) {
+                                   bool competence = false, bool far = false, int units = 16, bool fanout = false) {
   const bool f64 = sizeof(T) == 8;
   const double tolP = f64 ? 0 : 1e-5, tolS = f64 ? 0 : (N > 4096 ? 1e-3 : 1e-4);
-  Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05); prm.competence = competence;
+  Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05); prm.competence = competence; prm.units = units; prm.fanout = fanout;
   std::vector<Net<T>> init(nets);
   for (int n = 0; n < nets; n++) {
     init[n].init(d, 7 + n, prm);
     if (far) for (int l = 0; l < 2; l++) {
-      std::vector<T> H((size_t)64 * init[n].L[l].D), q(64);
+      std::vector<T> H((size_t)4 * units * init[n].L[l].D), q(4 * units);
       init[n].L[l].get_hyperplanes_raw(H.data(), q.data());
       for (auto& v : H) v *= l == 0 ? (T)999.9999 : (T)1.000001e-3;
       init[n].L[l].set_hyperplanes(H.data());
@@ -149,7 +154,7 @@ template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch
   if (!bank.download(got, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
   double wS = 0; for (int n = 0; n < nets; n++) wS = std::max(wS, state_diff(got[n], ref[n]));
   if (far && N < 4096)   // the start norms only come back to (0.01, 100) through the out-of-range renormalisation
-    for (int n = 0; n < nets; n++) for (int l = 0; l < 2; l++) for (int k = 0; k < 16; k++) for (int q = 0; q < 4; q++) {
+    for (int n = 0; n < nets; n++) for (int l = 0; l < 2; l++) for (int k = 0; k < units; k++) for (int q = 0; q < 4; q++) {
       const double v = (double)ref[n].L[l].hyperplane_sqnorm(k, q);
       CHECK(v > 0.01 && v < 100, "far: layer %d was not renormalised (|H|^2 = %g)", l, v);
     }
@@ -165,9 +170,9 @@ template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch
     if (!bank.download(fin, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
     for (int n = 0; n < nets; n++) wR = std::max(wR, state_diff(fin[n], ref[n]));
   }
-  std::printf("%s %s d=%d nets=%d T=%d calls=%d threads=%d scratch=%s(%zu B) image=%s competence=%d%s: max |P diff| = %.3g, state diff mid = %.3g, end = %.3g, after re-upload = %.3g\n",
+  std::printf("%s %s d=%d nets=%d T=%d calls=%d threads=%d scratch=%s(%zu B) image=%s competence=%d units=%d %s%s: max |P diff| = %.3g, state diff mid = %.3g, end = %.3g, after re-upload = %.3g\n",
               gpu::api_name(api), f64 ? "float64" : "float32", d, nets, N, calls, threads, bank.shared_scratch() ? "shared" : "global",
-              bank.scratch_bytes(), bank.image().c_str(), competence ? 1 : 0, far ? " far" : "", wP, wMid, wS, wR);
+              bank.scratch_bytes(), bank.image().c_str(), competence ? 1 : 0, units, fanout ? "fanout" : "chain", far ? " far" : "", wP, wMid, wS, wR);
   CHECK(wP <= tolP && wMid <= tolS && wS <= tolS && wR <= std::max(tolP, tolS), "differences above tolerance (P %.3g, state %.3g)", tolP, tolS);
   std::fflush(stdout);
 }
@@ -209,6 +214,37 @@ int main(int argc, char** argv) {
   }
   using S = gpu::Scratch;
   const std::vector<int> chunks = {1, 200, 311, 3, 185};   // crosses the prune at sample 512
+  int units = 16; bool fanout = false, variant = false;
+  for (int i = 2; i < argc; i++) {
+    const std::string a = argv[i];
+    if (a == "fanout") fanout = true;
+    else if (a.rfind("units=", 0) == 0) units = std::atoi(a.c_str() + 6);
+    else { std::printf("unknown option %s\n", a.c_str()); return 1; }
+    variant = true;
+  }
+  if (variant) {   // Params::units / Params::fanout: a shorter set of the same checks
+    if (!valid_units(units)) { std::printf("units must be 8, 12 or 16\n"); return 1; }
+    {   // networks with different units (or fanout) cannot share a bank
+      gpu::Bank<double> b; std::string why;
+      Params p1(0.2, 0.05), p2 = p1; p1.units = units; p1.fanout = fanout; p2.units = units == 16 ? 8 : 16; p2.fanout = fanout;
+      std::vector<Net<double>> mix(2); mix[0].init(8, 1, p1); mix[1].init(8, 2, p2);
+      CHECK(b.open(api, 0, &why) && !b.upload(mix, &why), "upload of networks with different units must fail");
+      std::printf("mixed units: %s\n", why.c_str());
+      p2 = p1; p2.fanout = !fanout; mix[1].init(8, 2, p2);
+      CHECK(!b.upload(mix, &why), "upload of networks with different fanout must fail");
+    }
+    one<double>(api, 8, 2, 700, S::shared, 32, chunks, false, false, units, fanout);
+    one<double>(api, 64, 2, 600, S::global, 64, chunks, true, false, units, fanout);
+    one<double>(api, 100, 1, 560, S::shared, 64, chunks, true, false, units, fanout);
+    one<double>(api, 100, 1, 560, S::global, 64, chunks, false, false, units, fanout);
+    one<float>(api, 8, 2, 700, S::global, 32, chunks, true, false, units, fanout);
+    one<float>(api, 64, 1, 600, S::shared, 64, chunks, false, false, units, fanout);
+    one<double>(api, 8, 2, 300, S::shared, 32, {1, 150, 149}, true, true, units, fanout);                     // out-of-range renormalisation
+    one<double>(api, 8, 1, 4200, S::global, 32, {1, 200, 311, 3, 185, 3500}, false, false, units, fanout);    // past t = 4096
+    if (failures) { std::printf("%d FAILURES\n", failures); return 1; }
+    std::printf("ALL GPU TESTS PASSED (%s, units=%d %s)\n", gpu::api_name(api), units, fanout ? "fanout" : "chain");
+    return 0;
+  }
   for (bool cm : {false, true})
     for (S sc : {S::shared, S::global}) {
       one<double>(api, 8, 3, 700, sc, 32, chunks, cm);
