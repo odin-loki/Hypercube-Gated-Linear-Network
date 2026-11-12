@@ -52,7 +52,8 @@ struct Var {
   int wbits = 0, abits = 0;  // > 0: integer datapath - state (W, H, p) stored as wbits-bit integers, activations as abits-bit
                              //      integers (fixed scale per array), exact integer accumulation, stochastic-rounded updates;
                              //      per-unit control scalars (error, gate steps, LMS rate) kept as 32-bit values
-  bool shiftnorm = false;    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
+  bool shiftnorm = false;
+  int round_mode = 0;        // integer state updates: 0 stochastic, 1 nearest, 2 nearest + error feedback    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
   int hybrid = 0;            // 1: L3 reads previous-sample L2; 2: L2 reads previous-sample L1; 3: L2 and L3 both read current L1;
                              // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
@@ -239,10 +240,18 @@ struct Layer {
     }
     if (V.p_shared && mode != 1 && !skip_gate) for (int i = 0; i < D; i++) p[i] = std::min(std::max(p[i] + dp_acc[i], 0.0), 3.0);
   }
-  void quantise_int(Rng& r, int bits) {   // integer state: W in [-8, 8), H in [-2, 2), p in [-4, 4)
-    for (auto& x : W) x = qsr(x, bits, 3, r);
-    for (auto& x : H) x = qsr(x, bits, 1, r);
-    for (auto& x : p) x = qsr(x, bits, 2, r);
+  std::vector<double> rW, rH, rp;   // round_mode 2: rounding residual carried to the next update (error feedback)
+  // round_mode 0: stochastic rounding; 1: round to nearest (deterministic); 2: nearest with error feedback
+  void quantise_int(Rng& r, int bits, int mode = 0) {   // integer state: W in [-8, 8), H in [-2, 2), p in [-4, 4)
+    auto one = [&](std::vector<double>& v, std::vector<double>& res, int ib) {
+      if (mode == 2 && res.size() != v.size()) res.assign(v.size(), 0.0);
+      for (size_t i = 0; i < v.size(); i++) {
+        if (mode == 0) v[i] = qsr(v[i], bits, ib, r);
+        else if (mode == 1) v[i] = qn(v[i], bits, ib);
+        else { double t = v[i] + res[i], q = qn(t, bits, ib); res[i] = t - q; v[i] = q; }
+      }
+    };
+    one(W, rW, 3); one(H, rH, 1); one(p, rp, 2);
   }
   void quantise(Rng& r, int bits) {   // stochastic rounding to the fixed-point grid 2^-bits
     const double sc = std::ldexp(1.0, bits);
@@ -561,7 +570,7 @@ struct Net {
       for (int l = V.layers - 1; l >= 0; l--) L[l].update(y, gl, es.data() + l * V.U, V, pruned, l == 0 || !(V.hybrid == 3) ? 2 : 0);
     } else for (int l = 0; l < V.layers; l++) L[l].update(y, gl, es.data() + l * V.U, V, pruned);
     if (V.qbits > 0) for (auto& l : L) l.quantise(qrng, V.qbits);
-    if (V.wbits > 0) for (auto& l : L) l.quantise_int(qrng, V.wbits);
+    if (V.wbits > 0) for (auto& l : L) l.quantise_int(qrng, V.wbits, V.round_mode);
     t++;
     if (!pruned && t >= V.warm && t % 64 == 0) { for (auto& l : L) l.prune(V.density); pruned = true; }
   }
