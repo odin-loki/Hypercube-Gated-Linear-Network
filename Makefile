@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # make            build the CLI (float64/float32), tests and the CUDA emulator into build/
-# make test       run every test that can run without a GPU (about 15 seconds)
+# make test       run every test that can run without a GPU (about a minute)
 # make ptx        compile the CUDA kernel to PTX with clang (no CUDA SDK needed), sm_70 and sm_80, float64 and float32
 # make bench      the speed benchmarks quoted in docs/OPTIMISATION.md
 # ARCH=-march=x86-64-v3 (or any -march) builds a binary for other machines; the default tunes for this CPU.

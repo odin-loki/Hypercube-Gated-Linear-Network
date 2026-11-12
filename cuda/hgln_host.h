@@ -6,17 +6,20 @@
 #include "hgln_kernel.h"
 #include "hgln.hpp"
 #include <vector>
-struct HgHostState { std::vector<hreal> H, p, W, M, A, m, scratch; std::vector<long> t; };
+struct HgHostState { std::vector<hreal> H, Q, p, W, M, A, m, scratch; std::vector<long> t; int competence = 0; };
 // with_scratch = false: the kernel will use dynamic shared memory, so no global scratch is allocated.
+// H is packed raw (unnormalised) with its squared norms Q, the exact state the library keeps, so the kernel continues
+// bit for bit. s.competence is the nets' Params::competence (all nets must agree; it is the kernel's competence flag).
 inline void hg_pack(const HgDims& g, const std::vector<hgln::Net<hreal>>& nets, HgHostState& s, bool with_scratch = true) {
   size_t N = nets.size();
-  s.H.assign(N * g.Hs, 0); s.p.assign(N * g.ps, 0); s.W.assign(N * g.Ws, 0); s.M.assign(N * g.Ms, 0); s.A.assign(N * g.Ms, 0);
+  s.H.assign(N * g.Hs, 0); s.Q.assign(N * g.Qs, 0); s.p.assign(N * g.ps, 0); s.W.assign(N * g.Ws, 0); s.M.assign(N * g.Ms, 0); s.A.assign(N * g.Ms, 0);
   s.m.assign(N * g.ms, 0); s.scratch.assign(with_scratch ? N * (size_t)g.scs : 0, 0); s.t.assign(N, 0);
+  s.competence = N && nets[0].P.competence ? 1 : 0;
   for (size_t n = 0; n < N; n++) {
     s.t[n] = nets[n].t;
     for (int l = 0; l < 3; l++) {
       const auto& L = nets[n].L[l]; const int N1 = L.N1, D = g.D;
-      L.get_hyperplanes(&s.H[n * g.Hs + l * 64L * D]);
+      L.get_hyperplanes_raw(&s.H[n * g.Hs + l * 64L * D], &s.Q[n * g.Qs + l * 64L]);
       for (int k = 0; k < 16; k++) {
         for (int i = 0; i < D; i++) s.p[n * g.ps + l * 16L * D + k * D + i] = L.gate_weight(k, i);
         for (int c = 0; c < 16; c++) {
@@ -31,7 +34,8 @@ inline void hg_pack(const HgDims& g, const std::vector<hgln::Net<hreal>>& nets, 
     }
   }
 }
-// Max abs difference of the live state of network n against a CPU net. Skips the frozen W of pruned columns and,
+// Max abs difference of the live state of network n against a CPU net (raw hyperplanes and their squared norms, as
+// stored, plus the normalised rows the library's hyperplane() returns). Skips the frozen W of pruned columns and,
 // after the prune, the activity trace (both are dead state the CPU library no longer keeps).
 inline double hg_state_diff(const HgDims& g, const HgHostState& s, size_t n, const hgln::Net<hreal>& net) {
   double mx = 0;
@@ -39,7 +43,14 @@ inline double hg_state_diff(const HgDims& g, const HgHostState& s, size_t n, con
   for (int l = 0; l < 3; l++) {
     const auto& L = net.L[l]; const int N1 = L.N1, D = g.D;
     for (int k = 0; k < 16; k++) {
-      for (int b = 0; b < 4; b++) for (int i = 0; i < D; i++) upd(s.H[n * g.Hs + l * 64L * D + (k * 4 + b) * D + i], L.hyperplane(k, b, i));
+      for (int b = 0; b < 4; b++) {
+        const hreal q = s.Q[n * g.Qs + l * 64L + k * 4 + b], rs = (hreal)1 / std::sqrt(q);
+        upd(q, L.hyperplane_sqnorm(k, b));
+        for (int i = 0; i < D; i++) {
+          const hreal hv = s.H[n * g.Hs + l * 64L * D + (k * 4 + b) * D + i];
+          upd(hv, L.hyperplane_raw(k, b, i)); upd(hv * rs, L.hyperplane(k, b, i));
+        }
+      }
       for (int i = 0; i < D; i++) upd(s.p[n * g.ps + l * 16L * D + k * D + i], L.gate_weight(k, i));
       for (int c = 0; c < 16; c++) {
         upd(s.m[n * g.ms + l * 256L + k * 16 + c], L.competence(k, c));

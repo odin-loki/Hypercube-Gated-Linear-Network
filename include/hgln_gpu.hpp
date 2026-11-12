@@ -56,7 +56,9 @@ public:
   std::string image() const;                // the image in use: "ptx sm_80", "ptx sm_70", "gfx90a", ...
   std::size_t max_shared_bytes() const;     // dynamic shared memory one block can get on this device
 
-  // Copy networks to the device (replacing any there). All must have the same d (1..128) and the same Params.
+  // Copy networks to the device (replacing any there). All must have the same d (1..128) and the same Params
+  // (Params::competence included: the kernel runs the 4.3 plain average or, with competence, the 4.2 mixture).
+  // The exact state is copied (unnormalised hyperplanes and their squared norms), so results match the CPU library.
   bool upload(const std::vector<Net<T>>& nets, std::string* why = nullptr);
   // Stream T samples through every network: predict, then learn. X: T x d, Y: nets x T, P: nets x T or nullptr.
   bool run(const T* X, const T* Y, T* P, int samples, std::string* why = nullptr);

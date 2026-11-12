@@ -36,12 +36,12 @@ template <class T> struct Bank<T>::Impl {
   int nets = 0, d = 0; Params prm; HgDims g{};
   bool use_smem = false;
   std::vector<long> t;                                   // host copy of the sample counts
-  std::uint64_t H = 0, p = 0, W = 0, M = 0, A = 0, m = 0, S = 0, tc = 0;
+  std::uint64_t H = 0, Q = 0, p = 0, W = 0, M = 0, A = 0, m = 0, S = 0, tc = 0;
   std::uint64_t X = 0, Y = 0, P = 0; std::size_t capX = 0, capY = 0, capP = 0;   // per-call buffers (bytes)
 
   void free_state() {
     if (!rt) return;
-    for (std::uint64_t* b : {&H, &p, &W, &M, &A, &m, &S, &tc}) if (*b) { rt->device_free(*b); *b = 0; }
+    for (std::uint64_t* b : {&H, &Q, &p, &W, &M, &A, &m, &S, &tc}) if (*b) { rt->device_free(*b); *b = 0; }
     nets = 0; t.clear();
   }
   void free_io() {
@@ -119,7 +119,8 @@ template <class T> std::size_t Bank<T>::scratch_bytes() const { return p_ && p_-
 template <class T> long Bank<T>::samples_seen(std::size_t n) const { return p_ && n < p_->t.size() ? p_->t[n] : 0; }
 
 static bool same_params(const Params& a, const Params& b) {
-  return a.glr0 == b.glr0 && a.glr1 == b.glr1 && a.tau == b.tau && a.glob == b.glob && a.mu == b.mu && a.warm == b.warm;
+  return a.glr0 == b.glr0 && a.glr1 == b.glr1 && a.tau == b.tau && a.glob == b.glob && a.mu == b.mu && a.warm == b.warm &&
+         a.competence == b.competence;
 }
 
 template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::string* why) {
@@ -134,14 +135,15 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
   }
   const HgDims g = hg_dims(d);
   const std::size_t N = nets.size(), smem = (std::size_t)g.scs * sizeof(T);
-  // dense layout (cuda/hgln_dims.h), exactly as hg_pack in cuda/hgln_host.h
-  std::vector<T> H(N * g.Hs, 0), p(N * g.ps, 0), W(N * g.Ws, 0), M(N * g.Ms, 0), A(N * g.Ms, 0), m(N * g.ms, 0);
+  // dense layout (cuda/hgln_dims.h), exactly as hg_pack in cuda/hgln_host.h: raw (unnormalised) hyperplanes and their
+  // squared norms, the exact state the library keeps, so the device continues bit for bit
+  std::vector<T> H(N * g.Hs, 0), Q(N * g.Qs, 0), p(N * g.ps, 0), W(N * g.Ws, 0), M(N * g.Ms, 0), A(N * g.Ms, 0), m(N * g.ms, 0);
   std::vector<long> t(N, 0);
   for (std::size_t n = 0; n < N; n++) {
     t[n] = nets[n].t;
     for (int l = 0; l < 3; l++) {
       const auto& L = nets[n].L[l]; const int N1 = L.N1, D = g.D;
-      L.get_hyperplanes(&H[n * g.Hs + l * 64L * D]);
+      L.get_hyperplanes_raw(&H[n * g.Hs + l * 64L * D], &Q[n * g.Qs + l * 64L]);
       for (int k = 0; k < 16; k++) {
         for (int i = 0; i < D; i++) p[n * g.ps + l * 16L * D + k * D + i] = L.gate_weight(k, i);
         for (int c = 0; c < 16; c++) {
@@ -164,7 +166,7 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
         return fail(why, "scratch needs " + std::to_string(smem) + " bytes of shared memory per block; the device allows " + std::to_string(I.max_smem));
     }
     auto put = [&](std::uint64_t& b, const void* src, std::size_t bytes) { b = I.rt->device_alloc(bytes); I.rt->upload(b, src, bytes); };
-    put(I.H, H.data(), H.size() * sizeof(T)); put(I.p, p.data(), p.size() * sizeof(T)); put(I.W, W.data(), W.size() * sizeof(T));
+    put(I.H, H.data(), H.size() * sizeof(T)); put(I.Q, Q.data(), Q.size() * sizeof(T)); put(I.p, p.data(), p.size() * sizeof(T)); put(I.W, W.data(), W.size() * sizeof(T));
     put(I.M, M.data(), M.size() * sizeof(T)); put(I.A, A.data(), A.size() * sizeof(T)); put(I.m, m.data(), m.size() * sizeof(T));
     put(I.tc, t.data(), t.size() * sizeof(long));
     if (!sh) I.S = I.rt->device_alloc(N * (std::size_t)g.scs * sizeof(T));
@@ -189,10 +191,10 @@ template <class T> bool Bank<T>::run(const T* X, const T* Y, T* P, int samples, 
     I.rt->upload(I.X, X, xb); I.rt->upload(I.Y, Y, yb);
     HgDims g = I.g;
     std::uint64_t S = I.use_smem ? 0 : I.S;
-    int Ts = samples, warm = I.prm.warm;
+    int Ts = samples, warm = I.prm.warm, competence = I.prm.competence ? 1 : 0;
     T glr0 = (T)I.prm.glr0, glr1 = (T)I.prm.glr1, tau = (T)I.prm.tau, glob = (T)I.prm.glob, mu = (T)I.prm.mu;
     // kernelParams in hgln_run's parameter order (cuda/hgln_kernel.h)
-    void* args[] = {&g, &I.H, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm};
+    void* args[] = {&g, &I.H, &I.Q, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm, &competence};
     const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.opt.threads, 1, 1};
     I.rt->launch_kernel(I.fn, grid, block, I.use_smem ? (unsigned)((std::size_t)g.scs * sizeof(T)) : 0u, args);
     if (P) I.rt->download(P, I.P, yb);
@@ -216,10 +218,11 @@ template <class T> bool Bank<T>::download(std::vector<Net<T>>& nets, std::string
   const Impl& I = *p_;
   if (!I.nets) return fail(why, "no networks uploaded");
   const HgDims& g = I.g; const std::size_t N = (std::size_t)I.nets;
-  std::vector<T> H(N * g.Hs), p(N * g.ps), W(N * g.Ws), M(N * g.Ms), A(N * g.Ms), m(N * g.ms);
+  std::vector<T> H(N * g.Hs), Q(N * g.Qs), p(N * g.ps), W(N * g.Ws), M(N * g.Ms), A(N * g.Ms), m(N * g.ms);
   std::vector<long> t(N);
   try {
-    I.rt->download(H.data(), I.H, H.size() * sizeof(T)); I.rt->download(p.data(), I.p, p.size() * sizeof(T));
+    I.rt->download(H.data(), I.H, H.size() * sizeof(T)); I.rt->download(Q.data(), I.Q, Q.size() * sizeof(T));
+    I.rt->download(p.data(), I.p, p.size() * sizeof(T));
     I.rt->download(W.data(), I.W, W.size() * sizeof(T)); I.rt->download(M.data(), I.M, M.size() * sizeof(T));
     I.rt->download(A.data(), I.A, A.size() * sizeof(T)); I.rt->download(m.data(), I.m, m.size() * sizeof(T));
     I.rt->download(t.data(), I.tc, t.size() * sizeof(long));
@@ -232,12 +235,12 @@ template <class T> bool Bank<T>::download(std::vector<Net<T>>& nets, std::string
   const long tp = hg_prune_time(I.prm.warm);
   for (std::size_t n = 0; n < N; n++) {
     auto& net = nets[n];
-    if (net.d != I.d) net.init(I.d, 1, I.prm);
+    if (net.d != I.d || net.L[0].has_competence != I.prm.competence) net.init(I.d, 1, I.prm);   // layer shapes / map
     net.P = I.prm; net.t = t[n];
     const bool pruned = t[n] >= tp;                            // the kernel prunes once, at t == tp
     for (int l = 0; l < 3; l++)
       net.L[l].import_dense(&H[n * g.Hs + l * 64L * g.D], &p[n * g.ps + l * 16L * g.D], &W[n * g.Ws + g.wofs[l]],
-                            &M[n * g.Ms + g.mofs[l]], &A[n * g.Ms + g.mofs[l]], &m[n * g.ms + l * 256L], pruned);
+                            &M[n * g.Ms + g.mofs[l]], &A[n * g.Ms + g.mofs[l]], &m[n * g.ms + l * 256L], pruned, &Q[n * g.Qs + l * 64L]);
   }
   return true;
 }
