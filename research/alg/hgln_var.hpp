@@ -53,7 +53,7 @@ struct Var {
                              //      integers (fixed scale per array), exact integer accumulation, stochastic-rounded updates;
                              //      per-unit control scalars (error, gate steps, LMS rate) kept as 32-bit values
   bool shiftnorm = false;
-  int round_mode = 0;        // integer state updates: 0 stochastic, 1 nearest, 2 nearest + error feedback    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
+  int round_mode = 0;        // integer state updates: 0 stochastic, 1 nearest, 2 nearest + error feedback, 3 floor, 4 toward zero    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
   int hybrid = 0;            // 1: L3 reads previous-sample L2; 2: L2 reads previous-sample L1; 3: L2 and L3 both read current L1;
                              // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
@@ -248,6 +248,10 @@ struct Layer {
       for (size_t i = 0; i < v.size(); i++) {
         if (mode == 0) v[i] = qsr(v[i], bits, ib, r);
         else if (mode == 1) v[i] = qn(v[i], bits, ib);
+        else if (mode == 3 || mode == 4) {   // no rounding: drop the low bits (3: arithmetic shift = floor; 4: toward zero)
+          const double sc = std::ldexp(1.0, bits - 1 - ib), m = std::ldexp(1.0, bits - 1) - 1, y = v[i] * sc;
+          v[i] = std::min(std::max(mode == 3 ? std::floor(y) : std::trunc(y), -m), m) / sc;
+        }
         else { double t = v[i] + res[i], q = qn(t, bits, ib); res[i] = t - q; v[i] = q; }
       }
     };

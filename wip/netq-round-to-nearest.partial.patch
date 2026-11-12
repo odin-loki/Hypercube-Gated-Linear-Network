@@ -1,0 +1,623 @@
+diff --git a/include/hgln_q.hpp b/include/hgln_q.hpp
+index 501b735..e2421aa 100644
+--- a/include/hgln_q.hpp
++++ b/include/hgln_q.hpp
+@@ -11,8 +11,7 @@
+ //     16 for 12 or 16 units (12 units: 4 padding lanes, kept at zero: H = p = 0 there);
+ //   * H is [i][b][lane] int16, p is [i][lane] int16;
+ //   * W is [unit][slot pair][corner][slot parity] int16: the 16 rule dot products of one unit are one 16 x int32
+-//     accumulator over column pairs (AVX-512 VNNI vpdpwssd / AVX-512BW and AVX2 vpmaddwd), and the 32 int16 of a slot
+-//     pair line up with the 32 16-bit halves of the 16 Philox blocks that round them (one block per corner);
++//     accumulator over column pairs (AVX-512 VNNI vpdpwssd / AVX-512BW and AVX2 vpmaddwd);
+ //   * after the prune the inactive columns are removed from W and the activity trace A is freed.
+ #pragma once
+ #include "hgln.hpp"
+@@ -81,14 +80,12 @@ struct WorkQ {
+ // constants of a network, and of one learning step of one layer
+ struct QCfg { qspec::Fmt F; int K = 8; bool latch = false, credit = false; int32_t th14 = 0; int64_t cscale = 0; };
+ struct QStep {
+-  int64_t Mq = 0; uint32_t layer = 0, tl = 0, th = 0, k0 = 0, k1 = 0;
++  int64_t Mq = 0; uint32_t layer = 0;
+   const int32_t* es = nullptr;                                // U rule errors (Q(AB-2))
+   const int32_t* ge = nullptr;                                // U gate errors times the gate rate (Q24)
+   const int32_t* acc_in = nullptr;                            // 4 x UL gate steps routed here by upper layers (or null)
+   int32_t* acc_out = nullptr;                                 // 4 x UL routed to the lower layer (latch credit), or null
+   int32_t* scratch = nullptr;                                 // D x 4 x UL
+-  uint32_t* c0 = nullptr;                                     // Philox counters, 16 per group (NetQ::kRndGroups groups)
+-  uint32_t* rnd = nullptr;                                    // Philox output, 64 words per group
+ };
+ 
+ namespace detail {
+@@ -144,74 +141,6 @@ template <class T, int N> HGLN_INLINE IV<T, N> vclamp(IV<T, N> v, T lo, T hi) {
+ template <class T, int N> HGLN_INLINE IV<T, N> vrne(IV<T, N> v, int k) {     // spec rne, k >= 1 (no overflow by the callers' bounds)
+   return (v + (T)(((T)1 << (k - 1)) - 1) + ((v >> k) & (T)1)) >> k;
+ }
+-template <int N> HGLN_INLINE IV<int64_t, N> vsr(IV<int64_t, N> Y, int F, IV<int64_t, N> r16) {   // spec sr, F >= 16
+-  return (Y >> F) - (r16 < ((Y >> (F - 16)) & (int64_t)0xFFFF));   // a true compare is -1
+-}
+-
+-// ---- Philox4x32-10 on N lanes: counter (base + lane, c1, c2, c3), key (k0, k1); out[w][lane].
+-#if defined(__AVX512F__)
+-HGLN_INLINE __m512i philox_mulhilo(__m512i x, __m512i m, __m512i& lo) {
+-  const __m512i ev = _mm512_mul_epu32(x, m), od = _mm512_mul_epu32(_mm512_srli_epi64(x, 32), m);
+-  lo = _mm512_permutex2var_epi32(ev, _mm512_setr_epi32(0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30), od);
+-  return _mm512_permutex2var_epi32(ev, _mm512_setr_epi32(1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31), od);
+-}
+-#endif
+-#if defined(__AVX2__)
+-HGLN_INLINE __m256i philox_mulhilo(__m256i x, __m256i m, __m256i& lo) {
+-  const __m256i ev = _mm256_mul_epu32(x, m), od = _mm256_mul_epu32(_mm256_srli_epi64(x, 32), m);
+-  lo = _mm256_blend_epi32(ev, _mm256_slli_epi64(od, 32), 0xAA);
+-  return _mm256_blend_epi32(_mm256_srli_epi64(ev, 32), od, 0xAA);
+-}
+-#endif
+-template <class P, int N> HGLN_INLINE void philox_lanes(uint32_t base, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t k0, uint32_t k1, uint32_t (*out)[N]) {
+-#if defined(__AVX512F__)
+-  if (N == 16) {
+-    const __m512i M0 = _mm512_set1_epi32((int)0xD2511F53u), M1 = _mm512_set1_epi32((int)0xCD9E8D57u);
+-    __m512i a = _mm512_add_epi32(_mm512_set1_epi32((int)base), _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+-    __m512i b = _mm512_set1_epi32((int)c1), c = _mm512_set1_epi32((int)c2), d = _mm512_set1_epi32((int)c3);
+-    for (int r = 0; r < 10; r++) {
+-      __m512i lo0, lo1; const __m512i hi0 = philox_mulhilo(a, M0, lo0), hi1 = philox_mulhilo(c, M1, lo1);
+-      a = _mm512_xor_si512(_mm512_xor_si512(hi1, b), _mm512_set1_epi32((int)k0)); c = _mm512_xor_si512(_mm512_xor_si512(hi0, d), _mm512_set1_epi32((int)k1));
+-      b = lo1; d = lo0; k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+-    }
+-    _mm512_storeu_si512((void*)out[0], a); _mm512_storeu_si512((void*)out[1], b); _mm512_storeu_si512((void*)out[2], c); _mm512_storeu_si512((void*)out[3], d);
+-    return;
+-  }
+-#endif
+-#if defined(__AVX2__)
+-  if (N % 8 == 0) {
+-    const __m256i M0 = _mm256_set1_epi32((int)0xD2511F53u), M1 = _mm256_set1_epi32((int)0xCD9E8D57u);
+-    for (int h = 0; h < N; h += 8) {
+-      __m256i a = _mm256_add_epi32(_mm256_set1_epi32((int)(base + (uint32_t)h)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+-      __m256i b = _mm256_set1_epi32((int)c1), c = _mm256_set1_epi32((int)c2), d = _mm256_set1_epi32((int)c3);
+-      uint32_t q0 = k0, q1 = k1;
+-      for (int r = 0; r < 10; r++) {
+-        __m256i lo0, lo1; const __m256i hi0 = philox_mulhilo(a, M0, lo0), hi1 = philox_mulhilo(c, M1, lo1);
+-        a = _mm256_xor_si256(_mm256_xor_si256(hi1, b), _mm256_set1_epi32((int)q0)); c = _mm256_xor_si256(_mm256_xor_si256(hi0, d), _mm256_set1_epi32((int)q1));
+-        b = lo1; d = lo0; q0 += 0x9E3779B9u; q1 += 0xBB67AE85u;
+-      }
+-      _mm256_storeu_si256((__m256i*)(out[0] + h), a); _mm256_storeu_si256((__m256i*)(out[1] + h), b);
+-      _mm256_storeu_si256((__m256i*)(out[2] + h), c); _mm256_storeu_si256((__m256i*)(out[3] + h), d);
+-    }
+-    return;
+-  }
+-#endif
+-  uint32_t a[N], b[N], c[N], d[N];
+-  for (int l = 0; l < N; l++) { a[l] = base + (uint32_t)l; b[l] = c1; c[l] = c2; d[l] = c3; }
+-  for (int r = 0; r < 10; r++) {
+-    for (int l = 0; l < N; l++) {
+-      const uint64_t p0 = (uint64_t)0xD2511F53u * a[l], p1 = (uint64_t)0xCD9E8D57u * c[l];
+-      const uint32_t na = (uint32_t)(p1 >> 32) ^ b[l] ^ k0, nc = (uint32_t)(p0 >> 32) ^ d[l] ^ k1;
+-      b[l] = (uint32_t)p1; d[l] = (uint32_t)p0; a[l] = na; c[l] = nc;
+-    }
+-    k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+-  }
+-  for (int l = 0; l < N; l++) { out[0][l] = a[l]; out[1][l] = b[l]; out[2][l] = c[l]; out[3][l] = d[l]; }
+-}
+-// one 16-bit half of each lane's word: (w >> (16 half)) & 0xFFFF, as int64 lanes
+-template <int N> HGLN_INLINE IV<int64_t, N> half_lanes(const uint32_t* w, int half) {
+-  return cvt<IV<int64_t, N>>((ld<uint32_t, N>(w) >> (16 * half)) & 0xFFFFu);
+-}
+ 
+ // 16 rule dot products of one unit over np column pairs: acc[c] = sum W[c] x (int32, wrap-around).
+ #if defined(__AVX512BW__) && !defined(__AVX512VNNI__) && (defined(__GNUC__) || defined(__clang__))
+@@ -257,6 +186,38 @@ template <class P> HGLN_INLINE void dot16(const int16_t* HGLN_RESTRICT Wk, const
+ #endif
+ }
+ 
++// Batcher's odd-even merge sorting network for 16 keys (63 compare-exchanges), generated at compile time.
++struct Batcher16 { int n = 0; int8_t a[64] = {}, b[64] = {}; };
++constexpr Batcher16 make_batcher16() {
++  Batcher16 t;
++  for (int p = 1; p < 16; p <<= 1)
++    for (int k = p; k >= 1; k >>= 1)
++      for (int j = k % p; j + k < 16; j += 2 * k)
++        for (int i = 0; i < k && i + j + k < 16; i++)
++          if ((i + j) / (2 * p) == (i + j + k) / (2 * p)) { t.a[t.n] = (int8_t)(i + j); t.b[t.n] = (int8_t)(i + j + k); t.n++; }
++  return t;
++}
++static constexpr Batcher16 kBatcher16 = make_batcher16();
++static_assert(kBatcher16.n == 63, "Batcher odd-even merge sort of 16 keys has 63 compare-exchanges");
++template <int UL> HGLN_INLINE IV<int32_t, UL> vmin32(IV<int32_t, UL> a, IV<int32_t, UL> b) {
++#if defined(__AVX512F__) && !defined(HGLN_NO_VECTOR_EXT)
++  if constexpr (UL == 16) return (IV<int32_t, UL>)_mm512_min_epi32((__m512i)a, (__m512i)b);
++#endif
++#if defined(__AVX2__) && !defined(HGLN_NO_VECTOR_EXT)
++  if constexpr (UL == 8) return (IV<int32_t, UL>)_mm256_min_epi32((__m256i)a, (__m256i)b);
++#endif
++  return vsel<int32_t, UL>(a < b, a, b);
++}
++template <int UL> HGLN_INLINE IV<int32_t, UL> vmax32(IV<int32_t, UL> a, IV<int32_t, UL> b) {
++#if defined(__AVX512F__) && !defined(HGLN_NO_VECTOR_EXT)
++  if constexpr (UL == 16) return (IV<int32_t, UL>)_mm512_max_epi32((__m512i)a, (__m512i)b);
++#endif
++#if defined(__AVX2__) && !defined(HGLN_NO_VECTOR_EXT)
++  if constexpr (UL == 8) return (IV<int32_t, UL>)_mm256_max_epi32((__m256i)a, (__m256i)b);
++#endif
++  return vsel<int32_t, UL>(a < b, b, a);
++}
++
+ // sig14 on UL lanes (spec section 3): the two table entries of each lane come from one 32-bit gather.
+ template <int UL> HGLN_INLINE IV<int32_t, UL> sig14v(IV<int32_t, UL> v) {
+   typedef IV<int32_t, UL> V32;
+@@ -338,19 +299,26 @@ template <class P, int UL> HGLN_NOINLINE void gates(const LayerQ& L, const QCfg&
+     for (int q = 0; q < 16 * UL; q++) { h[q] = hs[q]; sel[q] = 1; }
+     return;
+   }
+-  V32 key[16], rank[16];
+-  for (int c = 0; c < 16; c++) { key[c] = hv[c] * 16 + (15 - c); rank[c] = splat<int32_t, UL>(0); }
+-  for (int c = 0; c < 16; c++)
+-    for (int c2 = c + 1; c2 < 16; c2++) {
+-      const V32 gt = key[c2] > key[c];                                             // -1 if c2 ranks above c
+-      rank[c] -= gt; rank[c2] += gt + 1;
+-    }
+-  const V32 Kv = splat<int32_t, UL>(C.K);
++  // The keys are distinct, so "rank < K" is "key >= the K-th largest key": sort a copy of the keys with Batcher's
++  // odd-even merge network (63 compare-exchanges per lane) and take that threshold.
++  V32 key[16], srt[16];
++  for (int c = 0; c < 16; c++) { key[c] = hv[c] * 16 + (15 - c); srt[c] = key[c]; }
++  for (int q = 0; q < kBatcher16.n; q++) {
++    const int i = kBatcher16.a[q], j = kBatcher16.b[q];
++    const V32 lo_ = vmin32<UL>(srt[i], srt[j]), hi_ = vmax32<UL>(srt[i], srt[j]); srt[i] = lo_; srt[j] = hi_;
++  }
++  const V32 thr = srt[16 - C.K] - 1;                       // ascending order: K-th largest at 16 - K
+   V32 sm = splat<int32_t, UL>(0), sl[16];
+-  for (int c = 0; c < 16; c++) { sl[c] = rank[c] < Kv; sm += hv[c] & sl[c]; st<int32_t, UL>(sel + c * UL, -sl[c]); }
++  for (int c = 0; c < 16; c++) { sl[c] = key[c] > thr; sm += hv[c] & sl[c]; st<int32_t, UL>(sel + c * UL, -sl[c]); }
++  // R = floor(2^30 / max(sm, 1)): double quotient (exact: sm < 2^20, so the quotient is never within 2^-20 of an
++  // integer it is not equal to, far above the double's rounding error), checked by one integer correction
+   alignas(64) int32_t smv[UL]; alignas(64) int64_t R[UL];
+-  st<int32_t, UL>(smv, sm);
+-  for (int k = 0; k < UL; k++) R[k] = (int64_t)((1u << 30) / (uint32_t)(smv[k] > 1 ? smv[k] : 1));
++  st<int32_t, UL>(smv, vclamp<int32_t, UL>(sm, 1, 1 << 30));
++  for (int k = 0; k < UL; k++) {
++    int64_t r = (int64_t)(1073741824.0 / (double)smv[k]);
++    if (r * smv[k] > (1 << 30)) r--; else if ((r + 1) * smv[k] <= (1 << 30)) r++;
++    R[k] = r;
++  }
+   const V64 Rv = ld<int64_t, UL>(R); const int shr = 30 - F.FA;
+   for (int c = 0; c < 16; c++)
+     st<int32_t, UL>(h + c * UL, cvt<V32>(vrne<int64_t, UL>(cvt<V64>(hv[c] & sl[c]) * Rv, shr)));
+@@ -387,66 +355,6 @@ template <class P, int UL> HGLN_NOINLINE void rules(const LayerQ& L, const QCfg&
+   for (int k = 0; k < UL; k++) w.o[k] = k < L.U ? o[k] : 0;
+ }
+ 
+-// ---- many Philox groups at once: group g has 16 lanes with counters c0[16 g + lane] and (c1, c2, c3); out[(4 g + w) * 16
+-// + lane]. Four groups are computed together (independent chains hide the multiply latency).
+-#if defined(__AVX512F__)
+-HGLN_INLINE void philox_x4_512(const uint32_t* c0, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t k0, uint32_t k1, uint32_t* out, int n) {
+-  const __m512i M0 = _mm512_set1_epi32((int)0xD2511F53u), M1 = _mm512_set1_epi32((int)0xCD9E8D57u);
+-  __m512i a[4], b[4], c[4], d[4];
+-  for (int g = 0; g < 4; g++) { a[g] = _mm512_loadu_si512((const void*)(c0 + 16 * (g < n ? g : 0))); b[g] = _mm512_set1_epi32((int)c1); c[g] = _mm512_set1_epi32((int)c2); d[g] = _mm512_set1_epi32((int)c3); }
+-  for (int r = 0; r < 10; r++) {
+-    const __m512i K0 = _mm512_set1_epi32((int)k0), K1 = _mm512_set1_epi32((int)k1);
+-    for (int g = 0; g < 4; g++) {
+-      __m512i lo0, lo1; const __m512i hi0 = philox_mulhilo(a[g], M0, lo0), hi1 = philox_mulhilo(c[g], M1, lo1);
+-      a[g] = _mm512_xor_si512(_mm512_xor_si512(hi1, b[g]), K0); c[g] = _mm512_xor_si512(_mm512_xor_si512(hi0, d[g]), K1);
+-      b[g] = lo1; d[g] = lo0;
+-    }
+-    k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+-  }
+-  for (int g = 0; g < n; g++) {
+-    uint32_t* o = out + 64 * g;
+-    _mm512_storeu_si512((void*)o, a[g]); _mm512_storeu_si512((void*)(o + 16), b[g]); _mm512_storeu_si512((void*)(o + 32), c[g]); _mm512_storeu_si512((void*)(o + 48), d[g]);
+-  }
+-}
+-#endif
+-template <class P> HGLN_INLINE void philox_groups(const uint32_t* c0, int ng, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t k0, uint32_t k1, uint32_t* out) {
+-#if defined(__AVX512F__)
+-  for (int g = 0; g < ng; g += 4) philox_x4_512(c0 + 16 * g, c1, c2, c3, k0, k1, out + 64 * g, ng - g < 4 ? ng - g : 4);
+-#else
+-  for (int g = 0; g < ng; g++) {
+-    uint32_t a[16], b[16], c[16], d[16], q0 = k0, q1 = k1;
+-    for (int l = 0; l < 16; l++) { a[l] = c0[16 * g + l]; b[l] = c1; c[l] = c2; d[l] = c3; }
+-    for (int r = 0; r < 10; r++) {
+-      for (int l = 0; l < 16; l++) {
+-        const uint64_t p0 = (uint64_t)0xD2511F53u * a[l], p1 = (uint64_t)0xCD9E8D57u * c[l];
+-        const uint32_t na = (uint32_t)(p1 >> 32) ^ b[l] ^ q0, nc = (uint32_t)(p0 >> 32) ^ d[l] ^ q1;
+-        b[l] = (uint32_t)p1; d[l] = (uint32_t)p0; a[l] = na; c[l] = nc;
+-      }
+-      q0 += 0x9E3779B9u; q1 += 0xBB67AE85u;
+-    }
+-    uint32_t* o = out + 64 * g;
+-    for (int l = 0; l < 16; l++) { o[l] = a[l]; o[16 + l] = b[l]; o[32 + l] = c[l]; o[48 + l] = d[l]; }
+-  }
+-#endif
+-}
+-// Groups of the unit-lane arrays (p: array 2, H: array 1) of one layer step: UL = 16 lanes = units; UL = 8: two
+-// sub-blocks of 8 units per group (p: two i-batches; H: two bits).
+-template <int UL> struct RndMap {
+-  static int groups_p(int D) { const int nb = (D + 7) / 8; return UL == 16 ? nb : (nb + 1) / 2; }
+-  static int groups_h(int D) { const int nb = (D + 7) / 8; return UL == 16 ? 4 * nb : 2 * nb; }
+-  static void fill_p(int D, uint32_t* c0) {
+-    for (int g = 0; g < groups_p(D); g++) for (int l = 0; l < 16; l++)
+-      c0[16 * g + l] = UL == 16 ? (uint32_t)(g * 16 + l) : (uint32_t)((2 * g + (l >> 3)) * 16 + (l & 7));
+-  }
+-  static void fill_h(int D, uint32_t* c0) {
+-    for (int g = 0; g < groups_h(D); g++) for (int l = 0; l < 16; l++)
+-      c0[16 * g + l] = UL == 16 ? (uint32_t)(g * 16 + l) : (uint32_t)(((g >> 1) * 4 + 2 * (g & 1) + (l >> 3)) * 16 + (l & 7));
+-  }
+-  // the 4 words of lanes [lane0, lane0 + UL) for input i (and bit b)
+-  static const uint32_t* word_p(const uint32_t* R, int i) { const int bt = i >> 3; return UL == 16 ? R + 64 * bt + 16 * ((i >> 1) & 3) : R + 64 * (bt >> 1) + 16 * ((i >> 1) & 3) + 8 * (bt & 1); }
+-  static const uint32_t* word_h(const uint32_t* R, int i, int b) { const int bt = i >> 3; return UL == 16 ? R + 64 * (bt * 4 + b) + 16 * ((i >> 1) & 3) : R + 64 * (bt * 2 + (b >> 1)) + 16 * ((i >> 1) & 3) + 8 * (b & 1); }
+-};
+-
+ #if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+ #define HGLN_Q_AVX512 1
+ HGLN_INLINE __m512i rne64_512(__m512i v, int k) {
+@@ -454,15 +362,7 @@ HGLN_INLINE __m512i rne64_512(__m512i v, int k) {
+   const __m512i odd = _mm512_and_si512(_mm512_sra_epi64(v, kk), _mm512_set1_epi64(1));
+   return _mm512_sra_epi64(_mm512_add_epi64(_mm512_add_epi64(v, _mm512_set1_epi64(((int64_t)1 << (k - 1)) - 1)), odd), kk);
+ }
+-HGLN_INLINE __m512i sr64_512(__m512i Y, int F, __m512i r16) {
+-  const __m512i q = _mm512_sra_epi64(Y, _mm_cvtsi32_si128(F));
+-  const __m512i f16 = _mm512_and_si512(_mm512_srl_epi64(Y, _mm_cvtsi32_si128(F - 16)), _mm512_set1_epi64(0xFFFF));
+-  return _mm512_mask_add_epi64(q, _mm512_cmplt_epi64_mask(r16, f16), q, _mm512_set1_epi64(1));
+-}
+ HGLN_INLINE __m512i clamp64_512(__m512i v, int64_t lo, int64_t hi) { return _mm512_min_epi64(_mm512_max_epi64(v, _mm512_set1_epi64(lo)), _mm512_set1_epi64(hi)); }
+-HGLN_INLINE __m512i half8_512(const uint32_t* w, int half) {   // 8 lanes: (w >> 16 half) & 0xFFFF as int64
+-  return _mm512_and_si512(_mm512_srl_epi64(_mm512_cvtepu32_epi64(_mm256_loadu_si256((const __m256i*)w)), _mm_cvtsi32_si128(16 * half)), _mm512_set1_epi64(0xFFFF));
+-}
+ #endif
+ 
+ // sat32(div_rne(nu, de)) on UL lanes, de > 0 (spec 'div'): exact. AVX-512: double estimate, integer correction.
+@@ -505,13 +405,6 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+   const qs::Fmt& F = C.F; const int D = L.D, U = L.U;
+   const int32_t* HGLN_RESTRICT a = w.a.data(); const int32_t* HGLN_RESTRICT hs = w.hs.data(); const int32_t* HGLN_RESTRICT f = w.f.data();
+   const int32_t* HGLN_RESTRICT sel = w.sel.data();
+-  // all random words of this step: p and H groups, then W groups per unit
+-  const int gp = RndMap<UL>::groups_p(D), gh = RndMap<UL>::groups_h(D);
+-  uint32_t* HGLN_RESTRICT c0 = S.c0; uint32_t* HGLN_RESTRICT R = S.rnd;
+-  RndMap<UL>::fill_p(D, c0); RndMap<UL>::fill_h(D, c0 + 16 * gp);
+-  philox_groups<P>(c0, gp, 4 * S.layer + qs::kArrP, S.tl, S.th, S.k0, S.k1, R);
+-  philox_groups<P>(c0 + 16 * gp, gh, 4 * S.layer + qs::kArrH, S.tl, S.th, S.k0, S.k1, R + 64 * gp);
+-  const uint32_t* Rp = R; const uint32_t* Rh = R + 64 * gp;
+   // gate steps cb [b][lane] (Q30)
+   alignas(64) int64_t cb[4][UL];
+   {
+@@ -566,7 +459,7 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+     for (int i = 0; i < D; i++) {
+       const __m512i si = _mm512_set1_epi64(s[i]);
+       int16_t* HGLN_RESTRICT pi = &L.p[(size_t)i * UL]; const int16_t* HGLN_RESTRICT Hi = &L.H[(size_t)i * 4 * UL];
+-      int32_t* HGLN_RESTRICT Hri = Hr + (size_t)i * 4 * UL; const uint32_t* rp = RndMap<UL>::word_p(Rp, i);
++      int32_t* HGLN_RESTRICT Hri = Hr + (size_t)i * 4 * UL;
+       for (int hh = 0; hh < NH; hh++) {
+         const __m512i pv = _mm512_cvtepi16_epi64(_mm_loadu_si128((const __m128i*)(pi + 8 * hh))), cp = _mm512_mul_epi32(pv, si);
+         __m512i ssum = _mm512_setzero_si512();
+@@ -578,7 +471,7 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+           _mm256_storeu_si256((__m256i*)(Hri + b * UL + 8 * hh), _mm512_cvtepi64_epi32(hr));
+         }
+         const __m512i Y = _mm512_add_epi64(_mm512_sll_epi64(pv, _mm_cvtsi32_si128(Fp)), _mm512_mullo_epi64(ssum, si));
+-        const __m512i np_ = clamp64_512(sr64_512(Y, Fp, half8_512(rp + 8 * hh, i & 1)), 0, (int64_t)3 << F.FP);
++        const __m512i np_ = clamp64_512(rne64_512(Y, Fp), 0, (int64_t)3 << F.FP);
+         _mm_storeu_si128((__m128i*)(pi + 8 * hh), _mm512_cvtepi64_epi16(np_));
+       }
+     }
+@@ -597,7 +490,7 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+         n0 += r0 * r0; n1 += r1 * r1; n2 += r2 * r2; n3 += r3 * r3;
+         st<int32_t, UL>(Hri, cvt<V32>(r0)); st<int32_t, UL>(Hri + UL, cvt<V32>(r1)); st<int32_t, UL>(Hri + 2 * UL, cvt<V32>(r2)); st<int32_t, UL>(Hri + 3 * UL, cvt<V32>(r3));
+         const V64 Y = (pv << Fp) + ssum * si;
+-        st<int16_t, UL>(pi, cvt<IV<int16_t, UL>>(vclamp<int64_t, UL>(vsr<UL>(Y, Fp, half_lanes<UL>(RndMap<UL>::word_p(Rp, i), i & 1)), 0, (int64_t)3 << F.FP)));
++        st<int16_t, UL>(pi, cvt<IV<int16_t, UL>>(vclamp<int64_t, UL>(vrne<int64_t, UL>(Y, Fp), 0, (int64_t)3 << F.FP)));
+       }
+       st<int64_t, UL>(N2[0], n0); st<int64_t, UL>(N2[1], n1); st<int64_t, UL>(N2[2], n2); st<int64_t, UL>(N2[3], n3);
+     }
+@@ -635,10 +528,9 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+     for (int i = 0; i < D; i++) {
+       int16_t* HGLN_RESTRICT Hi = &L.H[(size_t)i * 4 * UL]; const int32_t* HGLN_RESTRICT Hri = Hr + (size_t)i * 4 * UL;
+       for (int b = 0; b < 4; b++) {
+-        const uint32_t* rh = RndMap<UL>::word_h(Rh, i, b);
+         for (int hh = 0; hh < NH; hh++) {
+           const __m512i hr = _mm512_cvtepi32_epi64(_mm256_loadu_si256((const __m256i*)(Hri + b * UL + 8 * hh)));
+-          __m512i nh = clamp64_512(sr64_512(_mm512_mullo_epi64(hr, rcv[b][hh]), Fr, half8_512(rh + 8 * hh, i & 1)), -F.MW, F.MW);
++          __m512i nh = clamp64_512(rne64_512(_mm512_mullo_epi64(hr, rcv[b][hh]), Fr), -F.MW, F.MW);
+           nh = _mm512_mask_blend_epi64(keep[b][hh], nh, _mm512_cvtepi16_epi64(_mm_loadu_si128((const __m128i*)(Hi + b * UL + 8 * hh))));
+           _mm_storeu_si128((__m128i*)(Hi + b * UL + 8 * hh), _mm512_cvtepi64_epi16(nh));
+         }
+@@ -650,68 +542,37 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+     for (int i = 0; i < D; i++) {
+       int16_t* HGLN_RESTRICT Hi = &L.H[(size_t)i * 4 * UL]; const int32_t* HGLN_RESTRICT Hri = Hr + (size_t)i * 4 * UL;
+       for (int b = 0; b < 4; b++) {
+-        const V64 nh = vclamp<int64_t, UL>(vsr<UL>(cvt<V64>(ld<int32_t, UL>(Hri + b * UL)) * rcv[b], Fr, half_lanes<UL>(RndMap<UL>::word_h(Rh, i, b), i & 1)), -F.MW, F.MW);
++        const V64 nh = vclamp<int64_t, UL>(vrne<int64_t, UL>(cvt<V64>(ld<int32_t, UL>(Hri + b * UL)) * rcv[b], Fr), -F.MW, F.MW);
+         st<int16_t, UL>(Hi + b * UL, cvt<IV<int16_t, UL>>(vsel<int64_t, UL>(keep[b], cvt<V64>(ld<int16_t, UL>(Hi + b * UL)), nh)));
+       }
+     }
+ #endif
+   }
+-  // rule step (normalised LMS), per unit over its active columns; random word of (slot q, corner c) = word (q>>1)&3,
+-  // half q&1 of the unit's group q>>3, lane c: the 32 halves of a word row are the 32 int16 of a W slot pair.
++  // rule step (normalised LMS), per unit over its active columns: W' = sat(W + rne(sc x, F))
+   const int Fw = 26 + F.AB - F.WB;
+   const int32_t* HGLN_RESTRICT x = w.x.data(); const int32_t* HGLN_RESTRICT h = w.h.data();
+-  // per unit: its rule steps sc (only the selected corners are non-zero), then the Philox blocks of exactly those
+-  // corners (all units together, 16 blocks per group); they are scattered to [unit batch][word][corner] - the words of
+-  // unselected corners are never used (their update is 0, which rounds to itself for any random number)
+-  alignas(64) int32_t scu[16][32]; int wg0[16], gw = 0, ne = 0;
+-  uint32_t* HGLN_RESTRICT ce = c0;                                // compressed counters
+-  uint16_t* HGLN_RESTRICT ent = reinterpret_cast<uint16_t*>(S.scratch);   // (unit batch group, corner) per entry; Hr is dead now
+   for (int k = 0; k < U; k++) {
+     int64_t h2 = 0;
+     for (int c = 0; c < 16; c++) h2 += (int64_t)h[c * UL + k] * h[c * UL + k];
+     const int64_t den = qs::rne(h2, 2 * F.FA - 18) * qs::rne(w.x2[k], 2 * F.FA - 12) + 1073742;
+     const int64_t c2 = qs::sat32(qs::div_rne((S.Mq * S.es[k]) * ((int64_t)1 << (38 - F.FA)), den));
+-    const int nb = ((L.ncol[k] + 1) / 2 + 3) / 4;
+-    wg0[k] = gw; gw += nb;
+-    for (int c = 0; c < 16; c++) {
+-      const int32_t v = qs::sat32(qs::rne(c2 * h[c * UL + k], F.FA)); scu[k][2 * c] = scu[k][2 * c + 1] = v;
+-      if (v) for (int B = 0; B < nb; B++) { ce[ne] = (uint32_t)((k << 16) | (B << 4) | c); ent[2 * ne] = (uint16_t)(wg0[k] + B); ent[2 * ne + 1] = (uint16_t)c; ne++; }
+-    }
+-  }
+-  const int nge = (ne + 15) / 16;
+-  for (int e = ne; e < 16 * nge; e++) ce[e] = 0;
+-  uint32_t* HGLN_RESTRICT Rc = R + 64 * (gp + gh);                // compressed output
+-  uint32_t* HGLN_RESTRICT Rw = Rc + 64 * nge;                     // [unit batch][word][corner]
+-  philox_groups<P>(ce, nge, 4 * S.layer + qs::kArrW, S.tl, S.th, S.k0, S.k1, Rc);
+-  for (int e = 0; e < ne; e++) {
+-    const uint32_t* src = Rc + 64 * (e >> 4) + (e & 15); uint32_t* dst = Rw + 64 * ent[2 * e] + ent[2 * e + 1];
+-    dst[0] = src[0]; dst[16] = src[16]; dst[32] = src[32]; dst[48] = src[48];
+-  }
+-  for (int k = 0; k < U; k++) {
+-    const int32_t* sc2 = scu[k]; bool any = false;
+-    for (int c = 0; c < 16; c++) any |= sc2[2 * c] != 0;
++    alignas(64) int32_t sc2[32]; bool any = false;
++    for (int c = 0; c < 16; c++) { const int32_t v = qs::sat32(qs::rne(c2 * h[c * UL + k], F.FA)); sc2[2 * c] = sc2[2 * c + 1] = v; any |= v != 0; }
+     if (!any) continue;
+     const int nc = L.ncol[k], np = (nc + 1) / 2; const int32_t* HGLN_RESTRICT ck = &L.cols[(size_t)k * L.cs];
+     int16_t* HGLN_RESTRICT Wk = &L.W[(size_t)k * L.cp * 32];
+-    const uint32_t* Rk = Rw + 64 * wg0[k];
+ #if defined(HGLN_Q_AVX512)
+     __m512i s64[4];
+     for (int qq = 0; qq < 4; qq++) s64[qq] = _mm512_cvtepi32_epi64(_mm256_load_si256((const __m256i*)(sc2 + 8 * qq)));
+-    const __m128i cF = _mm_cvtsi32_si128(Fw), cF16 = _mm_cvtsi32_si128(Fw - 16);
+-    const __m512i m16 = _mm512_set1_epi64(0xFFFF), one32 = _mm512_set1_epi32(1), lo32 = _mm512_set1_epi32(-F.MW), hi32 = _mm512_set1_epi32(F.MW);
++    const __m512i lo32 = _mm512_set1_epi32(-F.MW), hi32 = _mm512_set1_epi32(F.MW);
+     for (int q2 = 0; q2 < np; q2++) {
+-      const uint32_t* rw = Rk + 64 * (q2 >> 2) + 16 * (q2 & 3);
+       const int64_t x0 = x[ck[2 * q2]], x1 = 2 * q2 + 1 < nc ? x[ck[2 * q2 + 1]] : 0;
+       const __m512i xv = _mm512_mask_blend_epi64(0xAA, _mm512_set1_epi64(x0), _mm512_set1_epi64(x1));
+       int16_t* HGLN_RESTRICT Wq = Wk + q2 * 32;
+       for (int hh = 0; hh < 2; hh++) {                          // elements 16 hh .. 16 hh + 15 (corners 8 hh .. 8 hh + 7)
+-        const __m512i d0 = _mm512_mul_epi32(s64[2 * hh], xv), d1 = _mm512_mul_epi32(s64[2 * hh + 1], xv);
+-        const __m512i dq = _mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(_mm512_sra_epi64(d0, cF))), _mm512_cvtepi64_epi32(_mm512_sra_epi64(d1, cF)), 1);
+-        const __m512i fr = _mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(_mm512_and_si512(_mm512_srl_epi64(d0, cF16), m16))),
+-                                              _mm512_cvtepi64_epi32(_mm512_and_si512(_mm512_srl_epi64(d1, cF16), m16)), 1);
+-        const __m512i r16 = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)(rw + 8 * hh)));
+-        __m512i res = _mm512_add_epi32(_mm512_cvtepi16_epi32(_mm256_load_si256((const __m256i*)(Wq + 16 * hh))), dq);
+-        res = _mm512_mask_add_epi32(res, _mm512_cmplt_epi32_mask(r16, fr), res, one32);
++        const __m512i d0 = rne64_512(_mm512_mul_epi32(s64[2 * hh], xv), Fw), d1 = rne64_512(_mm512_mul_epi32(s64[2 * hh + 1], xv), Fw);
++        const __m512i dq = _mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(d0)), _mm512_cvtepi64_epi32(d1), 1);   // |.| < 2^25
++        const __m512i res = _mm512_add_epi32(_mm512_cvtepi16_epi32(_mm256_load_si256((const __m256i*)(Wq + 16 * hh))), dq);
+         _mm256_store_si256((__m256i*)(Wq + 16 * hh), _mm512_cvtepi32_epi16(_mm512_min_epi32(_mm512_max_epi32(res, lo32), hi32)));
+       }
+     }
+@@ -720,15 +581,11 @@ template <class P, int UL> HGLN_NOINLINE void update(LayerQ& L, const QCfg& C, c
+     const W64 sA = cvt<W64>(ld<int32_t, 16>(sc2)), sB = cvt<W64>(ld<int32_t, 16>(sc2 + 16));
+     const W64 odd = cvt<W64>(IV<int32_t, 16>{0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1}) == splat<int64_t, 16>(1);
+     for (int q2 = 0; q2 < np; q2++) {
+-      const uint32_t* rw = Rk + 64 * (q2 >> 2) + 16 * (q2 & 3);
+       const int64_t x0 = x[ck[2 * q2]], x1 = 2 * q2 + 1 < nc ? x[ck[2 * q2 + 1]] : 0;
+       const W64 xv = vsel<int64_t, 16>(odd, splat<int64_t, 16>(x1), splat<int64_t, 16>(x0));
+       int16_t* HGLN_RESTRICT Wq = Wk + q2 * 32;
+-      alignas(64) uint32_t rr[32];
+-      for (int c = 0; c < 16; c++) { rr[2 * c] = rw[c] & 0xFFFFu; rr[2 * c + 1] = rw[c] >> 16; }
+-      const W64 YA = (cvt<W64>(ld<int16_t, 16>(Wq)) << Fw) + sA * xv, YB = (cvt<W64>(ld<int16_t, 16>(Wq + 16)) << Fw) + sB * xv;
+-      st<int16_t, 16>(Wq, cvt<IV<int16_t, 16>>(vclamp<int64_t, 16>(vsr<16>(YA, Fw, cvt<W64>(ld<uint32_t, 16>(rr))), -F.MW, F.MW)));
+-      st<int16_t, 16>(Wq + 16, cvt<IV<int16_t, 16>>(vclamp<int64_t, 16>(vsr<16>(YB, Fw, cvt<W64>(ld<uint32_t, 16>(rr + 16))), -F.MW, F.MW)));
++      st<int16_t, 16>(Wq, cvt<IV<int16_t, 16>>(vclamp<int64_t, 16>(cvt<W64>(ld<int16_t, 16>(Wq)) + vrne<int64_t, 16>(sA * xv, Fw), -F.MW, F.MW)));
++      st<int16_t, 16>(Wq + 16, cvt<IV<int16_t, 16>>(vclamp<int64_t, 16>(cvt<W64>(ld<int16_t, 16>(Wq + 16)) + vrne<int64_t, 16>(sB * xv, Fw), -F.MW, F.MW)));
+     }
+ #endif
+   }
+@@ -847,8 +704,7 @@ template <class R = float> struct NetQ {
+     }
+     for (auto& a : acc) for (auto& v : a) v = 0;
+     scratch_();
+-    QStep S; S.Mq = qspec::round_param(P.mu, 16); S.tl = (uint32_t)t; S.th = (uint32_t)((uint64_t)t >> 32);
+-    S.k0 = (uint32_t)seed; S.k1 = (uint32_t)(seed >> 32); S.scratch = scr_.data(); S.c0 = c0_.data(); S.rnd = rnd_.data();
++    QStep S; S.Mq = qspec::round_param(P.mu, 16); S.scratch = scr_.data();
+     for (int l = 2; l >= 0; l--) {                           // upper layers first: latch credit reaches layer 1 now
+       const int lo = lower(l);
+       S.layer = (uint32_t)l; S.es = es + l * U; S.ge = ge + l * U; S.acc_in = acc[l];
+@@ -863,14 +719,8 @@ template <class R = float> struct NetQ {
+   size_t model_bytes() const { return L[0].model_bytes() + L[1].model_bytes() + L[2].model_bytes() + sizeof(*this); }
+ 
+  private:
+-  std::vector<int32_t> scr_; std::vector<uint32_t> c0_, rnd_;
+-  void scratch_() {                                          // Hr, and the Philox groups of the largest layer step
+-    const int D = L[0].D, nb = (D + 7) / 8; size_t g = (size_t)5 * nb + 2;
+-    for (auto& l : L) { size_t gw = 0; for (int k = 0; k < l.U; k++) gw += ((l.ncol[k] + 1) / 2 + 3) / 4; g = std::max(g, (size_t)5 * nb + 2 + 18 * gw); }
+-    const size_t n = std::max((size_t)D * 4 * L[0].UL, 16 * g);
+-    if (scr_.size() < n) scr_.assign(n, 0);
+-    if (c0_.size() < 16 * g) { c0_.assign(16 * g, 0); rnd_.assign(64 * g + 64 * 4, 0); }
+-  }
++  std::vector<int32_t> scr_;
++  void scratch_() { const size_t n = (size_t)L[0].D * 4 * L[0].UL; if (scr_.size() < n) scr_.assign(n, 0); }   // Hr
+   // the one-off prune (spec section 6): compacts W to the kept columns and frees A
+   static void prune(LayerQ& q) {
+     const int U = q.U, n = q.n;
+diff --git a/include/hgln_qspec.hpp b/include/hgln_qspec.hpp
+index 9b36b2e..6a990f2 100644
+--- a/include/hgln_qspec.hpp
++++ b/include/hgln_qspec.hpp
+@@ -24,20 +24,15 @@
+ //    sat(v, M)   = min(max(v, -M), M);   >> is an arithmetic (floor) shift.
+ //    div(n, d)   = n / d rounded to nearest, ties to even (d > 0), exact integer division.
+ //    isqrt(n)    = floor(sqrt(n)) of a uint64 (exact).
+-//    sr(Y, F, r) = stochastic rounding of Y / 2^F with a 16-bit random r:  (Y >> F) + (r < frac16), frac16 = the top
+-//                  16 bits of the F fraction bits of Y (F >= 16 here).  P(round up) = frac16 / 2^16.
++//    Every rounding is round-to-nearest-even (rne), including the state updates (W, H, p): no random numbers are
++//    used after initialisation (version 5.0 study: round-to-nearest is as accurate as stochastic rounding,
++//    research/alg/results46.jsonl).
+ //
+-// 1. Random numbers: Philox4x32-10 (Salmon et al., SC'11 / Random123; the same algorithm as FORGE's
++// 1. Initial hyperplanes: Philox4x32-10 (Salmon et al., SC'11 / Random123; the same algorithm as FORGE's
+ //    support/include/forge/rand/philox.hpp), key = (seed lo32, seed hi32) of the network seed, counter
+-//    (c0, c1, c2, c3) = (element block, 4*layer + array, t lo32, t hi32); t = number of learn() calls before this one.
+-//    Each block gives 4 words = 8 16-bit halves (half 0 = low 16 bits).  Element -> (c0, word, half):
+-//      W  (array 0) unit k, active slot q (q-th active column of unit k, ascending; bias last), corner c:
+-//                   c0 = k<<16 | (q>>3)<<4 | c,      word (q>>1)&3, half q&1
+-//      H  (array 1) unit k, bit b, input i:  c0 = ((i>>3)*4 + b)<<4 | k,   word (i>>1)&3, half i&1
+-//      p  (array 2) unit k, input i:         c0 = (i>>3)<<4 | k,            word (i>>1)&3, half i&1
+-//      initial hyperplanes (array 3, t = 2^64 - 1): c0 = (i*4 + b)<<4 | k; v = sum of the 8 halves of words 0..3
+-//                   ... see init_hyperplane() (sum of 4 halves of words 0,1 minus 131070: Irwin-Hall approximation
+-//                   of a Gaussian), last (bias) component 0, then H_i = sat(div(v_i << FH, isqrt(sum v^2)), MW).
++//    (c0, c1, c2, c3) = ((i*4 + b)<<4 | k, 4*layer + 3, 2^32 - 1, 2^32 - 1) for unit k, bit b, input i:
++//    v_i = sum of the four 16-bit halves of words 0 and 1 minus 131070 (Irwin-Hall approximation of a Gaussian),
++//    last (bias) component 0, then H_i = sat(div(v_i << FH, isqrt(sum v^2)), MW)  (init_component/init_normalise).
+ //
+ // 2. Input.  xq_j = sat(nearbyint(x_j * 2^FA), MA)  (NaN -> 0; the conversion clamps before rounding).
+ //    Side information (unit vector [x, 1] / |[x, 1]|):  nn = ONE^2 + sum xq_j^2 (int64);  g = isqrt(nn << 6);
+@@ -85,16 +80,16 @@
+ //      and bit) += clamp(rne(ge Gc, 18), +-53687091). Layers are updated 3, 2, 1, so layer 1 gets it in the same step.
+ //      ge for the gates: Params::gate_err = 0 the mixed error es, 1 the unit's own error yq - o, 2 the global eg.
+ //    p step (old H) and hyperplane step (old p), all inputs i < D = d + 1:
+-//      Y = p_i << (29 + AB) + s_i sum_b cb_b H_bi;   p_i' = clamp(sr(Y, 29 + AB), 0, 3 << FP)
++//      Y = p_i << (29 + AB) + s_i sum_b cb_b H_bi;   p_i' = clamp(rne(Y, 29 + AB), 0, 3 << FP)
+ //      Hr_bi = (H_bi << 8) + rne(cb_b (p_i s_i), 19 + AB)                                   [Q(FH + 8), int32]
+ //      N2_b = sum_i Hr_bi^2 (int64); N2 = 0: H_b unchanged; else rc = floor(2^54 / isqrt(N2_b));
+-//      H_bi' = sat(sr(Hr_bi rc, 56 - WB), MW)                    (renormalised to unit length on every update)
++//      H_bi' = sat(rne(Hr_bi rc, 56 - WB), MW)                    (renormalised to unit length on every update)
+ //    rule step (normalised LMS):  h2 = sum_c h_c^2;  x2 = sum_{active j} x_j^2                              [int64]
+ //      den = rne(h2, 2 FA - 18) rne(x2, 2 FA - 12) + 1073742                                     [Q30; 1e-3 at Q30]
+ //      c2 = sat32(div((M es_k) << (38 - FA), den)), M = round_even(mu 65536)                                 [Q24]
+ //      sc_c = sat32(rne(c2 h_c, FA))                                                                         [Q24]
+-//      W_cj' = sat(sr((W_cj << F) + sc_c x_j, F), MW),  F = 26 + AB - WB, for every active column j
+-//      (unselected corners have sc = 0: W is unchanged, no random number is consumed).
++//      W_cj' = sat(rne((W_cj << F) + sc_c x_j, F), MW) = sat(W_cj + rne(sc_c x_j, F), MW),  F = 26 + AB - WB, for every
++//      active column j (unselected corners have sc = 0: W is unchanged).
+ //    activity (until the prune; Q(FA+8), initial div(2^(FA+8), 1000)):  A_j += rne(1311 ((|x_j| << 8) - A_j), 16)
+ //    t += 1.  Prune (once, the first t >= warm with t % 64 == 0): per unit, nt = n <= 4 ? n : (6 n + 5) / 10 inputs
+ //    kept; score_j = (sum_c |W_cj|) A_j (int64); stable ascending sort of the active inputs (bias excluded); drop the
+@@ -129,7 +124,7 @@ HGLN_QHD Philox4 philox4x32_10(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c
+ }
+ HGLN_QHD uint32_t half16(const Philox4& b, int word, int half) { return (b.v[word] >> (16 * half)) & 0xFFFFu; }
+ 
+-enum : uint32_t { kArrW = 0, kArrH = 1, kArrP = 2, kArrInit = 3 };
++enum : uint32_t { kArrInit = 3 };              // Philox array id of the initial hyperplanes
+ 
+ // ---- rounding and integer helpers (exact; any platform)
+ HGLN_QHD int64_t rne(int64_t v, int k) {                    // v / 2^k, nearest, ties to even; k <= 0: v * 2^-k
+@@ -139,11 +134,6 @@ HGLN_QHD int64_t rne(int64_t v, int k) {                    // v / 2^k, nearest,
+ HGLN_QHD int64_t sat(int64_t v, int64_t m) { return v < -m ? -m : (v > m ? m : v); }
+ HGLN_QHD int64_t clampi(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
+ HGLN_QHD int32_t sat32(int64_t v) { return (int32_t)clampi(v, -2147483647LL, 2147483647LL); }
+-HGLN_QHD int64_t sr(int64_t Y, int F, uint32_t r16) {      // F >= 16
+-  const int64_t q = Y >> F;
+-  const uint32_t f16 = (uint32_t)((Y >> (F - 16)) & 0xFFFF);
+-  return q + (r16 < f16 ? 1 : 0);
+-}
+ // div_rne and isqrt are exact; they start from a double-precision estimate (faster than a 64-bit hardware divide)
+ // and correct it with integer arithmetic, so the result does not depend on how the estimate was rounded.
+ HGLN_QHD int64_t div_floor(int64_t n, int64_t d, int64_t* rem) {   // floor(n / d) and n - d floor(n / d), d > 0
+diff --git a/research/alg/hgln_var.hpp b/research/alg/hgln_var.hpp
+index cf2d7a2..a3166fd 100644
+--- a/research/alg/hgln_var.hpp
++++ b/research/alg/hgln_var.hpp
+@@ -53,7 +53,7 @@ struct Var {
+                              //      integers (fixed scale per array), exact integer accumulation, stochastic-rounded updates;
+                              //      per-unit control scalars (error, gate steps, LMS rate) kept as 32-bit values
+   bool shiftnorm = false;
+-  int round_mode = 0;        // integer state updates: 0 stochastic, 1 nearest, 2 nearest + error feedback    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
++  int round_mode = 0;        // integer state updates: 0 stochastic, 1 nearest, 2 nearest + error feedback, 3 floor, 4 toward zero    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
+   int hybrid = 0;            // 1: L3 reads previous-sample L2; 2: L2 reads previous-sample L1; 3: L2 and L3 both read current L1;
+                              // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
+   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
+@@ -248,6 +248,10 @@ struct Layer {
+       for (size_t i = 0; i < v.size(); i++) {
+         if (mode == 0) v[i] = qsr(v[i], bits, ib, r);
+         else if (mode == 1) v[i] = qn(v[i], bits, ib);
++        else if (mode == 3 || mode == 4) {   // no rounding: drop the low bits (3: arithmetic shift = floor; 4: toward zero)
++          const double sc = std::ldexp(1.0, bits - 1 - ib), m = std::ldexp(1.0, bits - 1) - 1, y = v[i] * sc;
++          v[i] = std::min(std::max(mode == 3 ? std::floor(y) : std::trunc(y), -m), m) / sc;
++        }
+         else { double t = v[i] + res[i], q = qn(t, bits, ib); res[i] = t - q; v[i] = q; }
+       }
+     };
+@@ -295,8 +299,6 @@ struct QNet {
+   } L[3];
+   std::vector<int32_t> s; int32_t S = 0;
+   static constexpr int32_t CB = 53687091;               // 0.05 at Q30
+-  uint32_t k0() const { return (uint32_t)seed; }
+-  uint32_t k1() const { return (uint32_t)(seed >> 32); }
+   void init(int d_, uint64_t seed_, const Var& V) {
+     if (!V.uniform) throw std::invalid_argument("intspec needs uniform=1");
+     if (V.hybrid != 0 && V.hybrid != 3) throw std::invalid_argument("intspec: hybrid must be 0 or 3 (fan-out)");
+@@ -399,7 +401,6 @@ struct QNet {
+     const int64_t yq = qs::quantise(y, F.FA, 1 << (F.FA + 6));
+     const int64_t eg = qs::div_rne(NU * yq - S, NU), G = qs::round_param(glob, 16), Mq = qs::round_param(mu, 16);
+     const int64_t glq = qs::gl_q24(t, glr0, glr1, tau);
+-    const uint32_t tl = (uint32_t)t, th = (uint32_t)((uint64_t)t >> 32);
+     for (auto& q : L) std::fill(q.acc.begin(), q.acc.end(), 0);
+     for (int l = 2; l >= 0; l--) {               // upper layers first: credit reaches the lower layer in this sample
+       QL& q = L[l]; QL* lo = lower(l); const int D = q.D, N1 = q.N1;
+@@ -442,15 +443,13 @@ struct QNet {
+             Hr[(size_t)b * D + i] = hr; N2[b] += hr * hr;
+           }
+           const int64_t Y = ((int64_t)q.p[(size_t)k * D + i] << (29 + F.AB)) + s[i] * ssum;
+-          const qs::Philox4 r = qs::philox4x32_10((uint32_t)(((i >> 3) << 4) | k), 4 * l + qs::kArrP, tl, th, k0(), k1());
+-          q.p[(size_t)k * D + i] = (int32_t)qs::clampi(qs::sr(Y, 29 + F.AB, qs::half16(r, (i >> 1) & 3, i & 1)), 0, 3 << F.FP);
++          q.p[(size_t)k * D + i] = (int32_t)qs::clampi(qs::rne(Y, 29 + F.AB), 0, 3 << F.FP);
+         }
+         for (int b = 0; b < 4; b++) {
+           if (N2[b] == 0) continue;
+           const int64_t rc = (int64_t)(((uint64_t)1 << 54) / qs::isqrt((uint64_t)N2[b]));
+           for (int i = 0; i < D; i++) {
+-            const qs::Philox4 r = qs::philox4x32_10((uint32_t)((((i >> 3) * 4 + b) << 4) | k), 4 * l + qs::kArrH, tl, th, k0(), k1());
+-            q.H[((size_t)k * 4 + b) * D + i] = (int32_t)qs::sat(qs::sr(Hr[(size_t)b * D + i] * rc, 56 - F.WB, qs::half16(r, (i >> 1) & 3, i & 1)), F.MW);
++            q.H[((size_t)k * 4 + b) * D + i] = (int32_t)qs::sat(qs::rne(Hr[(size_t)b * D + i] * rc, 56 - F.WB), F.MW);
+           }
+         }
+         // rule step
+@@ -463,13 +462,10 @@ struct QNet {
+         for (int c = 0; c < 16; c++) {
+           const int64_t sc = qs::sat32(qs::rne(c2 * q.h[k * 16 + c], F.FA));
+           if (sc == 0) continue;
+-          int slot = 0;
+-          for (int j = 0; j < N1; j++) {
++          for (int j = 0; j < N1; j++) {               // W' = rne((W << F) + sc x, F) = W + rne(sc x, F)
+             if (!q.M[(size_t)k * N1 + j]) continue;
+-            const qs::Philox4 r = qs::philox4x32_10((uint32_t)((k << 16) | ((slot >> 3) << 4) | c), 4 * l + qs::kArrW, tl, th, k0(), k1());
+             int32_t& w = q.W[((size_t)k * 16 + c) * N1 + j];
+-            w = (int32_t)qs::sat(qs::sr(((int64_t)w << FWs) + sc * q.x[j], FWs, qs::half16(r, (slot >> 1) & 3, slot & 1)), F.MW);
+-            slot++;
++            w = (int32_t)qs::sat(w + qs::rne(sc * q.x[j], FWs), F.MW);
+           }
+         }
+         if (!pruned) for (int j = 0; j < N1; j++) {
+diff --git a/tests/test_q.cpp b/tests/test_q.cpp
+index c04dde0..a44a1fa 100644
+--- a/tests/test_q.cpp
++++ b/tests/test_q.cpp
+@@ -3,7 +3,7 @@
+ // specification (research/alg/hgln_var.hpp, QNet / intspec=1): every prediction and the whole model state must be
+ // bit-identical, for d = 8 and 64, 16/12/8 units, both bit widths, the v5 defaults and the 4.3-like configuration,
+ // past the prune and beyond 4096 samples. Also: Philox known-answer vectors, the sigmoid table, the integer helpers,
+-// infer/run_streams/Classifier consistency. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
++// infer/run_streams/Classifier consistency. (Philox is used only for the initial hyperplanes.) Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
+ #include "hgln_q.hpp"
+ #include "../research/alg/hgln_var.hpp"
+ #include <cstdio>
+@@ -25,12 +25,6 @@ static void unit_tests() {
+     const qspec::Philox4 o = qspec::philox4x32_10(v.c[0], v.c[1], v.c[2], v.c[3], v.k[0], v.k[1]);
+     CHECK(!std::memcmp(o.v, v.r, 16), "Philox4x32-10 known-answer vector");
+   }
+-  // the lane-parallel Philox of the kernels equals the scalar one
+-  uint32_t out[4][16];
+-  detail::qk::philox_lanes<detail::qk::HeaderPolicy, 16>(0x12340, 7, 99, 1, 0xdeadbeefu, 42, out);
+-  bool lanes_ok = true;
+-  for (int l = 0; l < 16; l++) { const qspec::Philox4 o = qspec::philox4x32_10(0x12340 + l, 7, 99, 1, 0xdeadbeefu, 42); for (int w = 0; w < 4; w++) lanes_ok &= o.v[w] == out[w][l]; }
+-  CHECK(lanes_ok, "lane-parallel Philox equals the scalar Philox");
+   // sigmoid table: within 1 of the exact values, symmetric, monotone
+   int bad = 0;
+   for (int i = 0; i <= 1024; i++) {
+@@ -50,7 +44,6 @@ static void unit_tests() {
+   bool sq = true;
+   for (uint64_t n : {0ull, 1ull, 2ull, 3ull, 4ull, 15ull, 16ull, 17ull, 1ull << 40, (1ull << 40) - 1, 0xFFFFFFFFFFFFull, ~0ull >> 1}) { uint64_t r = qspec::isqrt(n); sq &= r * r <= n && (r + 1) * (r + 1) > n; }
+   CHECK(sq, "isqrt exact");
+-  CHECK(qspec::sr(5 << 16, 16, 0) == 5 && qspec::sr((5 << 16) + 0x8000, 16, 0x7FFF) == 6 && qspec::sr((5 << 16) + 0x8000, 16, 0x8000) == 5 && qspec::sr(-1, 16, 0xFFFE) == 0, "stochastic rounding");
+   const int32_t g0 = qspec::gl_q24(0, 0.2, 0.05, 1000), g1 = qspec::gl_q24(1000, 0.2, 0.05, 1000), g2 = qspec::gl_q24(100000, 0.2, 0.05, 1000);
+   CHECK(std::abs(g0 - 3355443) <= 1 && std::abs(g1 - (int)std::nearbyint((0.05 + 0.15 * std::exp(-1.0)) * 16777216)) <= 2 && g2 == 838861, "gate-rate schedule (%d %d %d)", g0, g1, g2);
+ }
