@@ -261,6 +261,32 @@ template <class T> struct Layer {
   T rule(int k, int c, int j) const { int q = slot(k, j); return q < 0 ? (T)0 : W[((size_t)k * cs + q) * 16 + c]; }  // 0 if pruned
   T competence(int k, int c) const { return m[(size_t)c * U + k]; }
   T activity(int k, int j) const { return pruned ? (T)0 : A[(size_t)k * N1 + j]; }
+  // Replace the whole layer state from the reference (dense) layout: Hd U x 4 x D, pd U x D, Wd U x 16 x N1,
+  // Md U x N1 (0/1 mask; bias column must be 1), Ad U x N1 (ignored when is_pruned), md U x 16. Inverse of the
+  // accessors above; used to bring state back from the CUDA kernel's flat layout.
+  template <class S> void import_dense(const S* Hd, const S* pd, const S* Wd, const S* Md, const S* Ad, const S* md, bool is_pruned) {
+    set_hyperplanes(Hd);
+    for (int k = 0; k < U; k++) {
+      for (int i = 0; i < D; i++) p[(size_t)i * U + k] = (T)pd[(size_t)k * D + i];
+      for (int c = 0; c < 16; c++) m[(size_t)c * U + k] = (T)md[(size_t)k * 16 + c];
+    }
+    int newcs = 0;
+    for (int k = 0; k < U; k++) { int c = 0; for (int j = 0; j < N1; j++) c += Md[(size_t)k * N1 + j] > 0 || j == n; newcs = std::max(newcs, c); }
+    cs = newcs; W.assign((size_t)U * cs * 16, 0); cols.assign((size_t)U * cs, 0);
+    for (int k = 0; k < U; k++) {
+      int q = 0;
+      for (int j = 0; j < N1; j++) {
+        if (!(Md[(size_t)k * N1 + j] > 0 || j == n)) continue;
+        cols[(size_t)k * cs + q] = j;
+        for (int c = 0; c < 16; c++) W[((size_t)k * cs + q) * 16 + c] = (T)Wd[((size_t)k * 16 + c) * N1 + j];
+        q++;
+      }
+      ncol[k] = q;
+    }
+    pruned = is_pruned;
+    if (pruned) A.reset();
+    else { A.assign((size_t)U * N1, 0); for (size_t i = 0; i < (size_t)U * N1; i++) A[i] = (T)Ad[i]; }
+  }
   size_t model_bytes() const {
     return (H.size() + p.size() + W.size() + m.size() + A.size()) * sizeof(T) + (cols.size() + ncol.size()) * sizeof(int32_t);
   }

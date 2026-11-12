@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# HGLN with FORGE (https://github.com/odin-loki/FORGE) for SIMD dispatch and GPU execution.
+#   cmake -S . -B build/forge -G Ninja -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18
+#   cmake --build build/forge && ctest --test-dir build/forge
+# The plain Makefile still builds the dependency-free header-only library and its tests.
+cmake_minimum_required(VERSION 3.25)
+project(HGLN VERSION 4.2.1 LANGUAGES C CXX)
+
+option(HGLN_WITH_FORGE "Build the FORGE SIMD-dispatch and GPU backends" ON)
+option(HGLN_BUILD_TESTS "Build HGLN tests" ON)
+set(FORGE_SOURCE_DIR "" CACHE PATH "Local FORGE checkout (copied and patched in the build tree); empty = fetch FORGE_GIT_TAG")
+set(FORGE_GIT_REPOSITORY "https://github.com/odin-loki/FORGE" CACHE STRING "FORGE repository")
+set(FORGE_GIT_TAG "b135941680664502fec59924f51d3c3dc11e23e9" CACHE STRING "FORGE commit the patches apply to")
+
+if(HGLN_BUILD_TESTS)
+  enable_testing()
+endif()
+find_package(Python3 COMPONENTS Interpreter)
+
+# Header-only core library (C++17; also built standalone by the Makefile).
+add_library(hgln INTERFACE)
+target_include_directories(hgln INTERFACE ${PROJECT_SOURCE_DIR}/include)
+find_package(Threads REQUIRED)
+target_link_libraries(hgln INTERFACE Threads::Threads)
+
+if(HGLN_WITH_FORGE)
+  include(cmake/hgln_forge.cmake)   # obtains, patches and adds FORGE (targets forge_simd, forge_simd_mv, forge_gpu, ...)
+  include(cmake/hgln_simd.cmake)    # hgln_simd: per-target CPU kernels chosen at run time through forge::simd
+  include(cmake/hgln_gpu.cmake)     # hgln_gpu: the HGLN kernel run through forge::gpu::cuda_hip (CUDA and HIP)
+endif()
+
+# CLI and tests shared by both backends
+add_executable(hgln_cli src/hgln_cli.cpp)
+target_link_libraries(hgln_cli PRIVATE hgln $<$<BOOL:${HGLN_WITH_FORGE}>:hgln_simd>)
+target_compile_definitions(hgln_cli PRIVATE $<$<BOOL:${HGLN_WITH_FORGE}>:HGLN_WITH_FORGE=1>)
+add_executable(hgln_cli_f src/hgln_cli.cpp)
+target_link_libraries(hgln_cli_f PRIVATE hgln $<$<BOOL:${HGLN_WITH_FORGE}>:hgln_simd>)
+target_compile_definitions(hgln_cli_f PRIVATE USE_FLOAT $<$<BOOL:${HGLN_WITH_FORGE}>:HGLN_WITH_FORGE=1>)
+if(HGLN_BUILD_TESTS)
+  add_executable(hgln_test_api tests/test_api.cpp)
+  target_link_libraries(hgln_test_api PRIVATE hgln $<$<BOOL:${HGLN_WITH_FORGE}>:hgln_simd>)
+  target_compile_definitions(hgln_test_api PRIVATE $<$<BOOL:${HGLN_WITH_FORGE}>:HGLN_WITH_FORGE=1>)
+  add_test(NAME hgln_api COMMAND hgln_test_api)
+  if(Python3_FOUND)
+    foreach(d 8 64)
+      add_test(NAME hgln_parity_f64_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli> ${d} 1e-12)
+      add_test(NAME hgln_parity_f32_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli_f> ${d} 1e-4)
+    endforeach()
+    add_test(NAME hgln_digits COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/digits_test.py $<TARGET_FILE:hgln_cli> 3)
+  endif()
+endif()
