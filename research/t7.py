@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import numpy as np
 D=8; N=4096; DR=2048
 WIN=[(0,512),(1536,2048),(2048,2560),(3584,4096)]

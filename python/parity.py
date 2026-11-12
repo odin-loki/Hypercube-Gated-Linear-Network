@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Parity test: NumPy reference (hgln_ref.py) vs the C++ CLI, started from identical hyperplanes.
 usage: python3 parity.py path/to/hgln_d|hgln_f  [d]  -> prints max |difference| and exits 1 if above the tolerance."""
 import subprocess, struct, sys, tempfile, os

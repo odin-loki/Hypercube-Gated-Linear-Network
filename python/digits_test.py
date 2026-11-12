@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """End-to-end accuracy test on the scikit-learn digits set (64 inputs, 10 classes), one-vs-rest, online.
 Writes train/test CSV, runs the C++ classifier, optionally compares with the NumPy reference.
 usage: python3 digits_test.py path/to/hgln_d [passes=3] [--ref]   (the --ref NumPy run is slow: about 10 minutes)"""

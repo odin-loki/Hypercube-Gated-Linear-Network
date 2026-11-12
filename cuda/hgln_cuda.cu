@@ -1,8 +1,11 @@
-// hgln_cuda.cu - host program for the HGLN CUDA kernel. UNTESTED ON A GPU (no CUDA compiler was available when written;
-// the kernel logic was tested with cuda_emu.cpp). Build: nvcc -O3 -std=c++17 -I../include hgln_cuda.cu -o hgln_cuda
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// hgln_cuda.cu - host program for the HGLN CUDA kernel. NOT RUN ON A GPU: nvcc was not available. The kernel logic is
+// tested with cuda_emu.cpp and the kernel compiles to PTX with clang (cuda/hgln_ptx.cu); this file has not been compiled.
+// Build: nvcc -O3 -std=c++17 -Iinclude -Icuda cuda/hgln_cuda.cu -o hgln_cuda
 //   hgln_cuda selftest d nets T      compare the GPU result with the CPU network (max abs prediction / state difference)
 //   hgln_cuda bench d nets T         time T samples for `nets` independent networks
-// Author: Odin Loch
+// The per-sample scratch goes in dynamic shared memory when it fits (d <= 128 in float64 fits in 48 KB), otherwise in
+// global memory. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_host.h"
 #include <cstdio>
 #include <cstdlib>
@@ -13,11 +16,12 @@ using hgln::Net;
 
 struct Dev { hreal *H, *p, *W, *M, *A, *m, *S, *X, *Y, *P; long* t; };
 static Dev upload(const HgDims& g, HgHostState& st, const std::vector<hreal>& X, const std::vector<hreal>& Y, int nets, int T) {
-  Dev v;
+  Dev v; v.S = nullptr; (void)g;
   CK(cudaMalloc(&v.H, st.H.size() * sizeof(hreal))); CK(cudaMalloc(&v.p, st.p.size() * sizeof(hreal)));
   CK(cudaMalloc(&v.W, st.W.size() * sizeof(hreal))); CK(cudaMalloc(&v.M, st.M.size() * sizeof(hreal)));
   CK(cudaMalloc(&v.A, st.A.size() * sizeof(hreal))); CK(cudaMalloc(&v.m, st.m.size() * sizeof(hreal)));
-  CK(cudaMalloc(&v.S, st.scratch.size() * sizeof(hreal))); CK(cudaMalloc(&v.X, X.size() * sizeof(hreal)));
+  if (!st.scratch.empty()) CK(cudaMalloc(&v.S, st.scratch.size() * sizeof(hreal)));
+  CK(cudaMalloc(&v.X, X.size() * sizeof(hreal)));
   CK(cudaMalloc(&v.Y, Y.size() * sizeof(hreal))); CK(cudaMalloc(&v.P, (size_t)nets * T * sizeof(hreal))); CK(cudaMalloc(&v.t, nets * sizeof(long)));
   CK(cudaMemcpy(v.H, st.H.data(), st.H.size() * sizeof(hreal), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(v.p, st.p.data(), st.p.size() * sizeof(hreal), cudaMemcpyHostToDevice));
@@ -25,7 +29,6 @@ static Dev upload(const HgDims& g, HgHostState& st, const std::vector<hreal>& X,
   CK(cudaMemcpy(v.M, st.M.data(), st.M.size() * sizeof(hreal), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(v.A, st.A.data(), st.A.size() * sizeof(hreal), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(v.m, st.m.data(), st.m.size() * sizeof(hreal), cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(v.S, st.scratch.data(), st.scratch.size() * sizeof(hreal), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(v.X, X.data(), X.size() * sizeof(hreal), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(v.Y, Y.data(), Y.size() * sizeof(hreal), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(v.t, st.t.data(), nets * sizeof(long), cudaMemcpyHostToDevice));
@@ -45,12 +48,18 @@ int main(int argc, char** argv) {
   hgln::Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05);
   std::vector<Net<hreal>> init(nets), ref(nets);
   for (int n = 0; n < nets; n++) { init[n].init(d, 7 + n, prm); ref[n] = init[n]; }
-  HgHostState st; hg_pack(g, init, st);
+  // scratch in dynamic shared memory if the device allows that much per block, else in global memory
+  size_t smem = (size_t)g.scs * sizeof(hreal); int dev = 0, optin = 0; CK(cudaGetDevice(&dev));
+  CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  bool use_smem = smem <= (size_t)optin;
+  if (use_smem && smem > 48 * 1024) CK(cudaFuncSetAttribute(hgln_run, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+  HgHostState st; hg_pack(g, init, st, !use_smem);
   Dev v = upload(g, st, X, Y, nets, T);
   const int threads = 256;
+  printf("scratch: %zu bytes per network in %s memory\n", smem, use_smem ? "shared" : "global");
   cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
   CK(cudaEventRecord(e0));
-  hgln_run<<<nets, threads>>>(g, v.H, v.p, v.W, v.M, v.A, v.m, v.S, v.X, v.Y, v.P, v.t, T, (hreal)prm.glr0, (hreal)prm.glr1,
+  hgln_run<<<nets, threads, use_smem ? smem : 0>>>(g, v.H, v.p, v.W, v.M, v.A, v.m, v.S, v.X, v.Y, v.P, v.t, T, (hreal)prm.glr0, (hreal)prm.glr1,
                               (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm);
   CK(cudaGetLastError()); CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
   float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
@@ -71,5 +80,8 @@ int main(int argc, char** argv) {
     }
     printf("selftest d=%d nets=%d T=%d: max |prediction diff| = %.3g, max |state diff| = %.3g (%s)\n", d, nets, T, wp, ws, sizeof(hreal) == 4 ? "float32" : "float64");
   }
+  hreal* bufs[] = {v.H, v.p, v.W, v.M, v.A, v.m, v.S, v.X, v.Y, v.P};
+  for (hreal* b : bufs) if (b) CK(cudaFree(b));
+  CK(cudaFree(v.t)); CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
   return 0;
 }

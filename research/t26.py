@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import numpy as np, json, sys, warnings
 warnings.filterwarnings("ignore")
 from tgn_v11 import NetT

@@ -1,18 +1,18 @@
 # HGLN: C++ and CUDA Implementation Spec
 
 **Author:** Odin Loch
-**Status:** Version 1. Companion to `TGN_spec.md` (algorithm version 4.1). A single-thread C++ port is built and verified. CUDA is specified but **not built or tested** (no CUDA compiler was available in the development environment).
+**Status:** Version 2. Companion to `TGN_spec.md` (algorithm version 4.1). The C++ library is built, verified, SIMD-tuned and multithreaded (see `OPTIMISATION.md`). The CUDA kernel compiles to PTX with clang and is verified on a CPU emulator. It has **not been run on a GPU**, and the nvcc host program has not been compiled. Licence: AGPL-3.0-or-later.
 
 ## 1. What is verified and what is not
 
 | Item | Status |
 |---|---|
-| Single-thread C++17 port, float64 and float32 | Built and verified against the NumPy reference (section 6) |
-| Speed measurement of the port | Measured, single run per setting, shared 2-core machine (section 7) |
-| SIMD tuning, pruned-column compaction, multithreading | Not done; ranked roadmap in section 8 |
-| CUDA | Design only (section 9); no CUDA compiler available, so nothing was compiled or run |
+| C++17 library, float64 and float32 | Built and verified against the NumPy reference (section 6) |
+| SIMD tuning, pruned-column compaction, multithreading | Done (section 8, `OPTIMISATION.md`); verified by the same parity tests and by threaded-equals-serial tests |
+| Speed measurement | Measured before and after on one 4-vCPU machine (section 7) |
+| CUDA kernel | Written. It matches the library exactly on a CPU emulator and compiles to PTX for sm_70 and sm_80 with clang (no CUDA SDK). Not run on a GPU; the nvcc host program has not been compiled |
 
-The port reproduces the algorithm exactly (differences of about 1e-15 in float64 and about 1e-6 in float32 on prediction values). It does not make the model faster than a small MLP: see section 7.
+The library reproduces the algorithm (differences of about 1e-15 in float64 and about 1e-6 in float32 on prediction values). It is still slower than a matched small MLP, but the gap is now 3x at d = 8 and 3 to 9x at d = 64 (section 7).
 
 ## 2. Model constants
 
@@ -119,7 +119,17 @@ These are the worst values across the four runs. The parity runs test arithmetic
 
 ## 7. Speed
 
-Measured with `hgln bench d nets nsamples` (`-O3 -march=native`, single thread, shared 2-core machine). Timings vary between runs by about 20 percent, so two runs are shown. "Per sample" is one predict plus one learn for all networks. "MLP 3x16" is a matched baseline in the same file (d to 16 to 16 to 16 to 1, tanh, per-sample SGD); it allocates small vectors in its backward pass, so it is slightly pessimistic for the MLP.
+**Optimised library** (version 2, this repository). Measured with `hgln_d|hgln_f bench d nets nsamples [threads]` on a 4-vCPU Xeon @ 2.1 GHz with AVX-512, `-O3 -march=native`. The original port was rebuilt in the same session for the first column. Figures are the middle of three runs, in microseconds per sample for all networks.
+
+| Setting | Original | Optimised, 1 thread | Optimised, nets in parallel (4 threads) | MLP 3x16 |
+|---|---|---|---|---|
+| d = 8, 1 network, float64 | 14.3 (predict 7.4) | 6.0 (predict 2.65) | one network | 2.0 |
+| d = 64, 10 networks, float64 | 492 (predict 251) | 246 (predict 130) | 52 (predict 20) | 26 |
+| d = 64, 10 networks, float32 | 334 (predict 193) | 72.5 (predict 36) | 22.6 (predict 8.6) | 26 |
+
+The rest of this section is the original measurement of the first port, kept for reference.
+
+**First port** (version 1). Measured with `hgln bench d nets nsamples` (`-O3 -march=native`, single thread, shared 2-core machine). Timings vary between runs by about 20 percent, so two runs are shown. "Per sample" is one predict plus one learn for all networks. "MLP 3x16" is a matched baseline in the same file (d to 16 to 16 to 16 to 1, tanh, per-sample SGD); it allocates small vectors in its backward pass, so it is slightly pessimistic for the MLP.
 
 | Setting | HGLN float64 (us) | HGLN float32 (us) | HGLN predict only, float64 (us) | MLP 3x16, float64 (us) |
 |---|---|---|---|---|
@@ -130,7 +140,9 @@ So the port is **about 6 to 7 times slower than a matched MLP at d = 8 and about
 
 I have not counted operations per sample precisely; the time is dominated by 48 units each evaluating 16 rules over their active inputs, plus the gate update.
 
-## 8. CPU optimisation roadmap (none implemented, effects unmeasured)
+## 8. CPU optimisation roadmap (status in version 2)
+
+Items 1, 2, 4 and 5 are done, measured and verified (`OPTIMISATION.md`). Item 1 was done as layouts that put units or corners in the vector lanes, rather than padding. Item 3 was not needed once the update was vectorised. Item 6 changes the algorithm and was not attempted. The original list:
 
 1. Pad each row of `W`, `xm` and `H` to a multiple of the SIMD width and align them; the inner loops are short (9, 17 or 65 elements).
 2. Compact the pruned input columns after sample 512 (40 percent of each unit's inputs are inactive), shrinking every `W` row and the forward and update loops.
@@ -139,7 +151,11 @@ I have not counted operations per sample precisely; the time is dominated by 48 
 5. Use float32 (about 1.5 times faster at d = 64 in section 7; little change at d = 8).
 6. Skip corners with negligible `h_c`. **This changes the algorithm** and must be re-validated for accuracy before use.
 
-## 9. CUDA design (not built or tested)
+## 9. CUDA design (compiled to PTX and emulated; not run on a GPU)
+
+The implemented kernel (`cuda/hgln_kernel.h`) uses one thread block per network, with all 48 units of that network inside the block and a block barrier between phases, rather than the per-unit mapping sketched below. That suits the target of many independent networks at once. Since version 2 the per-sample scratch can live in dynamic shared memory: 23 to 36 KB per block in float64 for d = 8 to 100. The p and hyperplane steps are fused, and dead work after the prune is skipped. `cuda/hgln_ptx.cu` builds the kernel to PTX without the CUDA SDK, using the same method as FORGE (`FORGE.md`).
+
+The original design notes:
 
 Mapping, as a starting point:
 

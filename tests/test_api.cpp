@@ -1,4 +1,5 @@
-// test_api.cpp - behavioural tests for the header-only library. Author: Odin Loch
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// test_api.cpp - behavioural tests for the header-only library. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln.hpp"
 #include <cstdio>
 using namespace hgln;
@@ -28,7 +29,7 @@ int main() {
   { Net<float> a; a.init(8, 1); double nm; run_stream(a, 8, 5000, 11, &nm);
     printf("      float32 late NMSE: %.3f\n", nm); CHECK(nm < 0.35, "float32 build learns too"); }
   { Net<double> a; a.init(8, 1); double nm; run_stream(a, 8, 1500, 3, &nm);
-    int pruned = 0, total = 0; for (int l = 0; l < 3; l++) { for (int k = 0; k < 16; k++) { int act = 0; for (int j = 0; j < a.L[l].n; j++) act += a.L[l].M[k * a.L[l].N1 + j] > 0; total++; int want = (int)std::nearbyint(0.6 * a.L[l].n); pruned += act == want; if (a.L[l].M[k * a.L[l].N1 + a.L[l].n] != 1) pruned -= 1000; } }
+    int pruned = 0, total = 0; for (int l = 0; l < 3; l++) { for (int k = 0; k < 16; k++) { int act = 0; for (int j = 0; j < a.L[l].n; j++) act += a.L[l].active(k, j); total++; int want = (int)std::nearbyint(0.6 * a.L[l].n); pruned += act == want; if (!a.L[l].active(k, a.L[l].n)) pruned -= 1000; } }
     CHECK(pruned == total, "after warm-up every unit keeps exactly round(0.6 n) inputs and its bias column"); }
   { Net<double> a; a.init(8, 1); bool ok = true; Rng rng(5); std::vector<double> x(8);
     for (int t = 0; t < 2000; t++) { for (auto& v : x) v = 2 * rng.uni() - 1; double p = a.predict(x.data()); a.learn(100 * std::sin(10 * x[0]));
@@ -46,5 +47,30 @@ int main() {
       if (t >= 3000) { ok += c.predict(x) == lab; n++; } c.train(x, lab); }
     printf("      XOR-style 2-class accuracy on the last 1000 samples (test-then-train): %.1f%%\n", 100.0 * ok / n);
     CHECK(ok > 0.8 * n, "classifier learns an XOR-style problem (> 80%)"); }
+  // ---- parallel and batched APIs must give exactly the serial results
+  { Rng rng(21); const int d = 16, N = 1500, C = 4; std::vector<double> X((size_t)N * d); std::vector<int> lab(N);
+    for (int t = 0; t < N; t++) { double s = 0; for (int i = 0; i < d; i++) { X[(size_t)t * d + i] = 2 * rng.uni() - 1; s += X[(size_t)t * d + i] * (i + 1); } lab[t] = ((int)std::floor(s * 3) % C + C) % C; }
+    Classifier<double> a, b, c; a.init(d, C, 3); b.init(d, C, 3); c.init(d, C, 3); c.set_threads(4);
+    for (int t = 0; t < N; t++) { a.train(&X[(size_t)t * d], lab[t]); c.train(&X[(size_t)t * d], lab[t]); }
+    b.train_batch(X.data(), lab.data(), N, 4);
+    bool same = true;
+    for (int k = 0; k < C; k++) for (int l = 0; l < 3; l++) { if (!(a.nets[k].L[l].W.size() == b.nets[k].L[l].W.size())) same = false;
+      for (size_t i = 0; i < a.nets[k].L[l].W.size() && same; i++) same = a.nets[k].L[l].W[i] == b.nets[k].L[l].W[i] && a.nets[k].L[l].W[i] == c.nets[k].L[l].W[i];
+      for (size_t i = 0; i < a.nets[k].L[l].H.size() && same; i++) same = a.nets[k].L[l].H[i] == b.nets[k].L[l].H[i] && a.nets[k].L[l].H[i] == c.nets[k].L[l].H[i]; }
+    CHECK(same, "train_batch (4 threads) and pooled train() give bit-identical models to serial train()");
+    std::vector<int> pb(N); std::vector<double> sc((size_t)N * C); b.predict_batch(X.data(), N, pb.data(), sc.data(), 4);
+    bool samep = true; for (int t = 0; t < N; t++) { int p1 = a.predict(&X[(size_t)t * d]), p2 = c.predict(&X[(size_t)t * d]); if (p1 != pb[t] || p2 != p1 || sc[(size_t)t * C + p1] != a.score[p1]) samep = false; }
+    CHECK(samep, "predict_batch (4 threads) and pooled predict() match serial predict()");
+    std::vector<Net<double>> G(3), R; for (int k = 0; k < 3; k++) G[k].init(d, 50 + k); R = G;
+    std::vector<double> Y((size_t)3 * N), P((size_t)3 * N); for (size_t i = 0; i < Y.size(); i++) Y[i] = std::sin(0.01 * (double)i);
+    run_streams(G, X.data(), Y.data(), P.data(), N, 3);
+    bool samer = true; for (int k = 0; k < 3; k++) for (int t = 0; t < N; t++) { double v = R[k].predict(&X[(size_t)t * d]); R[k].learn(Y[(size_t)k * N + t]); if (v != P[(size_t)k * N + t]) samer = false; }
+    CHECK(samer, "run_streams (3 threads) matches per-network serial predict/learn"); }
+  { Net<double> a; a.init(8, 1); double nm; run_stream(a, 8, 1000, 4, &nm); Net<double> b = a; Work<double> w; w.init(a);
+    std::vector<double> x(8, 0.3); double p1 = a.infer(x.data(), w), p2 = b.predict(x.data()), p3 = a.infer(x.data(), w);
+    CHECK(p1 == p2 && p1 == p3, "copied network and const infer() give the same prediction; infer() leaves the model unchanged");
+    Net<double> fresh; fresh.init(8, 1); size_t before = fresh.model_bytes();
+    printf("      model bytes d=8: %zu before prune, %zu after\n", before, a.model_bytes());
+    CHECK(a.pruned() && !fresh.pruned() && a.model_bytes() < before, "the prune compacts W and frees the activity trace (model shrinks)"); }
   printf(fails ? "%d test(s) FAILED\n" : "all tests passed\n", fails); return fails ? 1 : 0;
 }

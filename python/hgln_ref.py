@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Hypercube Gated Linear Network (HGLN), version 4.
 Stateless online learner. Each unit has 4 learned hyperplanes -> a 16-corner heatmap -> a blend of 16 local linear rules.
 The prediction is a competitive mixture over all hidden units (weights = each unit's local competence), and each unit

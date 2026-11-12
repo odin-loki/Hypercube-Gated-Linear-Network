@@ -23,8 +23,8 @@ From a NumPy prototype on synthetic drifting streams (10 seeds) and the public s
 
 ## Status and limits
 
-- **Implementation.** A C++ port matches the NumPy reference to about 1e-15 (float64) and 1e-6 (float32). A CUDA kernel is written and matches the reference exactly on a CPU emulator. It has not been compiled with nvcc or run on a GPU.
-- **Speed.** About 11-14 microseconds per sample per network at 8 inputs on one CPU thread, roughly 6-7 times slower than a matched small MLP, and not yet optimised.
+- **Implementation.** An optimised C++ library (SIMD, multithreaded) matches the NumPy reference to about 1e-15 (float64) and 1e-6 (float32). A CUDA kernel matches it exactly on a CPU emulator and compiles for NVIDIA GPU targets, but has not been run on a GPU. Licensed under the GNU AGPL v3.0 or later.
+- **Speed.** About 6 microseconds per sample at 8 inputs on one CPU thread, about 3 times slower than a matched small MLP (the first version was 6-7 times slower). Independent networks, such as class heads, run in parallel across cores: 10 heads at 64 inputs take about 23 microseconds per sample in float32 on 4 cores.
 - **Component test.** An ablation showed the competence weighting adds almost nothing beyond averaging. The gain comes from the shared global error signal.
 - **Evidence.** Tuning and comparison used the same seeds and shuffles, so the figures are mildly optimistic. Only small synthetic and digits tasks have been tested, against basic baselines. Nothing has been tested on real defence signals, at larger width, or against stronger online learners.
 
@@ -34,6 +34,6 @@ Streaming classification and regression where the data drifts and compute or mem
 
 ## Next steps
 
-Tune the compiled build (SIMD and multithreading), test the GPU version on real hardware, run wider networks (64-128), and run stronger baselines on real datasets.
+Test the GPU version on real hardware, run wider networks (64-128), and run stronger baselines on real datasets.
 
 Full specification and reference code are available on request.

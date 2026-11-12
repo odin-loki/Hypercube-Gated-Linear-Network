@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // hgln.cpp - Hypercube Gated Linear Network (HGLN v4.1): single-thread C++17 reference port, no dependencies.
 // Build:  g++ -O3 -march=native -std=c++17 hgln.cpp -o hgln_d            (float64, used for the parity test)
 //         g++ -O3 -march=native -std=c++17 -DUSE_FLOAT hgln.cpp -o hgln_f (float32)

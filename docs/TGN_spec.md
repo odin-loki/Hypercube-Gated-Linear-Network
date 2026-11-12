@@ -164,7 +164,7 @@ Shuffles 10 and 11 were also used for the earlier mixture and diversify checks, 
 
 **Simplifications in the port.** Several state arrays in the research code are dead in version 4.1 (gate codes, use counts, balancing offsets, recent-input and error buffers). The structure step only prunes, once, at sample 512, because each unit then already holds its target number of inputs. The C++ port omits all of this and matches the NumPy reference to about 1e-15 (float64) and 1e-6 (float32).
 
-**C++ speed (single thread, unoptimised, noisy by about 20 percent).** About 11 to 14 us per sample for one network at d = 8; about 465 to 490 us (float64) and 310 to 330 us (float32) per sample for 10 networks at d = 64. A matched 3x16 MLP takes about 2 us and 22 to 28 us in the same file, so HGLN is roughly 6 to 7 times slower at d = 8 and 17 to 22 times slower at d = 64. Details in `TGN_impl_spec.md`.
+**C++ speed.** The first, unoptimised port took about 11 to 14 us per sample for one network at d = 8, and about 465 to 490 us (float64) and 310 to 330 us (float32) per sample for 10 networks at d = 64. That was roughly 6 to 7 times slower than a matched 3x16 MLP at d = 8 and 17 to 22 times slower at d = 64. The optimised library takes about 6 us at d = 8, and at d = 64 with 10 networks about 246 us (float64) and 72 us (float32) on one thread, or 52 us and 23 us with the networks on 4 threads. The MLP takes about 2 us and 26 us. Details in `TGN_impl_spec.md` section 7 and `OPTIMISATION.md`.
 
 ## 8. Limitations
 
@@ -172,7 +172,7 @@ Shuffles 10 and 11 were also used for the earlier mixture and diversify checks, 
 - **Partly tuned.** The global share was tuned over three values. The competence rate and gate rates were not tuned for version 4.
 - **Digits.** Test sets are 599 samples, so differences of about 1 point are noise. The share was tuned on the same synthetic seeds and digit shuffles used to report it.
 - **Gate learning rate is task-dependent.** Low (0.02) suited 64-input digits; higher, annealed values suited the 8-input streams. A rule of about 1.6 / d fits both but is untested.
-- **Speed.** Measured in C++ (section 7b): slower than a matched small MLP. Not sparse or event-driven. No SIMD tuning or multithreading yet. CUDA is specified but not built or tested.
+- **Speed.** Measured in C++ (section 7b): still slower than a matched small MLP on one thread (about 3x at d = 8), though SIMD-tuned and multithreaded across networks. Not sparse or event-driven. The CUDA kernel compiles to PTX and is verified on a CPU emulator, but has not run on a GPU.
 - **Competence weighting** is not shown to help (section 7b), and was tested on the three synthetic tasks only.
 - **Baselines.** Online softmax regression and per-sample MLPs. Stronger tuning could change the comparison.
 - **Width.** Width 16 mainly.
@@ -185,7 +185,7 @@ Shuffles 10 and 11 were also used for the earlier mixture and diversify checks, 
 3. Check the 1.6 / d rule for the gate rate on other input sizes.
 4. Wider networks (64-128).
 5. Keep only the strongest few corners active, then measure the accuracy cost.
-6. SIMD, multithreaded and CUDA implementations per `TGN_impl_spec.md`; the single-thread C++ port is done.
+6. Run the CUDA kernel on real GPUs (for example through FORGE's driver-API runtime, `FORGE.md`). The SIMD and multithreaded C++ library is done.
 
 ## 10. Reference implementation
 

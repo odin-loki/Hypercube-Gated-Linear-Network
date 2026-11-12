@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import numpy as np
 import tgn_v5
 from tgn_v10 import HCS, NetS
