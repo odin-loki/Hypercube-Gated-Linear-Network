@@ -23,6 +23,7 @@ static thread_local std::barrier<>* hg_bar = nullptr;
 #define HG_SYNC() hg_bar->arrive_and_wait()
 #define HG_SMEM_DECL
 #define HG_SMEM nullptr
+#define HGLN_NO_WARP_KERNEL                  // only the integer kernel runs here
 #include "hgln_kernel.h"
 #include "hgln_q_kernel.h"
 #include "hgln_q_host.h"

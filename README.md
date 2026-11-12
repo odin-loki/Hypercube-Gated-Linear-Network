@@ -32,7 +32,7 @@ HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per
 | `include/hgln_gpu.hpp`, `src/gpu/` | FORGE build: `hgln::gpu::Bank`, many networks on a GPU through FORGE's CUDA/HIP runtime; `hgln_gpu` tool |
 | `CMakeLists.txt`, `cmake/`, `third_party/forge-patches/` | CMake build that fetches and patches FORGE |
 | `src/hgln_cli.cpp` | CLI: `parity`, `bench`, `classify` (built as `build/hgln_d` float64, `build/hgln_f` float32 and `build/hgln_q` the integer net) |
-| `cuda/hgln_kernel.h` | GPU kernel of the float `Net` (every option, v5 included): one block per network, many networks in parallel. Built for CUDA and HIP; run on an NVIDIA RTX 3090 |
+| `cuda/hgln_kernel.h` | GPU kernel of the float `Net` (every option, v5 included): one block per network (or, on CUDA, one warp per network), many networks in parallel. Built for CUDA and HIP; run on an NVIDIA RTX 3090 |
 | `cuda/hgln_q_kernel.h`, `cuda/hgln_q_dims.h`, `cuda/hgln_q_host.h`, `cuda/cuda_emu_q.cpp` | GPU kernel of the integer `NetQ` (`hgln::gpu::BankQ`), its layout, host helpers and CPU emulator test |
 | `cuda/hgln_ptx.cu` | Header-free wrapper that builds the kernel to PTX / AMDGPU code with plain clang, no SDK |
 | `cuda/hgln_cuda.cu` | nvcc host program (`selftest`, `bench`); compiled with nvcc 12.0 and run on the RTX 3090 |
@@ -120,7 +120,7 @@ Memory per network is about 33% lower after the prune at sample 512 (278 KB vs 4
 
 ## What was not tested
 
-- **AMD GPUs and other NVIDIA generations.** Only one RTX 3090 has run the kernels. The AMD code objects have not been loaded by ROCm. GPU speed has not been studied: one block per network is slow for a single stream (tens of µs per sample, dominated by barriers and launches); the design targets many networks at once.
+- **AMD GPUs and other NVIDIA generations.** Only one RTX 3090 has run the kernels. The AMD code objects have not been loaded by ROCm. GPU speed (OPTIMISATION.md section 6): every sample streams each network's whole state, so the kernel is bound by L2 latency (few networks) or DRAM bandwidth (many). On an RTX 3090 it is near the CPU's speed, not far above it. A kernel that keeps the state on chip is the next step.
 - Real-world datasets other than digits; widths above 16; stronger baselines. The spec lists the selection effects behind its numbers.
 - Inputs above 128 dimensions in the CUDA kernel (the prune scratch is fixed at 128; the C++ library has no such limit).
 - Non-x86 CPUs. The NEON, SVE and RVV tables were only syntax-checked; the code was only run on x86-64.

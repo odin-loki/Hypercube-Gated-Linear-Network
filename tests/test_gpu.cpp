@@ -129,6 +129,7 @@ template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch
 
   gpu::Bank<T> bank; std::string why;
   gpu::Options opt; opt.threads = threads; opt.scratch = scratch;
+  if (const char* e = std::getenv("HGLN_GPU_KERNEL")) opt.kernel = !std::strcmp(e, "block") ? gpu::Kernel::block : !std::strcmp(e, "warp") ? gpu::Kernel::warp : gpu::Kernel::automatic;
   if (!bank.open(api, 0, &why, opt)) { CHECK(false, "open: %s", why.c_str()); return; }
   if (!bank.upload(init, &why)) {
     if (scratch == gpu::Scratch::shared && why.find("shared memory") != std::string::npos) {   // a small device: refused, as it must be
@@ -155,8 +156,10 @@ template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch
     if (last) {   // what the driver saw
       unsigned L = 0, g = 0, b = 0, sm = 0, real = 0; char arch[16] = {};
       last(&L, &g, &b, &sm, &real, arch);
-      CHECK(g == (unsigned)nets && b == (unsigned)threads && real == sizeof(T), "launch grid %u block %u real %u", g, b, real);
-      CHECK(sm == (bank.shared_scratch() ? bank.scratch_bytes() : 0), "launch smem %u", sm);
+      const unsigned W = (unsigned)bank.nets_per_block(), eg = bank.warp_kernel() ? ((unsigned)nets + W - 1) / W : (unsigned)nets,
+                     eb = bank.warp_kernel() ? 32 * W : (unsigned)threads;
+      CHECK(g == eg && b == eb && real == sizeof(T), "launch grid %u block %u real %u (%s kernel)", g, b, real, bank.warp_kernel() ? "warp" : "block");
+      CHECK(sm == (bank.shared_scratch() ? (bank.warp_kernel() ? W : 1) * bank.scratch_bytes() : 0), "launch smem %u", sm);
     }
     wP = std::max(wP, ref_chunk(ref, x, y, P, len));
     s += len;
@@ -187,9 +190,9 @@ template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch
     if (!bank.download(fin, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
     for (int n = 0; n < nets; n++) wR = std::max(wR, state_diff(fin[n], ref[n]));
   }
-  std::printf("%s %s d=%d nets=%d T=%d calls=%d threads=%d scratch=%s(%zu B) image=%s competence=%d units=%d %s%s v5=%d: max |P diff| = %.3g, state diff mid = %.3g, end = %.3g, after re-upload = %.3g\n",
+  std::printf("%s %s d=%d nets=%d T=%d calls=%d threads=%d scratch=%s(%zu B) kernel=%s/%d image=%s competence=%d units=%d %s%s v5=%d: max |P diff| = %.3g, state diff mid = %.3g, end = %.3g, after re-upload = %.3g\n",
               gpu::api_name(api), f64 ? "float64" : "float32", d, nets, N, calls, threads, bank.shared_scratch() ? "shared" : "global",
-              bank.scratch_bytes(), bank.image().c_str(), competence ? 1 : 0, units, fanout ? "fanout" : "chain", far ? " far" : "", g_v5, wP, wMid, wS, wR);
+              bank.scratch_bytes(), bank.warp_kernel() ? "warp" : "block", bank.nets_per_block(), bank.image().c_str(), competence ? 1 : 0, units, fanout ? "fanout" : "chain", far ? " far" : "", g_v5, wP, wMid, wS, wR);
   CHECK(wP <= tolP && wMid <= tolS && wS <= tolS && wR <= std::max(tolP, tolS), "differences above tolerance (P %.3g, state %.3g)", tolP, tolS);
   std::fflush(stdout);
 }

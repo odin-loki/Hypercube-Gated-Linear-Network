@@ -31,9 +31,17 @@ inline const char* api_name(Api a) { return a == Api::cuda ? "cuda" : "hip"; }
 enum class Scratch { automatic, shared, global };   // where the kernel's per-sample scratch lives
 inline const char* scratch_name(Scratch s) { return s == Scratch::shared ? "shared" : s == Scratch::global ? "global" : "automatic"; }
 
+enum class Kernel { automatic, block, warp };   // the float kernel: a thread block or one warp per network
+inline const char* kernel_name(Kernel k) { return k == Kernel::warp ? "warp" : k == Kernel::block ? "block" : "automatic"; }
 struct Options {
-  int threads = 256;                        // threads per block (one block per network); any value 1..1024 is correct
+  int threads = 0;                          // threads per block; 0 = automatic: block kernel 256 for fewer than 128 networks,
+                                            // else 64 (measured on an RTX 3090); warp kernel 128 (4 networks per block); the
+                                            // integer kernel 256. Warp kernel: threads / 32 networks per block, at most what fits
+                                            // in shared memory. Any value 1..1024 gives the same bits.
   Scratch scratch = Scratch::automatic;     // automatic: shared memory if it fits on the device, else global
+  Kernel kernel = Kernel::automatic;        // automatic = block. warp (CUDA only): one warp per network, several networks per
+                                            // block; it is correct but was never faster than the block kernel on an RTX 3090
+                                            // (27..16384 networks; a 32-thread block is the same schedule). Same bits either way.
 };
 
 int device_count(Api api);                  // 0 when the driver is missing or has no devices
@@ -74,6 +82,9 @@ public:
   int d() const;
   bool shared_scratch() const;              // true: scratch in dynamic shared memory
   std::size_t scratch_bytes() const;        // per network
+  bool warp_kernel() const;                 // true: the warp kernel runs the networks (Bank only)
+  int nets_per_block() const;
+  int threads_per_block() const;            // the block size in use (after upload)               // networks per thread block (1 with the block kernel)
   long samples_seen(std::size_t net) const; // as of the last run (host copy; no device access)
 
   struct Impl;

@@ -18,7 +18,8 @@
 #define HGLN_NO_STD_HEADERS
 #define HGLN_EMULATE   // keep hgln_kernel.h from defining the nvcc macros; we define them header-free below
 #define HG_KERNEL extern "C" __attribute__((global))
-#define HG_DEV static __attribute__((device)) inline
+#define HG_DEV static __attribute__((device, always_inline)) inline   // one flat kernel: no call ABI, no stack
+#define HG_COLD static __attribute__((device, noinline))                 // rare code with big local arrays (the prune)
 #define HG_HD __attribute__((host, device))
 #define HGLN_HD static __attribute__((host, device)) inline
 #if defined(__NVPTX__)
@@ -26,12 +27,16 @@
 #define HG_NT ((int)__nvvm_read_ptx_sreg_ntid_x())
 #define HG_BID ((int)__nvvm_read_ptx_sreg_ctaid_x())
 #define HG_SYNC() __syncthreads()
+#define HG_WSYNC() __nvvm_bar_warp_sync(0xffffffffu)   // the warp kernel's barrier (bar.warp.sync)
 #else   // AMDGPU: the builtins HIP's own headers use; the barrier is __syncthreads() as HIP defines it
 #define HG_TID ((int)__builtin_amdgcn_workitem_id_x())
 #define HG_NT ((int)__builtin_amdgcn_workgroup_size_x())
 #define HG_BID ((int)__builtin_amdgcn_workgroup_id_x())
 #define HG_SYNC() (__builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup"), __builtin_amdgcn_s_barrier(), \
                    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"))
+#endif
+#if defined(__AMDGPU__)
+#define HGLN_NO_WARP_KERNEL     // AMD wavefronts are 64 (CDNA) or 32 (RDNA) lanes: HIP runs the block kernel only
 #endif
 #define HG_SMEM_DECL
 extern __attribute__((shared)) double hg_smem_raw[];   // dynamic shared memory (CUDA) / LDS (HIP)

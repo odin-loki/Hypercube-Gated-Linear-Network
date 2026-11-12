@@ -121,12 +121,12 @@ See [FORGE.md](FORGE.md) for the build. Both need the CMake build; the header-on
 | Call | Meaning |
 |---|---|
 | `hgln::gpu::device_count(Api::cuda / Api::hip)` | 0 if there is no driver or no device |
-| `Bank<T>::open(api, ordinal, &why, Options{threads, scratch})` | Open a device through FORGE's runtime and load the matching HGLN image |
+| `Bank<T>::open(api, ordinal, &why, Options{threads, scratch, kernel})` | Open a device through FORGE's runtime and load the matching HGLN image. `threads` = 0 (default): automatic (256 for fewer than 128 networks, else 64). `kernel`: `automatic` (= `block`, one thread block per network) or `warp` (CUDA only: one warp per network; same bits, not faster on an RTX 3090, see OPTIMISATION.md section 6) |
 | `upload(nets)` | Copy networks (same `d` and `Params`) to the device |
 | `run(X, Y, P, samples)` | X: samples x d (shared stream); Y, P: nets x samples. Same as the CPU predict/learn loop per network; state stays on the device |
 | `download(nets)` | State and sample counts back into CPU networks |
-| `image()`, `device_name()`, `shared_scratch()`, `scratch_bytes()` | What was chosen |
+| `image()`, `device_name()`, `shared_scratch()`, `scratch_bytes()`, `warp_kernel()`, `nets_per_block()`, `threads_per_block()` | What was chosen |
 
-Environment: `HGLN_GPU_IMAGE` (force an image), `HGLN_GPU_SCRATCH=shared|global`, `HGLN_GPU_THREADS`. A `Bank` is not thread-safe; use one per thread.
+Environment: `HGLN_GPU_IMAGE` (force an image), `HGLN_GPU_SCRATCH=shared|global`, `HGLN_GPU_THREADS`, `HGLN_GPU_KERNEL=block|warp` (read by the CLI, the tests and the character LM). A `Bank` is not thread-safe; use one per thread.
 
 `Bank<T>` runs the float `Net<T>`; **`BankQ<R>`** has the same calls for the integer `NetQ<R>` (its scratch is always in global memory). Both reproduce the CPU library **bit for bit** on the GPU, float64, float32 and int16, predictions and state (checked on an RTX 3090): the float kernel does the library's IEEE operations in the same order with the same `exp` (`hgln_exp`, `hgln_gate`), and the integer kernel is integer arithmetic.

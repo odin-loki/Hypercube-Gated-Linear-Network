@@ -39,6 +39,8 @@ static int trace(void) { return getenv("MOCK_TRACE") != NULL; }
 
 int hgln_emu_launch_f64(unsigned grid, unsigned block, unsigned smem, void** args);
 int hgln_emu_launch_f32(unsigned grid, unsigned block, unsigned smem, void** args);
+int hgln_emu_wlaunch_f64(unsigned grid, unsigned block, unsigned smem, void** args);
+int hgln_emu_wlaunch_f32(unsigned grid, unsigned block, unsigned smem, void** args);
 int hglnq_emu_launch_f64(unsigned grid, unsigned block, unsigned smem, void** args);
 int hglnq_emu_launch_f32(unsigned grid, unsigned block, unsigned smem, void** args);
 
@@ -81,7 +83,7 @@ MOCK_API int N_(cuModuleLoadData, hipModuleLoadData)(void** m, const void* img) 
 MOCK_API int N_(cuModuleUnload, hipModuleUnload)(void* m) { free(m); return 0; }
 MOCK_API int N_(cuModuleGetFunction, hipModuleGetFunction)(void** f, void* m, const char* name) {
     module* mod = (module*)m;
-    if (mod->hgln && strcmp(name, "hgln_run") && strcmp(name, "hglnq_run") && strcmp(name, mod->real == 8 ? "hgln_real_f64" : "hgln_real_f32")) return 500;   /* NOT_FOUND */
+    if (mod->hgln && strcmp(name, "hgln_run") && strcmp(name, "hglnq_run") && strcmp(name, "hgln_wrun") && strcmp(name, mod->real == 8 ? "hgln_real_f64" : "hgln_real_f32")) return 500;   /* NOT_FOUND */
     function* fn = calloc(1, sizeof(function)); snprintf(fn->name, sizeof fn->name, "%s", name); fn->mod = mod; fn->max_dyn = 48 << 10;
     *f = fn; return 0;   /* (leaked, like the handles of a real driver until the module is unloaded) */
 }
@@ -146,6 +148,12 @@ MOCK_API int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, uns
         g_last.launches++; g_last.grid = gx; g_last.block = bx; g_last.smem = sh; g_last.real = (unsigned)fn->mod->real;
         memcpy(g_last.arch, fn->mod->arch, 16);
         return fn->mod->real == 8 ? hglnq_emu_launch_f64(gx, bx, sh, args) : hglnq_emu_launch_f32(gx, bx, sh, args);
+    }
+    if (!strcmp(fn->name, "hgln_wrun")) {                          /* the warp kernel (CUDA images only) */
+        if (EXPORT_HIP) return 500;
+        g_last.launches++; g_last.grid = gx; g_last.block = bx; g_last.smem = sh; g_last.real = (unsigned)fn->mod->real;
+        memcpy(g_last.arch, fn->mod->arch, 16);
+        return fn->mod->real == 8 ? hgln_emu_wlaunch_f64(gx, bx, sh, args) : hgln_emu_wlaunch_f32(gx, bx, sh, args);
     }
     if (strcmp(fn->name, "hgln_run")) return 0;                     /* the empty marker kernel */
     g_last.launches++; g_last.grid = gx; g_last.block = bx; g_last.smem = sh; g_last.real = (unsigned)fn->mod->real;

@@ -87,7 +87,7 @@ The ctests drive the full path: CPU `Net` → `Bank` → FORGE runtime → mock 
 - a device with too little shared memory falls back to global scratch;
 - a missing driver gives a clear reason.
 
-**Two kernels, one image.** Every image holds `hgln_run`, the float `Net` with every option (4.3, 4.2, and the version 5.0 latch, latch credit, gate error and top-K corners), and `hglnq_run`, the integer `NetQ` (`cuda/hgln_q_kernel.h`), which `hgln::gpu::BankQ` runs. The mock tests cover both (`*_v5*`, `*_int` cases: CUDA and HIP, sm_80 and sm_70, 8/12/16 units, fan-out and chain, several calls, download and re-upload).
+**Two kernels, one image.** Every image holds `hgln_run` (and on CUDA `hgln_wrun`, the same body with one warp per network), the float `Net` with every option (4.3, 4.2, and the version 5.0 latch, latch credit, gate error and top-K corners), and `hglnq_run`, the integer `NetQ` (`cuda/hgln_q_kernel.h`), which `hgln::gpu::BankQ` runs. The mock tests cover both (`*_v5*`, `*_int` cases: CUDA and HIP, sm_80 and sm_70, 8/12/16 units, fan-out and chain, several calls, download and re-upload).
 
 **CPU and GPU give the same bits.** Every result is exact (0 difference) against the CPU library, in the mock tests and on hardware:
 - the float kernel does the library's IEEE operations in the same order, multiply-adds are never fused, and it uses no libm: the gate (`hgln_gate`) and the `exp` of the latch and the gate-rate schedule (`hgln_exp`) are HGLN's own, and `sqrt` and division are correctly rounded on every device;
@@ -95,7 +95,7 @@ The ctests drive the full path: CPU `Net` → `Bank` → FORGE runtime → mock 
 
 **Real hardware: an NVIDIA GeForce RTX 3090** (sm_86, CUDA driver under WSL2). FORGE's runtime opens it and the driver JIT-loads the sm_80 PTX. `hgln_gpu selftest` (GPU vs CPU library) gives 0 difference in predictions and state for float64, float32 and the integer net: 4.3, v4.2 and v5, 8/12/16 units, fan-out and chain, d = 8, 64 and 100, up to 4,500 samples (past the prune and the renormalisation at 4,096).
 
-**Not verified:** the AMD code objects have not been loaded by ROCm, and HIP's shared-memory limit is assumed to be 64 KB, not queried. GPU speed has not been studied. With one block per network a single stream takes tens of �s per sample; the kernels are built for many networks at once.
+**Not verified:** the AMD code objects have not been loaded by ROCm, and HIP's shared-memory limit is assumed to be 64 KB, not queried. GPU speed: see OPTIMISATION.md section 6. The float kernel is bound by streaming each network's state every sample: on an RTX 3090 it takes 41-49 µs per sample for 27 networks at d = 108, and 178-196 µs for 256 networks at d = 128.
 
 `cuda/hgln_cuda.cu` (the nvcc runtime-API host) is kept as an alternative for anyone with the CUDA SDK. It compiles with nvcc 12.0 (`-fmad=false`, so multiply-adds are not fused) and its selftest gives 0 difference on the RTX 3090 as well (float network only).
 

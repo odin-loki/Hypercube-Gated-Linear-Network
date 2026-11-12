@@ -152,6 +152,10 @@ if(HGLN_BUILD_TESTS)
     "cuda_u12_fanout_v5_latch|cuda||units=12 fanout v5=2"
     "hip_u8_chain_v5_gerr|hip||units=8 v5=3"
     "cuda_u16_v5_dense|cuda||units=16 v5=4"
+    # the warp kernel (CUDA only; the default everywhere is the block kernel)
+    "cuda_warp|cuda|HGLN_GPU_KERNEL=warp"
+    "cuda_warp_u8_fanout_v5|cuda|HGLN_GPU_KERNEL=warp|units=8 fanout v5=1"
+    "cuda_warp_small_smem|cuda|HGLN_GPU_KERNEL=warp;MOCK_SMEM_OPTIN=16384|units=8 fanout v5=1"
     "hip_u12_fanout_top8|hip||units=12 fanout v5=5"
     # the integer network (NetQ) through BankQ: bit-identical
     "cuda_int|cuda||int"

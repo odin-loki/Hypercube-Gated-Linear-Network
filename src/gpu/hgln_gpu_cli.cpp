@@ -10,7 +10,8 @@
 // options of Params::v5() - cross-layer latch 0.1, latch credit 0.5, gates on the global error, glob 0.95, top-6 corners - with the
 // given units / fanout (v5 itself uses units=8 fanout). int: the integer network hgln::NetQ (Params::v5(), or the 4.3
 // structure with v43; units default 8 with int, 16 with int v43) through hgln::gpu::BankQ; the selftest then requires bit-identical predictions and state.
-// Environment: HGLN_GPU_THREADS (threads per block, default 256), HGLN_GPU_SCRATCH (shared|global|automatic),
+// Environment: HGLN_GPU_THREADS (threads per block, default automatic), HGLN_GPU_SCRATCH (shared|global|automatic),
+// HGLN_GPU_KERNEL (block|warp|automatic: the float kernel),
 // HGLN_GPU_IMAGE (force an image, e.g. sm_70 or gfx1100). Exit 0 = ok, 1 = failure, 77 = no device.
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_gpu.hpp"
@@ -29,6 +30,8 @@ static gpu::Options options() {
   if (const char* e = std::getenv("HGLN_GPU_THREADS")) o.threads = std::atoi(e);
   if (const char* e = std::getenv("HGLN_GPU_SCRATCH"))
     o.scratch = !std::strcmp(e, "shared") ? gpu::Scratch::shared : !std::strcmp(e, "global") ? gpu::Scratch::global : gpu::Scratch::automatic;
+  if (const char* e = std::getenv("HGLN_GPU_KERNEL"))
+    o.kernel = !std::strcmp(e, "block") ? gpu::Kernel::block : !std::strcmp(e, "warp") ? gpu::Kernel::warp : gpu::Kernel::automatic;
   return o;
 }
 
@@ -68,8 +71,8 @@ template <class T> static int run(bool self, int d, int nets, int N, Api api, bo
   std::vector<Net<T>> nn(nets);
   for (int n = 0; n < nets; n++) nn[n].init(d, 7 + n, prm);
   if (!bank.upload(nn, &why)) { std::printf("upload failed: %s\n", why.c_str()); return 1; }
-  std::printf("%s, image %s, %s, %s, %d units, %s%s, scratch %zu bytes per network in %s memory\n", bank.device_name().c_str(), bank.image().c_str(),
-              sizeof(T) == 8 ? "float64" : "float32", v42 ? "competence (4.2)" : "plain average (4.3)", units, fanout ? "fanout" : "chain", v5 ? ", v5 latch/credit/global-error gates" : "", bank.scratch_bytes(),
+  std::printf("%s, image %s, %s kernel (%d per block, %d threads), %s, %s, %d units, %s%s, scratch %zu bytes per network in %s memory\n", bank.device_name().c_str(), bank.image().c_str(),
+              bank.warp_kernel() ? "warp" : "block", bank.nets_per_block(), bank.threads_per_block(), sizeof(T) == 8 ? "float64" : "float32", v42 ? "competence (4.2)" : "plain average (4.3)", units, fanout ? "fanout" : "chain", v5 ? ", v5 latch/credit/global-error gates" : "", bank.scratch_bytes(),
               bank.shared_scratch() ? "shared" : "global");
   auto t0 = std::chrono::steady_clock::now();
   if (!bank.run(X, Y, P, N, &why)) { std::printf("run failed: %s\n", why.c_str()); return 1; }

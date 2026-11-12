@@ -83,7 +83,7 @@ The emulator (`cuda_emu d nets T threads [shared]`) now exits non-zero on a mism
 - **Runtime CPU dispatch.** *Now done with FORGE, see `FORGE.md`; this item describes the header-only build.* The fast path depends on the compile flags. A build without `-march` (plain SSE2) is correct but runs at the original speed (about 15 us at d = 8). `make ARCH=-march=x86-64-v3` gives a binary for any AVX2 machine. FORGE's `simd` layer picks kernels at run time, and so could HGLN (see `FORGE.md`).
 - **FMA contraction.** It is now explicitly off everywhere (`-ffp-contract=off` in the Makefile, in every SIMD and GPU translation unit, and in the PTX/AMDGPU builds). Correction: g++ defaults to `-ffp-contract=fast` for C++ even with `-std=c++17`, and clang's CUDA mode fuses multiply-adds too. So the measurements in section 1 (Makefile, g++ `-march=native`) were taken with FMAs fused, and the first PTX contained FMAs. With contraction off, every build (g++ or clang, any `-march`, any SIMD table, the fallback path) gives the same output bits.
 - **Splitting one network across threads.** One network's sample costs 2.5 to 15 us, and the layers depend on each other, so a hand-off per layer would cost about as much as it saves. Only independent networks are parallelised.
-- **GPU.** *Since done:* both kernels (float and integer) have run on an NVIDIA RTX 3090 and reproduce the CPU library bit for bit, float64, float32 and int16 (see `FORGE.md`). GPU speed has not been studied.
+- **GPU.** *Since done:* both kernels (float and integer) have run on an NVIDIA RTX 3090 and reproduce the CPU library bit for bit, float64, float32 and int16 (see `FORGE.md`). *Since studied: section 6.*
 - **Skipping negligible corners** (roadmap item 6 of the implementation spec) changes the algorithm and was not attempted here. *Since done as top-K corners (`Params::corners`, default 6 in version 5.0, `ALGORITHM.md` section 8a).*
 - The NumPy reference (`python/hgln_ref.py`) is unchanged: it is the oracle the C++ is checked against.
 
@@ -121,7 +121,7 @@ The integer net keeps its int16 state and its integer forward pass, which is alr
 
 The float `Net` was profiled at the same time. The latch's `hgln_exp` now runs in simple loops that vectorise (float32 v5 prediction 2.1 -> 1.3 us at d = 8), and the top-K ranking is a branch-free vector pass over the 120 corner pairs (1.3 -> 0.15 us per layer; the first, branchy version cost about 20 us per sample).
 
-Speed, best of 12 alternating rounds (`qbench`: one net at d = 8, four at d = 64, past the prune; �s per sample, predict + learn):
+Speed, best of 12 alternating rounds (`qbench`: one net at d = 8, four at d = 64, past the prune; µs per sample, predict + learn):
 
 | | d = 8, g++ | d = 8, clang 18 | d = 64, g++ | d = 64, clang 18 |
 |---|---|---|---|---|
@@ -132,7 +132,55 @@ Speed, best of 12 alternating rounds (`qbench`: one net at d = 8, four at d = 64
 
 **Result.** The integer net is 1.3-1.7x (d = 8) and 1.8-2.0x (d = 64) slower than float32 running the same v5 model, while using half the memory and giving the same bits on every CPU and GPU. It is not at parity. Most of what remains is the per-element update work: float32 updates a value in place, while the integer net converts int16 to float, rounds and clamps back, and makes a second pass for the exact per-row renormalisation. Further steps that would change the spec again: norm tracking instead of per-sample renormalisation (as float 4.3 does), and processing two inputs per register for the 8-unit layers (that changes the summation order of the row norms).
 
-## 6. How to reproduce
+## 6. GPU speed of the float kernel (version 5.0)
+
+Measured on an RTX 3090 (82 SMs, 6 MB L2) with `hgln_gpu bench d nets T`, float32, the v5 model with 8 units and fan-out (the character LM's heads). Times are per sample for all networks together, copies included.
+
+Every step below keeps the kernel **bit-identical** to the CPU library. On the real GPU, predictions and state differ by 0 in 78 runs:
+- float64 and float32, both kernels;
+- versions 4.3, 4.2 and v5; 8, 12 and 16 units; chain and fan-out;
+- d = 8, 64 and 128; 2, 37 and 256 networks.
+
+The CPU emulators also give 0 difference.
+
+| µs per sample | 27 nets, d = 108 | 256 nets, d = 128 | 1024 nets, d = 64 |
+|---|---|---|---|
+| block kernel, before | 77 | 809 | 954 |
+| warp kernel, first version | 238 | 1497 | 2659 |
+| block kernel, now (automatic threads) | 41-49 | 178-196 | 357 |
+| warp kernel, now | 144-158 | 263-289 | 409 |
+| CPU, same heads (`run_streams`, 27 / 32 threads) | 24 | about 200 | - |
+
+**What it was.** A per-phase cycle profile (thread 0 timing every phase with `clock64`) showed:
+- **State reads not coalesced.** Each task walks its own row of `H` or `W` in the library's summation order, so a warp's 32 loads touched 32 different cache lines.
+- **One thread prepared the next input alone.** That was about 17% of the time at 27 networks, stalling on every store-then-load.
+- **The latch / top-K phase ran on 24 threads.** It had one task per unit, so 24 threads did the work of the 96 gates.
+- **The kernel body was not inlined.** clang compiled it as a called function with 255 registers and a 1.7 KB stack.
+
+**What changed** (`cuda/hgln_kernel.h`):
+1. **Transposed device layout.** `H`, `p`, `W`, `M`, `A` and the scratch `xm` are stored transposed per network (`hgln_dims.h`: `hg_relayout`; the host converts on upload and download). Each task still sums its row in the library's order, but adjacent threads now read adjacent addresses.
+2. **Parallel input preparation.** Every thread computes the input norm itself, with the same loop and so the same bits, and the threads share the copy.
+3. **Latch in its own phase.** The latch runs one task per gate; then the heatmap and top-K run per unit. This costs one more barrier.
+4. **Norm computed in the rule loop.** `|xm|^2` is computed in the rule dot product that already walks `xm`, not again in U1.
+5. **Loads issued ahead.** The rule loops load 8 elements ahead, and U2a takes 4 tasks per thread.
+6. **Forced inlining.** The kernel body is `always_inline`; the rare prune stays out of line.
+
+**Why the GPU is still not much faster than the CPU.** Every sample reads and writes the whole state of every network: about 115 KB (d = 108) to 135 KB (d = 128) each in float32, for 1-2 floating-point operations per byte.
+- **Few networks (one per SM):** each sample is a chain of L2 round trips. The 109-long dot products must be summed in order to keep the bits, so they cannot be split across threads.
+- **Many networks:** 256 networks are 35 MB, which does not fit in the L2. The run streams about 69 MB per sample through DRAM, measured at about 350 GB/s.
+- **The CPU** keeps each network in its core's cache.
+
+A large GPU speed-up needs a kernel that keeps each network's state on the chip (shared memory plus registers) for the whole stream. At d = 108 the state is larger than the 99 KB of shared memory a block can have, so it would need a split: `H` and `p` in shared memory, `W` from L2. That has not been built.
+
+**The warp kernel** (`hgln_wrun`: one 32-lane warp per network, several networks per block, warp barriers) is correct, and is kept as `Options::kernel = Kernel::warp`. It was never faster than the block kernel, from 27 to 16384 networks:
+- with few networks, 32 threads cannot keep enough loads in flight to stream a network's state;
+- with many networks, a block kernel with 32 threads per block runs the same schedule and was as fast or slightly faster.
+
+So `Kernel::automatic` is the block kernel, and its thread count is automatic (`Options::threads = 0`): 256 for fewer than 128 networks, otherwise 64. Measured on the 3090:
+- 27 networks: 256 threads 50 µs, 128 threads 57 µs, 64 threads 84 µs.
+- 256 networks: 64 threads 195 µs, 256 threads 273 µs.
+
+## 7. How to reproduce
 
     make && make test      # behavioural, parity, emulator (global + shared, float64 + float32), PTX, digits
     make bench             # the speed table above (this machine's numbers will differ)

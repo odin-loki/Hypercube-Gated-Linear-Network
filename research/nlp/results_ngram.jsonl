@@ -1,0 +1,12 @@
+{"dataset": "text8", "model": "1-gram, interpolated absolute discounting", "discounts": [0.1], "valid_bpc": 4.1213, "test_bpc": 4.1248}
+{"dataset": "text8", "model": "2-gram, interpolated absolute discounting", "discounts": [0.1, 0.1], "valid_bpc": 3.4327, "test_bpc": 3.4373}
+{"dataset": "text8", "model": "3-gram, interpolated absolute discounting", "discounts": [0.1, 0.1, 0.5], "valid_bpc": 2.8648, "test_bpc": 2.8846}
+{"dataset": "text8", "model": "4-gram, interpolated absolute discounting", "discounts": [0.1, 0.1, 0.7, 0.7], "valid_bpc": 2.3042, "test_bpc": 2.3348}
+{"dataset": "text8", "model": "5-gram, interpolated absolute discounting", "discounts": [0.1, 0.1, 0.7, 0.8, 0.7], "valid_bpc": 1.9285, "test_bpc": 1.9749}
+{"dataset": "text8", "model": "6-gram, interpolated absolute discounting", "discounts": [0.1, 0.1, 0.7, 0.8, 0.8, 0.8], "valid_bpc": 1.7505, "test_bpc": 1.8019}
+{"dataset": "enwik8", "model": "1-gram, interpolated absolute discounting", "discounts": [0.1], "valid_bpc": 5.0658, "test_bpc": 5.1101}
+{"dataset": "enwik8", "model": "2-gram, interpolated absolute discounting", "discounts": [0.1, 0.8], "valid_bpc": 3.8902, "test_bpc": 3.9218}
+{"dataset": "enwik8", "model": "3-gram, interpolated absolute discounting", "discounts": [0.1, 0.8, 0.7], "valid_bpc": 3.1148, "test_bpc": 3.1029}
+{"dataset": "enwik8", "model": "4-gram, interpolated absolute discounting", "discounts": [0.1, 0.8, 0.8, 0.8], "valid_bpc": 2.5343, "test_bpc": 2.5256}
+{"dataset": "enwik8", "model": "5-gram, interpolated absolute discounting", "discounts": [0.1, 0.8, 0.8, 0.9, 0.8], "valid_bpc": 2.1725, "test_bpc": 2.1761}
+{"dataset": "enwik8", "model": "6-gram, interpolated absolute discounting", "discounts": [0.1, 0.8, 0.8, 0.9, 0.9, 0.8], "valid_bpc": 2.0167, "test_bpc": 2.0315}

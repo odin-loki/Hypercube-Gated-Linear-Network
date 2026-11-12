@@ -51,6 +51,13 @@ for u in 8 12 16; do for fo in 0 1; do
   ./build/cuda_emu_f 8 2 700 8 1 0 0 $u $fo 1; ./build/cuda_emu 100 1 560 16 0 1 0 $u $fo 1
 done; done
 ./build/cuda_emu 8 1 4500 8 1 0 0 8 1 1; ./build/cuda_emu 8 2 600 8 0 0 1 8 1 1; ./build/cuda_emu 8 2 600 8 1 0 1 16 0 1
+echo "== the warp kernel (one warp per network, several per block) on the CPU emulator vs the C++ library"
+# last argument: networks per block; one barrier per 32-lane warp; shared scratch is W slices per block
+for w in 1 2 4 8; do
+  ./build/cuda_emu 8 5 700 8 $((w % 2)) 0 0 8 1 1 $w; ./build/cuda_emu 64 3 600 8 $(((w + 1) % 2)) 0 0 16 0 0 $w
+  ./build/cuda_emu_f 8 5 700 8 1 0 0 12 1 1 $w; ./build/cuda_emu 100 2 560 8 0 1 0 8 1 5 $w
+done
+./build/cuda_emu 8 3 4500 8 1 0 0 8 1 1 4; ./build/cuda_emu 8 2 600 8 0 0 1 16 0 0 2
 echo "== integer GPU kernel (NetQ) on the CPU emulator vs the C++ integer net (bit-identical; NOT on a GPU)"
 # args: d nets T threads [units] [bits] [mode]; mode 0 v5, 1 the 4.3 structure, 2 chain latch + credit 1 + top-1, 3 chain top-8
 for u in 8 12 16; do for b in 16 12; do ./build/cuda_emu_q 8 2 700 8 $u $b 0; ./build/cuda_emu_q 64 1 600 13 $u $b 0; done; done

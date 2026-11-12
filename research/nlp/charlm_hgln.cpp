@@ -15,9 +15,16 @@
 //   charlm_hgln FILE text8|enwik8 gpu|cpu [train_chars=90000000] [K] [chunk] [threads=0]
 //   gpu: the heads train on the GPU (hgln::gpu::Bank, one thread block per head) and are evaluated on the CPU;
 //   cpu: they train on the CPU (hgln::run_streams, heads in parallel) - the same model.
+// Text generation: HGLN_GEN=n (default 600) characters are sampled after the evaluation, from the prompt HGLN_PROMPT
+// (default: the 64 characters before the test split), each from softmax(scores / temperature) with a fixed seed
+// (HGLN_GEN_SEED), feeding the model its own output; printed to stderr and as "sample" in the JSON.
 // Progress goes to stderr, one JSON line with the results to stdout.
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
+#ifdef HGLN_CHARLM_CPU_ONLY                // header-only build without the GPU (training mode cpu only)
+#include "hgln.hpp"
+#else
 #include "hgln_gpu.hpp"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -81,6 +88,34 @@ static double bpc_of(const std::vector<float>& sc, const std::vector<unsigned ch
   return bits / n;
 }
 
+// Sample n symbols after the prompt: the K previous symbols -> the head scores -> softmax(scores / tau) -> one draw.
+static std::vector<unsigned char> generate(const Task& T, const std::vector<Net<float>>& nets, std::vector<unsigned char> ctx, int n, double tau, uint64_t seed) {
+  Rng rng(seed); std::vector<Work<float>> w(T.C); for (int c = 0; c < T.C; c++) w[c].init(nets[c]);
+  std::vector<float> x(T.d); std::vector<double> pr(T.C);
+  const long start = (long)ctx.size();
+  for (int i = 0; i < n; i++) {
+    T.features(ctx, (long)ctx.size(), x.data());
+    double mx = -1e30;
+    for (int c = 0; c < T.C; c++) { pr[c] = nets[c].infer(x.data(), w[c]); mx = std::max(mx, pr[c]); }
+    double z = 0; for (int c = 0; c < T.C; c++) { pr[c] = std::exp((pr[c] - mx) / tau); z += pr[c]; }
+    double u = rng.uni() * z; int c = 0;
+    for (; c < T.C - 1; c++) { u -= pr[c]; if (u < 0) break; }
+    ctx.push_back((unsigned char)c);
+  }
+  return std::vector<unsigned char>(ctx.begin() + start, ctx.end());
+}
+static std::string show(const Task& T, const std::vector<unsigned char>& v) {   // symbols -> printable text (JSON-safe)
+  std::string o;
+  for (unsigned char c : v) {
+    const int b = T.text8 ? (c == 0 ? 32 : 96 + c) : c;
+    if (b == 34 || b == 92) { o += (char)92; o += (char)b; }
+    else if (b == 10) { o += (char)92; o += 'n'; }
+    else if (b >= 32 && b < 127) o += (char)b;
+    else { char e[8]; std::snprintf(e, sizeof e, "%c%c%02x", 92, 'x', b); o += e; }
+  }
+  return o;
+}
+
 int main(int argc, char** argv) {
   if (argc < 4) { std::fprintf(stderr, "usage: charlm_hgln FILE text8|enwik8 gpu|cpu [train_chars] [K] [chunk] [threads]\n"); return 1; }
   const std::string path = argv[1], kind = argv[2], mode = argv[3];
@@ -116,12 +151,22 @@ int main(int argc, char** argv) {
   const auto t_start = now();
   long okw = 0, nw = 0;                                      // online accuracy over the last million training characters
   std::vector<float> X, Y, Pr;
-  gpu::Bank<float> bank; std::string why;
+#ifndef HGLN_CHARLM_CPU_ONLY
+  gpu::Bank<float> bank;
+#endif
+  std::string why;
   if (mode == "gpu") {
-    if (!bank.open(gpu::Api::cuda, 0, &why)) { std::fprintf(stderr, "no GPU: %s\n", why.c_str()); return 77; }
+#ifdef HGLN_CHARLM_CPU_ONLY
+    std::fprintf(stderr, "built without the GPU (HGLN_CHARLM_CPU_ONLY)\n"); return 1;
+#else
+    gpu::Options opt;                                          // HGLN_GPU_KERNEL=block|warp|automatic, HGLN_GPU_THREADS
+    if (const char* e = std::getenv("HGLN_GPU_KERNEL")) opt.kernel = std::string(e) == "block" ? gpu::Kernel::block : std::string(e) == "warp" ? gpu::Kernel::warp : gpu::Kernel::automatic;
+    if (const char* e = std::getenv("HGLN_GPU_THREADS")) opt.threads = std::atoi(e);
+    if (!bank.open(gpu::Api::cuda, 0, &why, opt)) { std::fprintf(stderr, "no GPU: %s\n", why.c_str()); return 77; }
     if (!bank.upload(nets, &why)) { std::fprintf(stderr, "upload: %s\n", why.c_str()); return 1; }
-    std::fprintf(stderr, "GPU: %s, image %s, scratch %zu bytes per head in %s memory\n", bank.device_name().c_str(), bank.image().c_str(),
-                 bank.scratch_bytes(), bank.shared_scratch() ? "shared" : "global");
+    std::fprintf(stderr, "GPU: %s, image %s, %s kernel (%d heads per block), scratch %zu bytes per head in %s memory\n", bank.device_name().c_str(), bank.image().c_str(),
+                 bank.warp_kernel() ? "warp" : "block", bank.nets_per_block(), bank.scratch_bytes(), bank.shared_scratch() ? "shared" : "global");
+#endif
   }
   for (long t0 = 0; t0 < Ntr; t0 += chunk) {
     const long n = std::min(chunk, Ntr - t0);
@@ -129,8 +174,11 @@ int main(int argc, char** argv) {
     for (long i = 0; i < n; i++) { T.features(s, t0 + i, &X[(size_t)i * d]); Y[(size_t)s[t0 + i] * n + i] = 1.0f; }
     const auto a = now();
     Pr.assign((size_t)C * n, 0.0f);
+#ifndef HGLN_CHARLM_CPU_ONLY
     if (mode == "gpu") { if (!bank.run(X.data(), Y.data(), Pr.data(), (int)n, &why)) { std::fprintf(stderr, "run: %s\n", why.c_str()); return 1; } }
-    else run_streams(nets, X.data(), Y.data(), Pr.data(), (size_t)n, threads);
+    else
+#endif
+    run_streams(nets, X.data(), Y.data(), Pr.data(), (size_t)n, threads);
     const double dt = sec(a, now());
     if (t0 + n > Ntr - 1000000L) for (long i = 0; i < n; i++) {
       int am = 0; for (int c = 1; c < C; c++) if (Pr[(size_t)c * n + i] > Pr[(size_t)am * n + i]) am = c;
@@ -139,7 +187,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "  trained %ld / %ld, %.2f us per character (all %d heads), elapsed %.0f s\n", t0 + n, Ntr, 1e6 * dt / n, C, sec(t_start, now()));
   }
   const double t_train = sec(t_start, now());
+#ifndef HGLN_CHARLM_CPU_ONLY
   if (mode == "gpu" && !bank.download(nets, &why)) { std::fprintf(stderr, "download: %s\n", why.c_str()); return 1; }
+#endif
   // ---- evaluation on the CPU
   const auto e0 = now();
   std::vector<float> sv;
@@ -154,10 +204,20 @@ int main(int argc, char** argv) {
   evaluate(T, nets, s, T0, NT, threads, false, none, tau, &tbits, &thit);
   const double t_eval = sec(e0, now());
   size_t bytes = 0; for (auto& n : nets) bytes += n.model_bytes();
+  const int ngen = std::getenv("HGLN_GEN") ? std::atoi(std::getenv("HGLN_GEN")) : 600;
+  std::vector<unsigned char> prompt;
+  if (const char* e = std::getenv("HGLN_PROMPT")) { for (const char* q = e; *q; q++) { const unsigned char b = (unsigned char)*q;
+      prompt.push_back(T.text8 ? (unsigned char)(b >= 97 && b <= 122 ? b - 96 : 0) : b); } }
+  else prompt.assign(s.begin() + T0 - 64, s.begin() + T0);
+  const uint64_t gseed = std::getenv("HGLN_GEN_SEED") ? std::strtoull(std::getenv("HGLN_GEN_SEED"), nullptr, 10) : 7;
+  const std::vector<unsigned char> gen = generate(T, nets, prompt, ngen, tau, gseed);
+  const std::string sp = show(T, prompt), sg = show(T, gen);
+  std::fprintf(stderr, "sample (temperature %.3f, seed %llu):\n[%s]%s\n", tau, (unsigned long long)gseed, sp.c_str(), sg.c_str());
   std::printf("{\"dataset\":\"%s\",\"model\":\"HGLN v5.0, %d one-vs-rest heads, K=%d context (d=%d), float32\",\"mode\":\"%s\",\"train_chars\":%ld,"
               "\"train_seconds\":%.1f,\"train_us_per_char\":%.3f,\"train_chars_per_second\":%.0f,\"online_train_acc_last_1M\":%.4f,"
-              "\"temperature\":%.4f,\"valid_bpc\":%.4f,\"valid_acc\":%.4f,\"test_bpc\":%.4f,\"test_acc\":%.4f,\"eval_seconds\":%.1f,\"model_bytes\":%zu}\n",
+              "\"temperature\":%.4f,\"valid_bpc\":%.4f,\"valid_acc\":%.4f,\"test_bpc\":%.4f,\"test_acc\":%.4f,\"eval_seconds\":%.1f,\"model_bytes\":%zu,"
+              "\"prompt\":\"%s\",\"sample\":\"%s\"}\n",
               kind.c_str(), C, T.K, d, mode.c_str(), Ntr, t_train, 1e6 * t_train / Ntr, Ntr / t_train, nw ? (double)okw / nw : 0.0,
-              tau, vbits / NV, (double)vhit / NV, tbits / NT, (double)thit / NT, t_eval, bytes);
+              tau, vbits / NV, (double)vhit / NV, tbits / NT, (double)thit / NT, t_eval, bytes, sp.c_str(), sg.c_str());
   return 0;
 }

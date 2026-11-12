@@ -9,6 +9,7 @@
 #include "hgln_q_host.h"
 #include "hgln_gpu_images.gen.hpp"   // generated at build time (cmake/hgln_gpu.cmake): hgln::gpu::images::table
 #include <forge/gpu/cuda.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -30,9 +31,10 @@ template <class T> struct Bank<T>::Impl {
   std::unique_ptr<fg::runtime> rt;
   Api api = Api::cuda;
   Options opt;
-  void* mod = nullptr; void* fn = nullptr;
+  void* mod = nullptr; void* fn = nullptr; void* wfn = nullptr;   // wfn: hgln_wrun (CUDA images), or null
   std::string image;
   std::size_t max_smem = 0;
+  bool warp = false; int wpb = 1, nt = 256;              // the kernel in use, its networks per block, its block size
   // networks on the device
   int nets = 0, d = 0; Params prm; HgDims g{};
   bool use_smem = false;
@@ -101,12 +103,14 @@ static bool load_image(Api api, int ordinal, int real, const char* kname, std::u
 
 template <class T> bool Bank<T>::open(Api api, int ordinal, std::string* why, Options opt) {
   close();
-  if (opt.threads < 1 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024");
+  if (opt.threads < 0 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024 (0: automatic)");
   auto im = std::make_unique<Impl>();
   im->api = api; im->opt = opt;
   try {
     if (!load_image(api, ordinal, (int)sizeof(T), "hgln_run", im->rt, im->mod, im->fn, im->image, why)) return false;
     im->max_smem = im->rt->max_dynamic_smem();
+    if (api == Api::cuda && opt.kernel == Kernel::warp) im->wfn = im->rt->module_function(im->mod, "hgln_wrun");
+    if (opt.kernel == Kernel::warp && !im->wfn) return fail(why, std::string(api_name(api)) + ": this image has no warp kernel (CUDA images only)");
   } catch (const std::exception& ex) {
     return fail(why, ex.what());
   }
@@ -122,6 +126,9 @@ template <class T> std::size_t Bank<T>::max_shared_bytes() const { return p_ ? p
 template <class T> std::size_t Bank<T>::size() const { return p_ ? (std::size_t)p_->nets : 0; }
 template <class T> int Bank<T>::d() const { return p_ ? p_->d : 0; }
 template <class T> bool Bank<T>::shared_scratch() const { return p_ && p_->use_smem; }
+template <class T> bool Bank<T>::warp_kernel() const { return p_ && p_->warp; }
+template <class T> int Bank<T>::nets_per_block() const { return p_ ? p_->wpb : 0; }
+template <class T> int Bank<T>::threads_per_block() const { return p_ && p_->nets ? p_->nt : 0; }
 template <class T> std::size_t Bank<T>::scratch_bytes() const { return p_ && p_->nets ? (std::size_t)p_->g.scs * sizeof(T) : 0; }
 template <class T> long Bank<T>::samples_seen(std::size_t n) const { return p_ && n < p_->t.size() ? p_->t[n] : 0; }
 
@@ -169,20 +176,30 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
       }
     }
   }
+  {                                                           // to the kernel's transposed device layout (hgln_dims.h)
+    std::vector<T> tmp(g.Hs + g.Ws);
+    hg_relayout(g, (long)N, H.data(), p.data(), W.data(), M.data(), A.data(), tmp.data(), true);
+  }
   try {
     I.free_state();
     bool sh = false;
+    const bool warp = I.wfn != nullptr;                         // the warp kernel: networks per block from the block size,
+    const int nt = I.opt.threads ? I.opt.threads : (warp ? 128 : (N < 128 ? 256 : 64));   // (automatic: see Options)
+    int wpb = warp ? std::max(1, nt / 32) : 1;                  // fewer if their scratch does not fit in shared memory
+    if (warp) wpb = std::min(wpb, (int)N);
     if (I.opt.scratch != Scratch::global) {
-      sh = smem <= I.max_smem && I.rt->set_dynamic_smem(I.fn, smem);
+      while (warp && wpb > 1 && (std::size_t)wpb * smem > I.max_smem) wpb--;
+      sh = (std::size_t)wpb * smem <= I.max_smem && I.rt->set_dynamic_smem(warp ? I.wfn : I.fn, (std::size_t)wpb * smem);
       if (!sh && I.opt.scratch == Scratch::shared)
         return fail(why, "scratch needs " + std::to_string(smem) + " bytes of shared memory per block; the device allows " + std::to_string(I.max_smem));
     }
+    if (warp && !sh) wpb = std::max(1, std::min(nt / 32, (int)N));   // global scratch: any number per block
     auto put = [&](std::uint64_t& b, const void* src, std::size_t bytes) { b = I.rt->device_alloc(bytes); I.rt->upload(b, src, bytes); };
     put(I.H, H.data(), H.size() * sizeof(T)); put(I.Q, Q.data(), Q.size() * sizeof(T)); put(I.p, p.data(), p.size() * sizeof(T)); put(I.W, W.data(), W.size() * sizeof(T));
     put(I.M, M.data(), M.size() * sizeof(T)); put(I.A, A.data(), A.size() * sizeof(T)); put(I.m, m.data(), m.size() * sizeof(T));
     put(I.tc, t.data(), t.size() * sizeof(long));
     if (!sh) I.S = I.rt->device_alloc(N * (std::size_t)g.scs * sizeof(T));
-    I.use_smem = sh; I.g = g; I.d = d; I.prm = nets[0].P; I.nets = (int)N; I.t = t;
+    I.use_smem = sh; I.warp = warp; I.wpb = wpb; I.nt = warp ? 32 * wpb : nt; I.g = g; I.d = d; I.prm = nets[0].P; I.nets = (int)N; I.t = t;
   } catch (const std::exception& ex) {
     I.free_state();
     return fail(why, ex.what());
@@ -207,10 +224,16 @@ template <class T> bool Bank<T>::run(const T* X, const T* Y, T* P, int samples, 
     T glr0 = (T)I.prm.glr0, glr1 = (T)I.prm.glr1, tau = (T)I.prm.tau, glob = (T)I.prm.glob, mu = (T)I.prm.mu;
     T latch = (T)I.prm.latch, credit = (T)I.prm.latch_credit; int gate_err = I.prm.gate_err, corners = I.prm.corners;   // version 5.0 options
     // kernelParams in hgln_run's parameter order (cuda/hgln_kernel.h)
+    int nets = I.nets;                                          // (hgln_wrun's last argument)
     void* args[] = {&g, &I.H, &I.Q, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm, &competence, &units, &fanout,
-                    &latch, &credit, &gate_err, &corners};
-    const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.opt.threads, 1, 1};
-    I.rt->launch_kernel(I.fn, grid, block, I.use_smem ? (unsigned)((std::size_t)g.scs * sizeof(T)) : 0u, args);
+                    &latch, &credit, &gate_err, &corners, &nets};
+    if (I.warp) {                                               // one warp per network, wpb networks per block
+      const unsigned grid[3] = {(unsigned)((I.nets + I.wpb - 1) / I.wpb), 1, 1}, block[3] = {(unsigned)(32 * I.wpb), 1, 1};
+      I.rt->launch_kernel(I.wfn, grid, block, I.use_smem ? (unsigned)((std::size_t)I.wpb * g.scs * sizeof(T)) : 0u, args);
+    } else {
+      const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.nt, 1, 1};
+      I.rt->launch_kernel(I.fn, grid, block, I.use_smem ? (unsigned)((std::size_t)g.scs * sizeof(T)) : 0u, args);
+    }
     if (P) I.rt->download(P, I.P, yb);
     else I.rt->wait();
     for (auto& t : I.t) t += samples;
@@ -242,6 +265,10 @@ template <class T> bool Bank<T>::download(std::vector<Net<T>>& nets, std::string
     I.rt->download(t.data(), I.tc, t.size() * sizeof(long));
   } catch (const std::exception& ex) {
     return fail(why, ex.what());
+  }
+  {                                                           // back from the transposed device layout
+    std::vector<T> tmp(g.Hs + g.Ws);
+    hg_relayout(g, (long)N, H.data(), p.data(), W.data(), M.data(), A.data(), tmp.data(), false);
   }
   const std::size_t old = nets.size();
   if (old != N) nets.resize(N);
@@ -306,7 +333,7 @@ template <class R> long BankQ<R>::samples_seen(std::size_t n) const { return p_ 
 
 template <class R> bool BankQ<R>::open(Api api, int ordinal, std::string* why, Options opt) {
   close();
-  if (opt.threads < 1 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024");
+  if (opt.threads < 0 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024 (0: automatic)");
   auto im = std::make_unique<Impl>();
   im->opt = opt;
   try {
@@ -369,7 +396,7 @@ template <class R> bool BankQ<R>::run(const R* X, const R* Y, R* P, int samples,
     HgQDims g = I.g; HgQCfg C = I.C; int Ts = samples;
     // kernelParams in hglnq_run's parameter order (cuda/hgln_q_kernel.h)
     void* args[] = {&g, &C, &I.H, &I.p, &I.W, &I.M, &I.A, &I.S, &I.lut, &I.ex, &I.X, &I.Y, &I.P, &I.tc, &Ts};
-    const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.opt.threads, 1, 1};
+    const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)(I.opt.threads ? I.opt.threads : 256), 1, 1};
     I.rt->launch_kernel(I.fn, grid, block, 0u, args);
     if (P) I.rt->download(P, I.P, yb);
     else I.rt->wait();

@@ -38,12 +38,16 @@ inline void hg_pack(const HgDims& g, const std::vector<hgln::Net<hreal>>& nets, 
       }
     }
   }
+  std::vector<hreal> tmp(g.Hs + g.Ws);                      // to the kernel's (transposed) device layout
+  hg_relayout(g, (long)N, s.H.data(), s.p.data(), s.W.data(), s.M.data(), s.A.data(), tmp.data(), true);
 }
 // Max abs difference of the live state of network n against a CPU net (raw hyperplanes and their squared norms, as
 // stored, plus the normalised rows the library's hyperplane() returns). Skips the frozen W of pruned columns and,
 // after the prune, the activity trace (both are dead state the CPU library no longer keeps).
-inline double hg_state_diff(const HgDims& g, const HgHostState& s, size_t n, const hgln::Net<hreal>& net) {
+inline double hg_state_diff(const HgDims& g, const HgHostState& s0, size_t n, const hgln::Net<hreal>& net) {
   if (net.units() != g.U || net.d != g.d) return INFINITY;
+  HgHostState s = s0; std::vector<hreal> tmp(g.Hs + g.Ws);   // back to the row-major layout
+  hg_relayout(g, (long)(s.t.size()), s.H.data(), s.p.data(), s.W.data(), s.M.data(), s.A.data(), tmp.data(), false);
   double mx = 0;
   auto upd = [&](hreal a, hreal b) { mx = std::max(mx, std::fabs((double)a - (double)b)); };
   for (int l = 0; l < 3; l++) {

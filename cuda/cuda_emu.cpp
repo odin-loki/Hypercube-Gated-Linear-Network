@@ -11,6 +11,8 @@
 //     units = Params::units (8, 12 or 16; default 16); fanout = 1: Params::fanout (layer 3 reads layer 1)
 //     v5 = version 5.0 options: 1 the v5 defaults (latch 0.1, latch credit 0.5, gate_err 2, glob 0.95, top-6 corners); 2 latch 0.1
 //          without credit, gate_err 1; 3 gate_err 2 without the latch; 4 = 1 with all 16 corners; 5 top-8 corners only; 0 (default) none (4.3)
+//     wpb > 0: the warp kernel hgln_wrun (one 32-lane warp per network, wpb networks per block, one barrier per warp;
+//          threads is then ignored); 0 (default): the block kernel hgln_run
 // float64 and float32 must match the C++ library exactly (0 difference), predictions and the full state including |H|^2.
 #define HGLN_EMULATE
 #include <barrier>
@@ -35,7 +37,7 @@ using hgln::Net;
 int main(int argc, char** argv) {
   int d = argc > 1 ? atoi(argv[1]) : 8, nets = argc > 2 ? atoi(argv[2]) : 3, T = argc > 3 ? atoi(argv[3]) : 1500, NT = argc > 4 ? atoi(argv[4]) : 8, SH = argc > 5 ? atoi(argv[5]) : 0,
       CM = argc > 6 ? atoi(argv[6]) : 0, FAR = argc > 7 ? atoi(argv[7]) : 0, UN = argc > 8 ? atoi(argv[8]) : 16, FO = argc > 9 ? atoi(argv[9]) : 0,
-      V5 = argc > 10 ? atoi(argv[10]) : 0;
+      V5 = argc > 10 ? atoi(argv[10]) : 0, WPB = argc > 11 ? atoi(argv[11]) : 0;   // WPB > 0: the warp kernel, WPB networks per block
   if (!hg_valid_units(UN) || d < 1 || d > HG_MAXN) { fprintf(stderr, "cuda_emu: need units 8, 12 or 16 and 1 <= d <= %d\n", HG_MAXN); return 2; }
   HgDims g = hg_dims(d, UN); hgln::Rng rng(12345);
   std::vector<hreal> X((size_t)T * d), Y((size_t)nets * T);
@@ -63,15 +65,23 @@ int main(int argc, char** argv) {
   }
   HgHostState st; hg_pack(g, init, st, !SH);
   std::vector<hreal> P((size_t)nets * T);
-  for (int b = 0; b < nets; b++) {                          // blocks run one after another; threads inside a block run concurrently
-    std::barrier<> bar(NT); std::vector<std::thread> th;
-    std::vector<double> smem(SH ? (g.scs * sizeof(hreal) + sizeof(double) - 1) / sizeof(double) : 0);
+  const int nblk = WPB > 0 ? (nets + WPB - 1) / WPB : nets, bt = WPB > 0 ? 32 * WPB : NT, per = WPB > 0 ? WPB : 1;
+  for (int b = 0; b < nblk; b++) {                          // blocks run one after another; threads inside a block run concurrently
+    std::vector<std::unique_ptr<std::barrier<>>> bars;       // block kernel: one barrier; warp kernel: one per warp
+    for (int w = 0; w < (WPB > 0 ? WPB : 1); w++) bars.emplace_back(new std::barrier<>(WPB > 0 ? 32 : NT));
+    std::vector<std::thread> th;
+    std::vector<double> smem(SH ? (per * g.scs * sizeof(hreal) + sizeof(double) - 1) / sizeof(double) : 0);
     for (size_t i = 0; i < smem.size(); i++) smem[i] = std::nan("");   // NaN bytes for float too: any early read shows
-    for (int k = 0; k < NT; k++) th.emplace_back([&, k] {
-      hg_tid_v = k; hg_nt_v = NT; hg_bid_v = b; hg_bar = &bar; hg_smem_v = smem.data();
-      hgln_run(g, st.H.data(), st.Q.data(), st.p.data(), st.W.data(), st.M.data(), st.A.data(), st.m.data(), SH ? nullptr : st.scratch.data(),
-               X.data(), Y.data(), P.data(), st.t.data(), T, (hreal)prm.glr0, (hreal)prm.glr1, (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm,
-               st.competence, st.units, st.fanout, st.latch, st.credit, st.gate_err, st.corners); });
+    for (int k = 0; k < bt; k++) th.emplace_back([&, k] {
+      hg_tid_v = k; hg_nt_v = bt; hg_bid_v = b; hg_bar = bars[WPB > 0 ? k >> 5 : 0].get(); hg_smem_v = smem.data();
+      if (WPB > 0)
+        hgln_wrun(g, st.H.data(), st.Q.data(), st.p.data(), st.W.data(), st.M.data(), st.A.data(), st.m.data(), SH ? nullptr : st.scratch.data(),
+                  X.data(), Y.data(), P.data(), st.t.data(), T, (hreal)prm.glr0, (hreal)prm.glr1, (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm,
+                  st.competence, st.units, st.fanout, st.latch, st.credit, st.gate_err, st.corners, nets);
+      else
+        hgln_run(g, st.H.data(), st.Q.data(), st.p.data(), st.W.data(), st.M.data(), st.A.data(), st.m.data(), SH ? nullptr : st.scratch.data(),
+                 X.data(), Y.data(), P.data(), st.t.data(), T, (hreal)prm.glr0, (hreal)prm.glr1, (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm,
+                 st.competence, st.units, st.fanout, st.latch, st.credit, st.gate_err, st.corners); });
     for (auto& t : th) t.join();
   }
   double worstP = 0, worstS = 0;
@@ -87,7 +97,7 @@ int main(int argc, char** argv) {
   }
   char farmsg[64] = "";
   if (FAR) snprintf(farmsg, sizeof farmsg, ", far: %d/%d layers renormalised", renormed, 2 * nets);
-  printf("cuda_emu d=%d nets=%d T=%d threads=%d real=%s scratch=%s (%ld bytes/block) competence=%d units=%d %s%s v5=%d: max |prediction diff| = %.3g, max |state diff| = %.3g\n",
-         d, nets, T, NT, sizeof(hreal) == 4 ? "float32" : "float64", SH ? "shared" : "global", (long)(g.scs * sizeof(hreal)), CM, UN, FO ? "fanout" : "chain", farmsg, V5, worstP, worstS);
+  printf("cuda_emu d=%d nets=%d T=%d threads=%d real=%s scratch=%s (%ld bytes/block) competence=%d units=%d %s%s v5=%d %s: max |prediction diff| = %.3g, max |state diff| = %.3g\n",
+         d, nets, T, NT, sizeof(hreal) == 4 ? "float32" : "float64", SH ? "shared" : "global", (long)(g.scs * sizeof(hreal)), CM, UN, FO ? "fanout" : "chain", farmsg, V5, WPB > 0 ? "warp kernel" : "block kernel", worstP, worstS);
   return worstP == 0 && worstS == 0 ? 0 : 1;
 }

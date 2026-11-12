@@ -11,6 +11,7 @@
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #define HGLN_EMULATE
 #include <barrier>
+#include <memory>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -39,13 +40,14 @@ thread_local double* hg_smem_v = nullptr;
 #define HG_EMU_NAME HG_EMU_CAT(hgln_emu_launch_, HG_EMU_CAT(HG_EMU_TAG_, HG_REAL))
 
 // Returns 0, or 1 (invalid launch: block size, or shared scratch requested with too little dynamic shared memory).
-extern "C" int HG_EMU_NAME(unsigned grid, unsigned block, unsigned smem_bytes, void** args) {
-  if (block < 1 || block > 1024) return 1;
+// warp = true: hgln_wrun (args[27] = the number of networks; block = 32 W threads; one barrier per 32-lane warp).
+static int hg_emu_launch(bool warp, unsigned grid, unsigned block, unsigned smem_bytes, void** args) {
+  if (block < 1 || block > 1024 || (warp && block % 32)) return 1;
   const HgDims g = *static_cast<const HgDims*>(args[0]);
   auto ptr = [&](int i) { return reinterpret_cast<hreal*>(static_cast<uintptr_t>(*static_cast<const uint64_t*>(args[i]))); };
   // hgln_run(g, H, Q, p, W, M, A, m, scratch, X, Y, P, tcount, T, glr0, glr1, tau, glob, mu, warm, competence, units, fanout,
   //          latch, credit, gate_err, corners)
-  hreal *H = ptr(1), *Q = ptr(2), *p = ptr(3), *W = ptr(4), *M = ptr(5), *A = ptr(6), *m = ptr(7), *S = ptr(8);
+  hreal *H = ptr(1), *Q = ptr(2), *p = ptr(3), *Wt = ptr(4), *M = ptr(5), *A = ptr(6), *m = ptr(7), *S = ptr(8);
   const hreal *X = ptr(9), *Y = ptr(10); hreal* P = ptr(11);
   long* tc = reinterpret_cast<long*>(static_cast<uintptr_t>(*static_cast<const uint64_t*>(args[12])));
   const int T = *static_cast<const int*>(args[13]);
@@ -57,21 +59,27 @@ extern "C" int HG_EMU_NAME(unsigned grid, unsigned block, unsigned smem_bytes, v
   const hreal latch = *static_cast<const hreal*>(args[23]), credit = *static_cast<const hreal*>(args[24]);
   const int gate_err = *static_cast<const int*>(args[25]), corners = *static_cast<const int*>(args[26]);
   if (units != g.U || !hg_valid_units(units)) return 1;     // layout and kernel argument disagree
-  if (!S && (size_t)smem_bytes < (size_t)g.scs * sizeof(hreal)) return 1;   // the kernel would run past the buffer
+  const int nets = warp ? *static_cast<const int*>(args[27]) : 0, W = warp ? (int)block / 32 : 1;
+  if (!S && (size_t)smem_bytes < (size_t)W * g.scs * sizeof(hreal)) return 1;   // the kernel would run past the buffer
   std::vector<double> smem((smem_bytes + sizeof(double) - 1) / sizeof(double));
   for (unsigned b = 0; b < grid; b++) {
     std::memset(smem.data(), 0xFF, smem.size() * sizeof(double));
-    std::barrier<> bar((std::ptrdiff_t)block);
+    std::vector<std::unique_ptr<std::barrier<>>> bars;   // block kernel: one barrier; warp kernel: one per warp
+    for (int w = 0; w < W; w++) bars.emplace_back(new std::barrier<>((std::ptrdiff_t)(warp ? 32 : block)));
     std::vector<std::thread> th;
     th.reserve(block);
     for (unsigned k = 0; k < block; k++) th.emplace_back([&, k] {
-      hg_tid_v = (int)k; hg_nt_v = (int)block; hg_bid_v = (int)b; hg_bar = &bar; hg_smem_v = smem.data();
-      hgln_run(g, H, Q, p, W, M, A, m, S, X, Y, P, tc, T, glr0, glr1, tau, glob, mu, warm, competence, units, fanout, latch, credit, gate_err, corners);
+      hg_tid_v = (int)k; hg_nt_v = (int)block; hg_bid_v = (int)b; hg_bar = bars[warp ? k / 32 : 0].get(); hg_smem_v = smem.data();
+      if (warp) hgln_wrun(g, H, Q, p, Wt, M, A, m, S, X, Y, P, tc, T, glr0, glr1, tau, glob, mu, warm, competence, units, fanout, latch, credit, gate_err, corners, nets);
+      else hgln_run(g, H, Q, p, Wt, M, A, m, S, X, Y, P, tc, T, glr0, glr1, tau, glob, mu, warm, competence, units, fanout, latch, credit, gate_err, corners);
     });
     for (auto& t : th) t.join();
   }
   return 0;
 }
+#define HG_EMUW_NAME HG_EMU_CAT(hgln_emu_wlaunch_, HG_EMU_CAT(HG_EMU_TAG_, HG_REAL))
+extern "C" int HG_EMU_NAME(unsigned grid, unsigned block, unsigned smem_bytes, void** args) { return hg_emu_launch(false, grid, block, smem_bytes, args); }
+extern "C" int HG_EMUW_NAME(unsigned grid, unsigned block, unsigned smem_bytes, void** args) { return hg_emu_launch(true, grid, block, smem_bytes, args); }
 
 #define HG_EMUQ_NAME HG_EMU_CAT(hglnq_emu_launch_, HG_EMU_CAT(HG_EMU_TAG_, HG_REAL))
 // The integer kernel: hglnq_run(g, C, H, p, W, M, A, scratch, lut, expneg, X, Y, P, tcount, T); no shared memory.

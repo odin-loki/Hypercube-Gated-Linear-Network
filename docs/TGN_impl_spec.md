@@ -156,7 +156,7 @@ Items 1, 2, 4 and 5 are done, measured and verified (`OPTIMISATION.md`). Item 1 
 
 ## 9. CUDA design (compiled to PTX, emulated, and run on an RTX 3090)
 
-The implemented kernel (`cuda/hgln_kernel.h`) uses one thread block per network, with all 3U units of that network (`Params::units` per layer) inside the block and a block barrier between phases, rather than the per-unit mapping sketched below. That suits the target of many independent networks at once. Since version 2 the per-sample scratch can live in dynamic shared memory: 23 to 36 KB per block in float64 for d = 8 to 100. The p and hyperplane steps are fused, and dead work after the prune is skipped. `cuda/hgln_ptx.cu` builds the kernel to PTX without the CUDA SDK, using the same method as FORGE (`FORGE.md`).
+The implemented kernel (`cuda/hgln_kernel.h`) uses one thread block per network, with all 3U units of that network (`Params::units` per layer) inside the block and a block barrier between phases, rather than the per-unit mapping sketched below. That suits the target of many independent networks at once. Since version 2 the per-sample scratch can live in dynamic shared memory: 23 to 36 KB per block in float64 for d = 8 to 100. The p and hyperplane steps are fused, and dead work after the prune is skipped. On the device the state is stored transposed per network, so adjacent threads read adjacent addresses while each task keeps the library's summation order (`hgln_dims.h`, OPTIMISATION.md section 6). `cuda/hgln_ptx.cu` builds the kernel to PTX without the CUDA SDK, using the same method as FORGE (`FORGE.md`).
 
 The original design notes:
 
