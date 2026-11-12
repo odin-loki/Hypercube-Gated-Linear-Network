@@ -14,6 +14,11 @@ def row(r):
     d = r["digits"]["mean"][2]; db = B["digits"]["mean"][2]
     dw = sum(a[2] > c[2] for a, c in zip(r["digits"]["shuffles"], B["digits"]["shuffles"]))
     out.append(f"dig {d:.2f}({d - db:+.2f},{dw})")
+    if "ts" in r and "ts" in B:
+        for t in ("narma10", "mackey", "regime"):
+            m = r["ts"][t]["mean"][1]; b = B["ts"][t]["mean"][1]
+            wins = sum(a[1] < c[1] for a, c in zip(r["ts"][t]["seeds"], B["ts"][t]["seeds"]))
+            out.append(f"{t[:5]} {m:.3f}({(m - b) / b * 100:+.0f}%,{wins}/5)")
     for k in ("d8", "d64"):
         out.append(f"{k} macs x{r['cost'][k]['macs'] / B['cost'][k]['macs']:.2f} ram x{r['cost'][k]['state'] / B['cost'][k]['state']:.2f}")
     return "  ".join(out)

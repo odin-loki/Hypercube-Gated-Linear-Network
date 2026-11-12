@@ -32,6 +32,13 @@ struct Var {
   double density = 0.6;      // prune target
   int gate_every = 1;
   bool pipeline = false;
+  double theta = 0;          // > 0: Schmitt-trigger flip-flop gates: set = sig(12(z-theta)), reset = sig(12(-z-theta)),
+                             //      a = set + (1 - set - reset) a_prev  (theta = 0 is exactly the stateless gate)
+  int theta_mode = 0;        // 0: theta for every bit; 1: only odd units latched (mixed population); 2: theta learned per bit
+  double theta_lr = 0.05;
+  double theta0 = 0;         // initial theta (theta_mode 2)    // learning rate of theta (theta_mode 2)
+  int sparse_k = 0;          // > 0: hard corners - each unit uses only its top-k corners (weights renormalised)
+  int qbits = 0;             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
   int hybrid = 0;            // 1: L3 reads previous-sample L2; 2: L2 reads previous-sample L1; 3: L2 and L3 both read current L1;
                              // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
@@ -43,7 +50,8 @@ struct Layer {
   std::vector<double> H, p, W, M, A, m, hn;   // hn: tracked squared norms (norm_track)
   // per-sample
   std::vector<double> inp, s, a, h, f, xm, pred, comp, z;
-  std::vector<double> cb_acc, dp_acc;   // share_gates: gate steps from the other layers; p_shared: summed p step
+  std::vector<double> cb_acc, dp_acc;
+  std::vector<double> ap, kap, hs, th, dth;   // + per-bit dead band and d a / d theta      // latch state (previous gate bits), d a / d z factor, soft heatmap   // share_gates: gate steps from the other layers; p_shared: summed p step
   int pr(int k) const { return pshared ? 0 : k; }
   bool pshared = false, gate_from_owner = false, skip_gate = false;
   void init(int U_, int K_, int n_, int D_) {
@@ -52,6 +60,8 @@ struct Layer {
     A.assign((size_t)U * N1, 1e-3); m.assign((size_t)U * C, 0.3); hn.assign((size_t)U * K, 1);
     inp.assign(N1, 0); s.assign(D, 0); a.assign((size_t)U * K, 0); h.assign((size_t)U * C, 0); f.assign((size_t)U * C, 0);
     xm.assign((size_t)U * N1, 0); pred.assign(U, 0); comp.assign(U, 0); z.assign((size_t)U * K, 0);
+    th.assign((size_t)U * K, 0); dth.assign((size_t)U * K, 0);   // th is set from Var in Net::init
+    ap.assign((size_t)U * K, 0.5); kap.assign((size_t)U * K, 0.25); hs.assign((size_t)U * C, 0);
   }
   void random_hyperplanes(Rng& r, bool last_zero) {
     std::vector<double> v(D);
@@ -72,13 +82,32 @@ struct Layer {
         for (int i = 0; i < D; i++) zz += Hb[i] * (V.no_p ? s[i] : p[(size_t)pr(k) * D + i] * s[i]);
         if (V.norm_track) zz /= std::sqrt(hn[(size_t)k * K + b]);
         z[(size_t)k * K + b] = zz;
-        double sg = 1 / (1 + std::exp(-12 * zz));
-        a[(size_t)k * K + b] = std::min(std::max(sg, 1e-4), 1 - 1e-4);
+        const size_t ib = (size_t)k * K + b;
+        const double thv = V.theta_mode == 2 ? th[ib] : (V.theta_mode == 1 && (k & 1) == 0 ? 0.0 : V.theta);
+        if (V.theta > 0 && (thv > 0 || V.theta_mode == 2)) {   // SR flip-flop with a dead band: holds its previous value when |z| < theta
+          double st = 1 / (1 + std::exp(-12 * (zz - thv))), rt = 1 / (1 + std::exp(-12 * (-zz - thv))), q0 = ap[ib];
+          double av = st + (1 - st - rt) * q0;
+          a[ib] = std::min(std::max(av, 1e-4), 1 - 1e-4);
+          kap[ib] = st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0;   // d a / d (12 z) with a_prev held (one-step gradient)
+          dth[ib] = 12 * (-st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0);   // d a / d theta
+          ap[ib] = a[ib];
+        } else {
+          double sg = 1 / (1 + std::exp(-12 * zz));
+          a[ib] = std::min(std::max(sg, 1e-4), 1 - 1e-4);
+          kap[ib] = a[ib] * (1 - a[ib]); ap[ib] = a[ib];
+        }
       }
       for (int c = 0; c < C; c++) {
         double v = 1;
         for (int b = 0; b < K; b++) v *= ((c >> b) & 1) ? a[(size_t)k * K + b] : 1 - a[(size_t)k * K + b];
-        h[(size_t)k * C + c] = v;
+        h[(size_t)k * C + c] = v; hs[(size_t)k * C + c] = v;
+      }
+      if (V.sparse_k > 0 && V.sparse_k < C) {   // hard corners: keep the top-k, renormalise; others contribute nothing
+        int idx[16]; for (int c = 0; c < C; c++) idx[c] = c;
+        std::partial_sort(idx, idx + V.sparse_k, idx + C, [&](int x, int y) { return hs[(size_t)k * C + x] > hs[(size_t)k * C + y]; });
+        double sm = 0; for (int q = 0; q < V.sparse_k; q++) sm += hs[(size_t)k * C + idx[q]];
+        for (int c = 0; c < C; c++) h[(size_t)k * C + c] = 0;
+        for (int q = 0; q < V.sparse_k; q++) h[(size_t)k * C + idx[q]] = hs[(size_t)k * C + idx[q]] / sm;
       }
       for (int j = 0; j < N1; j++) xm[(size_t)k * N1 + j] = inp[j] * M[(size_t)k * N1 + j];
       double mix = 0, cm = 0;
@@ -98,10 +127,17 @@ struct Layer {
       double* hk = &h[(size_t)k * C]; double* fk = &f[(size_t)k * C];
       if (!V.uniform) for (int c = 0; c < C; c++) m[(size_t)k * C + c] += 0.02 * hk[c] * (e * e - m[(size_t)k * C + c]);
       double tot = 0, F1[8] = {0};
-      for (int c = 0; c < C; c++) { double hf = hk[c] * fk[c]; tot += hf; for (int b = 0; b < K; b++) if ((c >> b) & 1) F1[b] += hf; }
+      // gate gradient from the soft heatmap; with hard corners only over the corners in use (straight-through)
+      for (int c = 0; c < C; c++) { if (hk[c] == 0 && V.sparse_k > 0) continue; double hf = hs[(size_t)k * C + c] * fk[c]; tot += hf; for (int b = 0; b < K; b++) if ((c >> b) & 1) F1[b] += hf; }
       double cb[8];
       for (int b = 0; b < K; b++) {
         double ab = a[(size_t)k * K + b], g = 12 * (F1[b] * (1 - ab) - (tot - F1[b]) * ab);
+        const double dm = F1[b] / ab - (tot - F1[b]) / (1 - ab);   // d mix / d a_b
+        if (V.theta > 0) g = 12 * kap[(size_t)k * K + b] * dm;
+        if (V.theta_mode == 2 && mode != 1 && !skip_gate) {        // learn the dead band: theta += lr * es * dmix/da * da/dtheta
+          double& t0 = th[(size_t)k * K + b];
+          t0 = std::min(std::max(t0 + std::min(std::max(V.theta_lr * esk * dm * dth[(size_t)k * K + b], -0.01), 0.01), 0.0), 0.5);
+        }
         cb[b] = std::min(std::max(gl * esk * g, -0.05), 0.05);
       }
       if (mode == 1) { for (int b = 0; b < K; b++) sink[(size_t)k * K + b] += cb[b]; }
@@ -140,6 +176,11 @@ struct Layer {
     }
     if (V.p_shared && mode != 1 && !skip_gate) for (int i = 0; i < D; i++) p[i] = std::min(std::max(p[i] + dp_acc[i], 0.0), 3.0);
   }
+  void quantise(Rng& r, int bits) {   // stochastic rounding to the fixed-point grid 2^-bits
+    const double sc = std::ldexp(1.0, bits);
+    auto qz = [&](std::vector<double>& v) { for (auto& x : v) { double y = x * sc, f = std::floor(y); x = (f + (r.uni() < y - f ? 1 : 0)) / sc; } };
+    qz(W); qz(H); qz(p);
+  }
   std::vector<double> pold;                      // p as it was in the forward pass (set by the net before update)
   double pu_old(int k, int i, const Var& V) const { return (V.no_p ? 1 : pold[(size_t)pr(k) * D + i]) * s[i]; }
   void prune(double density) {
@@ -160,7 +201,7 @@ struct Layer {
 };
 
 struct Net {
-  int d = 0; Var V; std::vector<Layer> L; std::vector<double> u, o, r, R, us, prev; double out = 0; long t = 0; bool pruned = false;
+  int d = 0; Var V; std::vector<Layer> L; std::vector<double> u, o, r, R, us, prev; double out = 0; long t = 0; bool pruned = false; Rng qrng{12345};
   void init(int d_, uint64_t seed, const Var& v) {
     d = d_; V = v; t = 0; pruned = false; L.assign(V.layers, Layer());
     int Du = V.proj > 0 ? V.proj : d + 1;
@@ -170,6 +211,7 @@ struct Net {
       int D = (l > 0 && V.gate_src == 1) ? V.U + 1 : Du;
       L[l].init(V.U, V.K, n, D); L[l].pshared = V.p_shared; L[l].gate_from_owner = V.share_gates && l > 0;
       L[l].cb_acc.assign((size_t)V.U * V.K, 0);
+      if (V.theta_mode == 2) std::fill(L[l].th.begin(), L[l].th.end(), V.theta0);
     }
     for (int l = 0; l < V.layers; l++) L[l].random_hyperplanes(rng, V.proj == 0 && !(l > 0 && V.gate_src == 1));
     if (V.proj > 0) { R.assign((size_t)V.proj * (d + 1), 0); for (auto& x : R) x = rng.normal() / std::sqrt((double)V.proj); }
@@ -217,6 +259,7 @@ struct Net {
       for (int l = V.layers - 1; l > 0; l--) L[l].update(y, gl, es.data() + l * V.U, V, pruned, 1, L[0].cb_acc.data());
       L[0].update(y, gl, es.data(), V, pruned, 2);
     } else for (int l = 0; l < V.layers; l++) L[l].update(y, gl, es.data() + l * V.U, V, pruned);
+    if (V.qbits > 0) for (auto& l : L) l.quantise(qrng, V.qbits);
     t++;
     if (!pruned && t >= V.warm && t % 64 == 0) { for (auto& l : L) l.prune(V.density); pruned = true; }
   }
@@ -230,7 +273,7 @@ struct Net {
       double gate_f = gm * (double)l.U * l.K * l.D * (V.no_p ? 1 : 2);
       double gate_u = gm * (double)l.U * l.K * l.D * (V.no_p ? 3 : 6) + (V.norm_track ? 0 : (double)l.U * l.K * l.D * 2);
       gate_u /= V.gate_every;
-      double rule = 2.0 * l.U * l.C * act;
+      double rule = 2.0 * l.U * ((V.sparse_k > 0 && V.sparse_k < l.C) ? V.sparse_k : l.C) * act;
       s += gate_f + gate_u + 2 * rule + (double)l.U * l.C * (l.K + 4);
     }
     if (V.proj > 0) s += (double)V.proj * (d + 1);

@@ -20,11 +20,12 @@ int main(int argc, char** argv) {
     else if (k == "no_p") V.no_p = v != 0; else if (k == "gate_src") V.gate_src = (int)v; else if (k == "proj") V.proj = (int)v;
     else if (k == "share_gates") V.share_gates = v != 0; else if (k == "p_shared") V.p_shared = v != 0;
     else if (k == "norm_track") V.norm_track = v != 0; else if (k == "density") V.density = v; else if (k == "glob") V.glob = v; else if (k == "mu") V.mu = v;
+    else if (k == "theta") V.theta = v; else if (k == "theta_mode") V.theta_mode = (int)v; else if (k == "theta_lr") V.theta_lr = v; else if (k == "theta0") V.theta0 = v; else if (k == "sparse_k") V.sparse_k = (int)v; else if (k == "qbits") V.qbits = (int)v;
     else if (k == "hybrid") V.hybrid = (int)v; else if (k == "pipeline") V.pipeline = v != 0; else if (k == "gate_every") V.gate_every = (int)v; else if (k == "seed_off") seed_off = (int)v;
     else { fprintf(stderr, "unknown key %s\n", k.c_str()); return 1; } }
   const char* tasks[3] = {"A", "B", "C"}; const int W[4][2] = {{0, 512}, {1536, 2048}, {2048, 2560}, {3584, 4096}};
-  double syn[3][10][4]; double dig[5][3];
-  std::atomic<int> next(0); int njobs = 35;
+  double syn[3][10][4]; double dig[5][3]; double ts[3][5][2]; const char* tsn[3] = {"narma10", "mackey", "regime"};
+  std::atomic<int> next(0); int njobs = 50;
   auto work = [&] { for (int j; (j = next.fetch_add(1)) < njobs;) {
     if (j < 5) {   // digits shuffle 10 + j (longest jobs first)
       auto D = load(dir + "/dig_" + std::to_string(10 + j) + ".bin"); int n = (int)D.size() / 65, ntr = 2 * n / 3, C = 10;
@@ -36,8 +37,16 @@ int main(int argc, char** argv) {
           for (int k = 0; k < C; k++) { double s = nets[k].predict(r + 1); if (s > bs) { bs = s; best = k; } } ok += best == (int)r[0]; }
         dig[j][ep] = 100.0 * ok / (n - ntr);
       }
+    } else if (j < 20) {   // time-structured streams: NMSE over samples 2000-4000 and 4000-6000
+      int q = j - 5, ti = q / 5, sd = 300 + q % 5;
+      auto Dt = load(dir + "/ts_" + tsn[ti] + "_" + std::to_string(sd) + ".bin"); int dd = (int)Dt[0]; int N = (int)(Dt.size() - 1) / (dd + 1);
+      Net net; net.init(dd, sd + 7919 * seed_off, V); std::vector<double> err(N), ys(N);
+      for (int t = 0; t < N; t++) { const double* r = &Dt[1 + (size_t)t * (dd + 1)]; double p = net.predict(r); err[t] = (r[dd] - p) * (r[dd] - p); ys[t] = r[dd]; net.learn(r[dd]); }
+      for (int w = 0; w < 2; w++) { int a0 = 2000 + 2000 * w, b0 = a0 + 2000; double se = 0, sm = 0, s2 = 0;
+        for (int t = a0; t < b0; t++) { se += err[t]; sm += ys[t]; s2 += ys[t] * ys[t]; }
+        ts[ti][q % 5][w] = (se / 2000) / (s2 / 2000 - (sm / 2000) * (sm / 2000)); }
     } else {
-      int q = j - 5, ti = q / 10, sd = 200 + q % 10;
+      int q = j - 20, ti = q / 10, sd = 200 + q % 10;
       auto D = load(dir + "/syn_" + tasks[ti] + "_" + std::to_string(sd) + ".bin"); int N = (int)D.size() / 9;
       Net net; net.init(8, sd + 7919 * seed_off, V); std::vector<double> err(N), ys(N);
       for (int t = 0; t < N; t++) { const double* r = &D[(size_t)t * 9]; double p = net.predict(r); err[t] = (r[8] - p) * (r[8] - p); ys[t] = r[8]; net.learn(r[8]); }
@@ -53,5 +62,9 @@ int main(int argc, char** argv) {
     printf("],\"seeds\":["); for (int s = 0; s < 10; s++) { printf("%s[", s ? "," : ""); for (int w = 0; w < 4; w++) printf("%s%.4f", w ? "," : "", syn[ti][s][w]); printf("]"); } printf("]}"); }
   printf("},\"digits\":{\"mean\":["); for (int ep = 0; ep < 3; ep++) { double m = 0; for (int j = 0; j < 5; j++) m += dig[j][ep]; printf("%s%.2f", ep ? "," : "", m / 5); }
   printf("],\"shuffles\":["); for (int j = 0; j < 5; j++) printf("%s[%.2f,%.2f,%.2f]", j ? "," : "", dig[j][0], dig[j][1], dig[j][2]);
-  printf("]},\"cost\":{\"d8\":{\"macs\":%.0f,\"state\":%zu},\"d64\":{\"macs\":%.0f,\"state\":%zu}}}\n", a.macs(), a.state_values(), b.macs(), b.state_values());
+  printf("]},\"ts\":{");
+  for (int ti = 0; ti < 3; ti++) { printf("%s\"%s\":{\"mean\":[", ti ? "," : "", tsn[ti]);
+    for (int w = 0; w < 2; w++) { double m = 0; for (int s = 0; s < 5; s++) m += ts[ti][s][w]; printf("%s%.4f", w ? "," : "", m / 5); }
+    printf("],\"seeds\":["); for (int s = 0; s < 5; s++) printf("%s[%.4f,%.4f]", s ? "," : "", ts[ti][s][0], ts[ti][s][1]); printf("]}"); }
+  printf("},\"cost\":{\"d8\":{\"macs\":%.0f,\"state\":%zu},\"d64\":{\"macs\":%.0f,\"state\":%zu}}}\n", a.macs(), a.state_values(), b.macs(), b.state_values());
 }
