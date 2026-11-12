@@ -38,13 +38,30 @@ struct Var {
   double theta_lr = 0.05;
   double theta0 = 0;         // initial theta (theta_mode 2)    // learning rate of theta (theta_mode 2)
   int sparse_k = 0;          // > 0: hard corners - each unit uses only its top-k corners (weights renormalised)
-  int qbits = 0;             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
+  int qbits = 0;
+  int wbits = 0, abits = 0;  // > 0: integer datapath - state (W, H, p) stored as wbits-bit integers, activations as abits-bit
+                             //      integers (fixed scale per array), exact integer accumulation, stochastic-rounded updates;
+                             //      per-unit control scalars (error, gate steps, LMS rate) kept as 32-bit values
+  bool shiftnorm = false;    // integer datapath: LMS normaliser as a power-of-two shift instead of a division             // > 0: fixed point - W, H, p rounded (stochastically) to multiples of 2^-qbits after each update
   int hybrid = 0;            // 1: L3 reads previous-sample L2; 2: L2 reads previous-sample L1; 3: L2 and L3 both read current L1;
                              // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
   int warm = 512;
 };
 
+// Integer emulation: x -> nearest (or stochastically rounded) multiple of 2^-frac, saturated to `bits` signed bits.
+// frac = bits - 1 - (integer bits of the array's range). Sums of products of such values are exact in double (< 2^53),
+// i.e. they behave like an integer accumulator; rescaling by a power of two is a shift.
+inline double qn(double x, int bits, int ib) {
+  if (bits <= 0) return x;
+  const double sc = std::ldexp(1.0, bits - 1 - ib), m = std::ldexp(1.0, bits - 1) - 1;
+  return std::min(std::max(std::nearbyint(x * sc), -m), m) / sc;
+}
+inline double qsr(double x, int bits, int ib, Rng& r) {
+  if (bits <= 0) return x;
+  const double sc = std::ldexp(1.0, bits - 1 - ib), m = std::ldexp(1.0, bits - 1) - 1, y = x * sc, f = std::floor(y);
+  return std::min(std::max(f + (r.uni() < y - f ? 1.0 : 0.0), -m), m) / sc;
+}
 struct Layer {
   int U, K, C, n, N1, D;     // units, hyperplanes, corners, inputs, inputs+1, gate-input size
   std::vector<double> H, p, W, M, A, m, hn;   // hn: tracked squared norms (norm_track)
@@ -72,14 +89,15 @@ struct Layer {
     }
   }
   void forward(const double* in, const double* side, const Var& V, const Layer* owner = nullptr) {
-    for (int j = 0; j < n; j++) inp[j] = in[j];
+    for (int j = 0; j < n; j++) inp[j] = qn(in[j], V.abits, 1);
     inp[n] = 1;
-    for (int i = 0; i < D; i++) s[i] = side[i];
+    for (int i = 0; i < D; i++) s[i] = qn(side[i], V.abits, 1);
     for (int k = 0; k < U; k++) {
       if (owner) { for (int b = 0; b < K; b++) { a[(size_t)k * K + b] = owner->a[(size_t)k * K + b]; z[(size_t)k * K + b] = owner->z[(size_t)k * K + b]; } }
       else for (int b = 0; b < K; b++) {
         const double* Hb = &H[((size_t)k * K + b) * D]; double zz = 0;
-        for (int i = 0; i < D; i++) zz += Hb[i] * (V.no_p ? s[i] : p[(size_t)pr(k) * D + i] * s[i]);
+        for (int i = 0; i < D; i++) zz += Hb[i] * (V.no_p ? s[i] : qn(p[(size_t)pr(k) * D + i] * s[i], V.abits, 1));
+        zz = qn(zz, V.abits, 1);
         if (V.norm_track) zz /= std::sqrt(hn[(size_t)k * K + b]);
         z[(size_t)k * K + b] = zz;
         const size_t ib = (size_t)k * K + b;
@@ -88,18 +106,20 @@ struct Layer {
           double st = 1 / (1 + std::exp(-12 * (zz - thv))), rt = 1 / (1 + std::exp(-12 * (-zz - thv))), q0 = ap[ib];
           double av = st + (1 - st - rt) * q0;
           a[ib] = std::min(std::max(av, 1e-4), 1 - 1e-4);
+          if (V.abits > 0) { const double g0 = std::ldexp(1.0, -(V.abits - 2)); a[ib] = std::min(std::max(qn(a[ib], V.abits, 1), g0), 1 - g0); }
           kap[ib] = st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0;   // d a / d (12 z) with a_prev held (one-step gradient)
           dth[ib] = 12 * (-st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0);   // d a / d theta
           ap[ib] = a[ib];
         } else {
           double sg = 1 / (1 + std::exp(-12 * zz));
-          a[ib] = std::min(std::max(sg, 1e-4), 1 - 1e-4);
+          a[ib] = std::min(std::max(sg, 1e-4), 1 - 1e-4);   // integer datapath: a lookup table indexed by the quantised z
+          if (V.abits > 0) { const double g0 = std::ldexp(1.0, -(V.abits - 2)); a[ib] = std::min(std::max(qn(a[ib], V.abits, 1), g0), 1 - g0); }
           kap[ib] = a[ib] * (1 - a[ib]); ap[ib] = a[ib];
         }
       }
       for (int c = 0; c < C; c++) {
         double v = 1;
-        for (int b = 0; b < K; b++) v *= ((c >> b) & 1) ? a[(size_t)k * K + b] : 1 - a[(size_t)k * K + b];
+        for (int b = 0; b < K; b++) v = qn(v * (((c >> b) & 1) ? a[(size_t)k * K + b] : 1 - a[(size_t)k * K + b]), V.abits, 1);
         h[(size_t)k * C + c] = v; hs[(size_t)k * C + c] = v;
       }
       if (V.sparse_k > 0 && V.sparse_k < C) {   // hard corners: keep the top-k, renormalise; others contribute nothing
@@ -113,9 +133,9 @@ struct Layer {
       double mix = 0, cm = 0;
       for (int c = 0; c < C; c++) {
         double sm = 0; for (int j = 0; j < N1; j++) sm += W[((size_t)k * C + c) * N1 + j] * xm[(size_t)k * N1 + j];
-        f[(size_t)k * C + c] = sm; mix += h[(size_t)k * C + c] * sm; cm += h[(size_t)k * C + c] * m[(size_t)k * C + c];
+        sm = qn(sm, V.abits, 3); f[(size_t)k * C + c] = sm; mix += h[(size_t)k * C + c] * sm; cm += h[(size_t)k * C + c] * m[(size_t)k * C + c];
       }
-      pred[k] = std::min(std::max(mix, -2.0), 2.0);
+      pred[k] = qn(std::min(std::max(mix, -2.0), 2.0), V.abits, 1);
       comp[k] = 1 / (cm + 1e-3);
     }
   }
@@ -171,10 +191,16 @@ struct Layer {
       for (int c = 0; c < C; c++) h2 += hk[c] * hk[c];
       for (int j = 0; j < N1; j++) x2 += xk[j] * xk[j];
       double c2 = (V.mu * esk) / (1e-3 + h2 * x2);
+      if (V.shiftnorm) c2 = V.mu * esk * std::ldexp(1.0, -(int)std::ceil(std::log2(1e-3 + h2 * x2)));   // shift, no divider
       for (int c = 0; c < C; c++) { double sc = c2 * hk[c]; double* Wc = &W[((size_t)k * C + c) * N1]; for (int j = 0; j < N1; j++) Wc[j] += sc * xk[j]; }
       if (!pruned) for (int j = 0; j < N1; j++) A[(size_t)k * N1 + j] = 0.98 * A[(size_t)k * N1 + j] + 0.02 * std::fabs(inp[j]);
     }
     if (V.p_shared && mode != 1 && !skip_gate) for (int i = 0; i < D; i++) p[i] = std::min(std::max(p[i] + dp_acc[i], 0.0), 3.0);
+  }
+  void quantise_int(Rng& r, int bits) {   // integer state: W in [-8, 8), H in [-2, 2), p in [-4, 4)
+    for (auto& x : W) x = qsr(x, bits, 3, r);
+    for (auto& x : H) x = qsr(x, bits, 1, r);
+    for (auto& x : p) x = qsr(x, bits, 2, r);
   }
   void quantise(Rng& r, int bits) {   // stochastic rounding to the fixed-point grid 2^-bits
     const double sc = std::ldexp(1.0, bits);
@@ -260,6 +286,7 @@ struct Net {
       L[0].update(y, gl, es.data(), V, pruned, 2);
     } else for (int l = 0; l < V.layers; l++) L[l].update(y, gl, es.data() + l * V.U, V, pruned);
     if (V.qbits > 0) for (auto& l : L) l.quantise(qrng, V.qbits);
+    if (V.wbits > 0) for (auto& l : L) l.quantise_int(qrng, V.wbits);
     t++;
     if (!pruned && t >= V.warm && t % 64 == 0) { for (auto& l : L) l.prune(V.density); pruned = true; }
   }
