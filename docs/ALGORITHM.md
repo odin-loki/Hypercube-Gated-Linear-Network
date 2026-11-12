@@ -106,6 +106,31 @@ On balance it is at least as accurate, and simpler.
 - **Depth matters for re-adaptation.** One wide layer of 48 units is much worse after the drift (B 0.255 vs 0.158).
 - **If you need it cheaper and can lose a little accuracy,** the best trades measured are 12 units per layer (about 30% fewer operations and state; B and C post-drift worse by 0.01-0.02) and 3 hyperplanes (35-42% fewer operations; worse by 0.01-0.02 throughout). Neither is in the library, whose layer width and corner count are fixed in its SIMD layout.
 
+## 4b. Cost/accuracy trade-off and pipelined layers (measured against 4.3)
+
+Every row includes the 4.3 changes; the baseline row is 4.3 itself.
+
+| Variant | A pre | A post | B pre | B post | C pre | C post | Digits 3 passes | Ops d=8 | Ops d=64 | State d=64 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 4.3 (16 units) | 0.130 | 0.077 | 0.126 | 0.158 | 0.155 | 0.209 | 96.79 | 1.00x | 1.00x | 1.00x |
+| 4.3, other seeds (noise) | 0.127 (4/10) | 0.081 (3/10) | 0.128 (6/10) | 0.163 (5/10) | 0.151 (8/10) | 0.213 (4/10) | 97.30 (4/5) | 1.00x | 1.00x | 1.00x |
+| 4.3, other seeds (noise) | 0.124 (7/10) | 0.079 (3/10) | 0.126 (6/10) | 0.149 (8/10) | 0.150 (9/10) | 0.215 (3/10) | 97.06 (3/5) | 1.00x | 1.00x | 1.00x |
+| pipelined layers | 0.190 (0/10) | 0.143 (0/10) | 0.199 (0/10) | 0.292 (0/10) | 0.190 (1/10) | 0.314 (0/10) | 95.09 (0/5) | 1.00x | 1.00x | 1.00x |
+| 14 units | 0.130 (4/10) | 0.080 (1/10) | 0.127 (3/10) | 0.172 (2/10) | 0.158 (3/10) | 0.214 (4/10) | 96.76 (3/5) | 0.80x | 0.85x | 0.85x |
+| **12 units** | 0.130 (5/10) | 0.082 (1/10) | 0.131 (3/10) | 0.178 (0/10) | 0.162 (1/10) | 0.218 (3/10) | 96.43 (2/5) | 0.66x | 0.72x | 0.71x |
+| 10 units | 0.133 (3/10) | 0.087 (1/10) | 0.134 (4/10) | 0.177 (2/10) | 0.163 (1/10) | 0.225 (2/10) | 96.33 (1/5) | 0.52x | 0.59x | 0.58x |
+| **8 units** | 0.133 (5/10) | 0.087 (1/10) | 0.132 (5/10) | 0.179 (1/10) | 0.165 (0/10) | 0.237 (2/10) | 96.06 (1/5) | 0.39x | 0.47x | 0.46x |
+| 3 hyperplanes | 0.141 (1/10) | 0.085 (1/10) | 0.145 (0/10) | 0.174 (2/10) | 0.170 (1/10) | 0.221 (3/10) | 96.16 (1/5) | 0.56x | 0.65x | 0.65x |
+| 12 units + 3 hyperplanes | 0.139 (0/10) | 0.089 (0/10) | 0.148 (1/10) | 0.188 (1/10) | 0.176 (0/10) | 0.238 (1/10) | 96.13 (1/5) | 0.38x | 0.47x | 0.47x |
+| 12 units, keep 50% | 0.131 (5/10) | 0.086 (1/10) | 0.130 (3/10) | 0.178 (2/10) | 0.161 (1/10) | 0.225 (3/10) | 96.36 (1/5) | 0.61x | 0.69x | 0.66x |
+
+**Reading the table.**
+- At equal cost, fewer units per layer beat fewer hyperplanes: 8 units are about as cheap as 12 units with 3 hyperplanes, and more accurate on most scores.
+- The library therefore offers the width as a setting, `Params::units` = 16 (default), 12 or 8, rather than fewer corners.
+- What narrowing costs is mostly re-adaptation after the drift (B and C post-drift). Before the drift and on digits, 12 units lose little.
+
+**Pipelined layers (rejected).** Here layer 2 and layer 3 read the layer below's outputs from the previous sample. That would make all three rule stages independent, leaving the mixture as the only step that has to wait. It is much worse on every score (+0.03 to +0.13 NMSE, digits −1.7), so the chain between the layers within a sample is essential.
+
 ## 5. Parallelism
 
 Within one network, a sample has this dependency structure (exact, no change to the model):
@@ -115,7 +140,7 @@ Within one network, a sample has this dependency structure (exact, no change to 
 3. **The mixture** is a 48-term reduction.
 4. **Updates** of all three layers are independent once the error signals are known, so all 48 units' updates can run in parallel, and within a unit the gate and rule updates are independent too.
 
-So the critical path of a sample is 3 rule stages, 1 reduction and 1 update stage. Version 4.3 removes the renormalisation stage from it; on the GPU that is one block-wide barrier fewer per sample.
+So the critical path of a sample is 3 rule stages, 1 reduction and 1 update stage. The sequence comes from the chain between the layers, not from the global mixture. The mixture is a single 48-term reduction after the third stage, and the global error it produces feeds only the update. Computing all gates first and the three rule stages at the end is an exact reordering. Making the rule stages independent requires the pipelined variant, which is rejected above. Version 4.3 removes the renormalisation stage from it; on the GPU that is one block-wide barrier fewer per sample.
 
 Across networks there is no dependency at all: class heads, ensemble members and streams parallelise perfectly. `run_streams`, `Classifier::train_batch` and the GPU `Bank` all exploit this.
 

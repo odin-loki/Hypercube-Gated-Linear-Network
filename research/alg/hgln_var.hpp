@@ -30,7 +30,8 @@ struct Var {
   bool p_shared = false;     // one gate-weight vector p per layer instead of per unit
   bool norm_track = false;   // track |H_b| analytically instead of a renormalisation pass (exact in real arithmetic)
   double density = 0.6;      // prune target
-  int gate_every = 1;        // update gates (p, H) only on every n-th sample
+  int gate_every = 1;
+  bool pipeline = false;     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
   int warm = 512;
 };
@@ -157,7 +158,7 @@ struct Layer {
 };
 
 struct Net {
-  int d = 0; Var V; std::vector<Layer> L; std::vector<double> u, o, r, R, us; double out = 0; long t = 0; bool pruned = false;
+  int d = 0; Var V; std::vector<Layer> L; std::vector<double> u, o, r, R, us, prev; double out = 0; long t = 0; bool pruned = false;
   void init(int d_, uint64_t seed, const Var& v) {
     d = d_; V = v; t = 0; pruned = false; L.assign(V.layers, Layer());
     int Du = V.proj > 0 ? V.proj : d + 1;
@@ -170,6 +171,7 @@ struct Net {
     }
     for (int l = 0; l < V.layers; l++) L[l].random_hyperplanes(rng, V.proj == 0 && !(l > 0 && V.gate_src == 1));
     if (V.proj > 0) { R.assign((size_t)V.proj * (d + 1), 0); for (auto& x : R) x = rng.normal() / std::sqrt((double)V.proj); }
+    prev.assign((size_t)V.layers * V.U, 0);
     u.assign(d + 1, 0); us.assign(std::max(Du, V.U + 1), 0); o.assign((size_t)V.layers * V.U, 0); r = o;
   }
   double predict(const double* x) {
@@ -182,7 +184,7 @@ struct Net {
       q = std::sqrt(q) + 1e-12; for (auto& s : side) s /= q;
     }
     for (int l = 0; l < V.layers; l++) {
-      const double* in = l == 0 ? x : L[l - 1].pred.data();
+      const double* in = l == 0 ? x : (V.pipeline ? &prev[(size_t)(l - 1) * V.U] : L[l - 1].pred.data());
       std::vector<double> sd = side;
       if (l > 0 && V.gate_src == 1) {
         sd.assign(V.U + 1, 0); double q = 1; for (int j = 0; j < V.U; j++) { sd[j] = in[j]; q += in[j] * in[j]; }
@@ -191,6 +193,7 @@ struct Net {
       L[l].pold = L[l].p;
       L[l].forward(in, sd.data(), V, (V.share_gates && l > 0) ? &L[0] : nullptr);
     }
+    if (V.pipeline) for (int l = 0; l < V.layers; l++) for (int k = 0; k < V.U; k++) prev[(size_t)l * V.U + k] = L[l].pred[k];
     int G = V.layers * V.U; double cs = 0;
     for (int l = 0; l < V.layers; l++) for (int k = 0; k < V.U; k++) { o[l * V.U + k] = L[l].pred[k]; r[l * V.U + k] = V.uniform ? 1.0 : L[l].comp[k]; cs += r[l * V.U + k]; }
     out = 0; for (int i = 0; i < G; i++) { r[i] /= cs; out += r[i] * o[i]; }
