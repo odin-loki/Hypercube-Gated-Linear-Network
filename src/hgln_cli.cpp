@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // hgln_cli.cpp - command-line tool for HGLN. Copyright (C) Odin Loch. Licensed under the GNU AGPL v3.0 or later (see LICENSE).
-//   hgln_cli parity in.bin out.bin [glr0 glr1]             replay a stream from given initial hyperplanes (parity vs NumPy)
+//   hgln_cli parity in.bin out.bin [glr0 glr1 [competence]]           replay a stream from given initial hyperplanes (parity vs NumPy)
 //   hgln_cli bench d nets nsamples [threads]               speed: single thread vs a matched 3x16 MLP, then all nets in
 //                                                          parallel (threads: 0 or omitted = all hardware threads)
 //   hgln_cli classify train.csv test.csv passes [threads]  one-vs-rest classifier, heads trained in parallel;
@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
     FILE* f = fopen(argv[2], "rb"); if (!f) { perror("in.bin"); return 1; }
     int32_t d, N; if (fread(&d, 4, 1, f) != 1 || fread(&N, 4, 1, f) != 1) return 1;
     Params P(argc > 5 ? atof(argv[4]) : 0.2, argc > 5 ? atof(argv[5]) : 0.05);
+    P.competence = argc > 6 && atoi(argv[6]) != 0;
     Net<real> g; g.init(d, 1, P);
     for (int l = 0; l < 3; l++) { std::vector<double> buf((size_t)16 * 4 * g.L[l].D);
       if (fread(buf.data(), 8, buf.size(), f) != buf.size()) return 1;

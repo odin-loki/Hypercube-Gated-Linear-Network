@@ -56,6 +56,8 @@ Per-sample scratch: `inp` (N1), `u` copy (D), `pu` (U x D), `a` (U x 4), `h` (U 
 
 ## 4. Exact procedure
 
+> This section is the version 4.2 procedure (`Params::v42()`). Version 4.3, the library default, makes two changes, both specified in `ALGORITHM.md` section 1. It tracks hyperplane norms in closed form, which is the same model with less work. It uses a plain average of the units with `es_i = (1 - glob)(y - o_i) + glob (y - out)` and no competence map.
+
 **Predict(x).**
 1. `u = [x; 1] / ||[x; 1]||` (length D).
 2. Layer 1 takes `a = x`; layer 2 takes layer 1's 16 outputs; layer 3 takes layer 2's 16 outputs.

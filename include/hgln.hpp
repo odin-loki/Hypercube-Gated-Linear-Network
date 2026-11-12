@@ -153,10 +153,10 @@ template <class T> struct Layer;
 
 // Per-sample scratch of one layer: written by forward, read by update. Not part of the model.
 template <class T> struct LayerWork {
-  detail::ABuf<T> inp, a, h, f, pred, comp, x2;               // inp: N1 inputs incl. bias; a: 4 x U; h, f: 16 x U
+  detail::ABuf<T> inp, a, zn, h, f, pred, comp, x2, pp;      // inp: N1 inputs incl. bias; a, zn: 4 x U; h, f: 16 x U
   void init(int N1, int U) {
-    inp.assign(N1, 0); a.assign(U * 4, 0); h.assign(U * 16, 0); f.assign(U * 16, 0);
-    pred.assign(U, 0); comp.assign(U, 0); x2.assign(U, 0);
+    inp.assign(N1, 0); a.assign(U * 4, 0); zn.assign(U * 4, 0); h.assign(U * 16, 0); f.assign(U * 16, 0);
+    pred.assign(U, 0); comp.assign(U, 0); x2.assign(U, 0); pp.assign(U, 0);
   }
 };
 
@@ -231,19 +231,23 @@ template <class T> struct Layer {
   int nt = 0;                                                // prune target: active inputs kept per unit
   int cs = 0;                                                // column stride of W / cols (max active columns per unit)
   bool pruned = false;                                       // the one-off prune has run (A is then freed)
-  detail::ABuf<T> H;                                         // D x 4 x U   hyperplanes: [i][b][unit] (unit innermost)
+  bool has_competence = false;                               // keep the competence map m (version 4.2 mixture)
+  detail::ABuf<T> H;                                         // D x 4 x U   hyperplanes, NOT normalised: [i][b][unit]
+  detail::ABuf<T> q, nq, rs;                                 // 4 x U       |H_b|^2, |H_b| and 1/|H_b| (norm tracking)
   detail::ABuf<T> p;                                         // D x U       gate weights: [i][unit]
   detail::ABuf<T> W;                                         // U x cs x 16 rules, corner innermost; active columns only
-  detail::ABuf<T> m;                                         // 16 x U      competence map: [corner][unit]
+  detail::ABuf<T> m;                                         // 16 x U      competence map: [corner][unit] (if competence)
   detail::ABuf<T> A;                                         // U x N1      input activity (only until the prune)
   detail::ABuf<int32_t> cols;                                // U x cs      active column index (ascending, bias last)
   detail::ABuf<int32_t> ncol;                                // U           number of active columns incl. bias
 
-  void init(int n_, int D_) {
-    n = n_; D = D_; N1 = n + 1; cs = N1; pruned = false;
+  void init(int n_, int D_, bool competence_ = false) {
+    n = n_; D = D_; N1 = n + 1; cs = N1; pruned = false; has_competence = competence_;
     nt = n <= 4 ? n : (int)std::nearbyint(0.6 * n);
     H.assign((size_t)D * U * 4, 0); p.assign((size_t)D * U, 1); W.assign((size_t)U * cs * 16, 0);
-    m.assign(U * 16, (T)0.3); A.assign((size_t)U * N1, (T)1e-3);
+    q.assign(4 * U, 1); nq.assign(4 * U, 1); rs.assign(4 * U, 1);
+    if (has_competence) m.assign(U * 16, (T)0.3); else m.reset();
+    A.assign((size_t)U * N1, (T)1e-3);
     cols.assign((size_t)U * cs, 0); ncol.assign(U, N1);
     for (int k = 0; k < U; k++) for (int j = 0; j < N1; j++) cols[k * cs + j] = j;
   }
@@ -256,15 +260,42 @@ template <class T> struct Layer {
       v[D - 1] = 0; nn = std::sqrt(nn);
       for (int i = 0; i < D; i++) H[hidx(k, b, i)] = (T)(v[i] / nn);
     }
+    recompute_norms();
+  }
+  // Exact |H_b| from the stored (unnormalised) hyperplanes.
+  void recompute_norms() {
+    for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) {
+      T s2 = 0; for (int i = 0; i < D; i++) { T v = H[hidx(k, b, i)]; s2 += v * v; }
+      q[b * U + k] = s2; nq[b * U + k] = std::sqrt(s2); rs[b * U + k] = (T)1 / nq[b * U + k];
+    }
+  }
+  // Scale every hyperplane back to unit length (exactly the same model; bounds rounding drift in the tracked norms).
+  void renormalise() {
+    for (int i = 0; i < D; i++) for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) H[hidx(k, b, i)] *= rs[b * U + k];
+    recompute_norms();
   }
   // ---- accessors in the reference (dense) layout: H as U x 4 x D, p as U x D, W as U x 16 x N1, M as U x N1
-  template <class S> void set_hyperplanes(const S* src) {
+  // set_hyperplanes takes any non-zero rows (the model uses their directions); get_hyperplanes/hyperplane return unit
+  // rows, as the reference stores them. The *_raw forms and hyperplane_sqnorm expose the stored state exactly.
+  template <class S> void set_hyperplanes(const S* src, const S* sqnorms = nullptr) {
     for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) for (int i = 0; i < D; i++) H[hidx(k, b, i)] = (T)src[((size_t)k * 4 + b) * D + i];
+    recompute_norms();
+    if (sqnorms) for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) {
+      T s2 = (T)sqnorms[(size_t)k * 4 + b]; q[b * U + k] = s2; nq[b * U + k] = std::sqrt(s2); rs[b * U + k] = (T)1 / nq[b * U + k];
+    }
   }
   template <class S> void get_hyperplanes(S* dst) const {
-    for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) for (int i = 0; i < D; i++) dst[((size_t)k * 4 + b) * D + i] = (S)H[hidx(k, b, i)];
+    for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) for (int i = 0; i < D; i++) dst[((size_t)k * 4 + b) * D + i] = (S)hyperplane(k, b, i);
   }
-  T hyperplane(int k, int b, int i) const { return H[hidx(k, b, i)]; }
+  template <class S> void get_hyperplanes_raw(S* dst, S* sqnorms) const {
+    for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) {
+      for (int i = 0; i < D; i++) dst[((size_t)k * 4 + b) * D + i] = (S)H[hidx(k, b, i)];
+      sqnorms[(size_t)k * 4 + b] = (S)q[b * U + k];
+    }
+  }
+  T hyperplane(int k, int b, int i) const { return H[hidx(k, b, i)] * rs[b * U + k]; }
+  T hyperplane_raw(int k, int b, int i) const { return H[hidx(k, b, i)]; }
+  T hyperplane_sqnorm(int k, int b) const { return q[b * U + k]; }
   T gate_weight(int k, int i) const { return p[(size_t)i * U + k]; }
   void set_gate_weight(int k, int i, T v) { p[(size_t)i * U + k] = v; }
   int slot(int k, int j) const {                             // position of input column j in unit k's compact W, or -1
@@ -274,16 +305,17 @@ template <class T> struct Layer {
   }
   bool active(int k, int j) const { return slot(k, j) >= 0; }  // the reference's M[k][j] > 0
   T rule(int k, int c, int j) const { int q = slot(k, j); return q < 0 ? (T)0 : W[((size_t)k * cs + q) * 16 + c]; }  // 0 if pruned
-  T competence(int k, int c) const { return m[(size_t)c * U + k]; }
+  T competence(int k, int c) const { return has_competence ? m[(size_t)c * U + k] : (T)0; }
   T activity(int k, int j) const { return pruned ? (T)0 : A[(size_t)k * N1 + j]; }
   // Replace the whole layer state from the reference (dense) layout: Hd U x 4 x D, pd U x D, Wd U x 16 x N1,
-  // Md U x N1 (0/1 mask; bias column must be 1), Ad U x N1 (ignored when is_pruned), md U x 16. Inverse of the
-  // accessors above; used to bring state back from the CUDA kernel's flat layout.
-  template <class S> void import_dense(const S* Hd, const S* pd, const S* Wd, const S* Md, const S* Ad, const S* md, bool is_pruned) {
-    set_hyperplanes(Hd);
+  // Md U x N1 (0/1 mask; bias column must be 1), Ad U x N1 (ignored when is_pruned), md U x 16 (ignored without
+  // competence), qd U x 4 squared hyperplane norms (nullptr: computed from Hd). Inverse of the accessors above; used to
+  // bring state back from the GPU kernel's flat layout.
+  template <class S> void import_dense(const S* Hd, const S* pd, const S* Wd, const S* Md, const S* Ad, const S* md, bool is_pruned, const S* qd = nullptr) {
+    set_hyperplanes(Hd, qd);
     for (int k = 0; k < U; k++) {
       for (int i = 0; i < D; i++) p[(size_t)i * U + k] = (T)pd[(size_t)k * D + i];
-      for (int c = 0; c < 16; c++) m[(size_t)c * U + k] = (T)md[(size_t)k * 16 + c];
+      if (has_competence && md) for (int c = 0; c < 16; c++) m[(size_t)c * U + k] = (T)md[(size_t)k * 16 + c];
     }
     int newcs = 0;
     for (int k = 0; k < U; k++) { int c = 0; for (int j = 0; j < N1; j++) c += Md[(size_t)k * N1 + j] > 0 || j == n; newcs = std::max(newcs, c); }
@@ -303,7 +335,7 @@ template <class T> struct Layer {
     else { A.assign((size_t)U * N1, 0); for (size_t i = 0; i < (size_t)U * N1; i++) A[i] = (T)Ad[i]; }
   }
   size_t model_bytes() const {
-    return (H.size() + p.size() + W.size() + m.size() + A.size()) * sizeof(T) + (cols.size() + ncol.size()) * sizeof(int32_t);
+    return (H.size() + q.size() + nq.size() + rs.size() + p.size() + W.size() + m.size() + A.size()) * sizeof(T) + (cols.size() + ncol.size()) * sizeof(int32_t);
   }
 
   // ---- [SIMD hook] With HGLN_WITH_FORGE, forward/update call the kernels compiled for this CPU (hgln_simd.hpp,
@@ -323,16 +355,19 @@ template <class T> struct Layer {
     T* HGLN_RESTRICT inp = w.inp.data();
     for (int j = 0; j < n; j++) inp[j] = in[j];
     inp[n] = 1;
-    // gates: z_b = sum_i H[i][b] * (p[i] * u[i]), i ascending
-    V16 z0 = O::zero(), z1 = z0, z2 = z0, z3 = z0;
+    // gates: z_b = (H_b . (p * u)) / |H_b| with the stored, unnormalised H_b, i ascending; |p * u|^2 for the update
+    V16 z0 = O::zero(), z1 = z0, z2 = z0, z3 = z0, pp = z0;
     for (int i = 0; i < D; i++) {
       const T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U];
       const V16 pu = O::load(&p[(size_t)i * U]) * u[i];
       z0 += O::load(Hi) * pu; z1 += O::load(Hi + U) * pu;
       z2 += O::load(Hi + 2 * U) * pu; z3 += O::load(Hi + 3 * U) * pu;
+      pp += pu * pu;
     }
-    alignas(64) T zz[4 * U];
-    O::store(zz, z0); O::store(zz + U, z1); O::store(zz + 2 * U, z2); O::store(zz + 3 * U, z3);
+    T* HGLN_RESTRICT zz = w.zn.data();
+    O::store(zz, z0 * O::load(&rs[0])); O::store(zz + U, z1 * O::load(&rs[U]));
+    O::store(zz + 2 * U, z2 * O::load(&rs[2 * U])); O::store(zz + 3 * U, z3 * O::load(&rs[3 * U]));
+    O::store(w.pp.data(), pp);
     T* HGLN_RESTRICT aw = w.a.data();
     for (int q = 0; q < 4 * U; q++) aw[q] = hgln_gate<T>(zz[q]);                  // 64 gates, [b][unit]
     // 16-corner heatmap h[c] as a tensor product; same multiplication order as the reference (bit 0 first)
@@ -359,17 +394,18 @@ template <class T> struct Layer {
       O::store(fa, acc);
       for (int c = 0; c < 16; c++) f[c * U + k] = fa[c];
     }
-    // mixture of the 16 rules and the competence-weighted confidence, all units at once (c ascending)
+    // mixture of the 16 rules (and, with competence, the competence-weighted confidence), all units at once
     const T* HGLN_RESTRICT h = w.h.data();
     V16 mix = O::zero(), cm = mix;
-    for (int c = 0; c < 16; c++) {
-      const V16 hc = O::load(h + c * U);
-      mix += hc * O::load(f + c * U); cm += hc * O::load(&m[c * U]);
+    if (has_competence) {
+      for (int c = 0; c < 16; c++) { const V16 hc = O::load(h + c * U); mix += hc * O::load(f + c * U); cm += hc * O::load(&m[c * U]); }
+      O::store(w.comp.data(), (O::zero() + (T)1) / (cm + (T)1e-3));
+    } else {
+      for (int c = 0; c < 16; c++) mix += O::load(h + c * U) * O::load(f + c * U);
     }
     alignas(64) T mx[U];
     O::store(mx, mix);
     for (int k = 0; k < U; k++) w.pred[k] = clipv(mx[k], (T)-2, (T)2);
-    O::store(w.comp.data(), (O::zero() + (T)1) / (cm + (T)1e-3));
   }
 
   template <class O> void update_k(T y, T mu, T glr, const T* HGLN_RESTRICT es, const T* HGLN_RESTRICT u, const LayerWork<T>& w) {
@@ -377,7 +413,7 @@ template <class T> struct Layer {
     const T* HGLN_RESTRICT inp = w.inp.data(); const T* HGLN_RESTRICT h = w.h.data(); const T* HGLN_RESTRICT f = w.f.data();
     const V16 esv = O::load(es);
     // competence map: m[c] += 0.02 * h[c] * (e^2 - m[c]), e = the unit's own error
-    {
+    if (has_competence) {
       const V16 e = (O::zero() + y) - O::load(w.pred.data()), e2 = e * e;
       for (int c = 0; c < 16; c++) {
         T* HGLN_RESTRICT mc = &m[c * U];
@@ -425,34 +461,37 @@ template <class T> struct Layer {
         for (int j = 0; j < N1; j++) Ak[j] = (T)0.98 * Ak[j] + (T)0.02 * std::fabs(inp[j]);
       }
     }
-    // all units at once (unit = lane), fused: p step (uses OLD H), hyperplane step (uses OLD p, i.e. the forward
-    // pass's p*u), squared norms accumulated on the fly
-    const V16 c0 = O::load(cbs[0]), c1 = O::load(cbs[1]), c2 = O::load(cbs[2]), c3 = O::load(cbs[3]);
-    V16 n0 = O::zero(), n1 = n0, n2 = n0, n3 = n0;
-    for (int i = 0; i < D; i++) {
-      const T ui = u[i]; T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U]; T* HGLN_RESTRICT pi = &p[(size_t)i * U];
-      V16 h0 = O::load(Hi), h1 = O::load(Hi + U), h2 = O::load(Hi + 2 * U), h3 = O::load(Hi + 3 * U);
-      const V16 pv = O::load(pi);
-      const V16 dp = ((c0 * h0 * ui + c1 * h1 * ui) + c2 * h2 * ui) + c3 * h3 * ui;   // reference order: dp += cb_b*H_b*u
-      const V16 pu = pv * ui;
-      h0 += c0 * pu; h1 += c1 * pu; h2 += c2 * pu; h3 += c3 * pu;
-      O::store(Hi, h0); O::store(Hi + U, h1); O::store(Hi + 2 * U, h2); O::store(Hi + 3 * U, h3);
-      n0 += h0 * h0; n1 += h1 * h1; n2 += h2 * h2; n3 += h3 * h3;
-      alignas(64) T np[U];
-      O::store(np, pv + dp);
-      for (int k = 0; k < U; k++) pi[k] = clipv(np[k], (T)0, (T)3);
+    // all units at once (unit = lane), fused: p step with the OLD unit hyperplanes H_b/|H_b|, hyperplane step with the
+    // OLD p (the forward pass's p*u). The reference adds cb*pu to the unit hyperplane and renormalises; here the stored
+    // H_b is unnormalised, so the same direction is H_b += (cb |H_b|) pu, and |H_b|^2 follows in closed form:
+    //   |H_b + s pu|^2 = |H_b|^2 + 2 s (H_b . pu) + s^2 |pu|^2,  s = cb |H_b|,  H_b . pu = |H_b| z_b (from the forward pass)
+    // so neither a norm pass nor a renormalisation pass over the D inputs is needed.
+    alignas(64) T cr[4][U], st[4][U];
+    for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) { cr[b][k] = cbs[b][k] * rs[b * U + k]; st[b][k] = cbs[b][k] * nq[b * U + k]; }
+    {
+      const V16 r0 = O::load(cr[0]), r1 = O::load(cr[1]), r2 = O::load(cr[2]), r3 = O::load(cr[3]);
+      const V16 s0 = O::load(st[0]), s1 = O::load(st[1]), s2 = O::load(st[2]), s3 = O::load(st[3]);
+      for (int i = 0; i < D; i++) {
+        const T ui = u[i]; T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U]; T* HGLN_RESTRICT pi = &p[(size_t)i * U];
+        V16 h0 = O::load(Hi), h1 = O::load(Hi + U), h2 = O::load(Hi + 2 * U), h3 = O::load(Hi + 3 * U);
+        const V16 pv = O::load(pi);
+        const V16 dp = ((r0 * h0 * ui + r1 * h1 * ui) + r2 * h2 * ui) + r3 * h3 * ui;   // reference order: dp += cb_b*Hunit_b*u
+        const V16 pu = pv * ui;
+        O::store(Hi, h0 + s0 * pu); O::store(Hi + U, h1 + s1 * pu); O::store(Hi + 2 * U, h2 + s2 * pu); O::store(Hi + 3 * U, h3 + s3 * pu);
+        alignas(64) T np[U];
+        O::store(np, pv + dp);
+        for (int k = 0; k < U; k++) pi[k] = clipv(np[k], (T)0, (T)3);
+      }
     }
-    // renormalise each hyperplane. Multiplying by 1/|H| instead of dividing by |H| (as the NumPy reference does)
-    // differs by at most 1 ulp per element and avoids D x 64 divisions, the slowest part of the update.
-    alignas(64) T inv[4][U];
-    O::store(inv[0], n0); O::store(inv[1], n1); O::store(inv[2], n2); O::store(inv[3], n3);
-    for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) inv[b][k] = (T)1 / std::sqrt(inv[b][k]);
-    const V16 r0 = O::load(inv[0]), r1 = O::load(inv[1]), r2 = O::load(inv[2]), r3 = O::load(inv[3]);
-    for (int i = 0; i < D; i++) {
-      T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U];
-      O::store(Hi, O::load(Hi) * r0); O::store(Hi + U, O::load(Hi + U) * r1);
-      O::store(Hi + 2 * U, O::load(Hi + 2 * U) * r2); O::store(Hi + 3 * U, O::load(Hi + 3 * U) * r3);
+    const T* zn = w.zn.data(); const T* ppv = w.pp.data();
+    bool far = false;
+    for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) {
+      const int j = b * U + k; const T s = st[b][k];
+      const T q2 = q[j] + (T)2 * s * (nq[j] * zn[j]) + s * s * ppv[k];
+      q[j] = q2; nq[j] = std::sqrt(q2); rs[j] = (T)1 / nq[j];
+      far |= !(q2 > (T)1e-6 && q2 < (T)1e6);
     }
+    if (far) renormalise();                                                          // keep |H_b| near 1 (rare)
   }
 
   // Fixed connection budget: keep round_half_even(0.6*n) inputs per unit (n<=4: dense); bias column always kept.
@@ -504,16 +543,19 @@ struct Params {
   double glob = 0.75;               // share of each unit's error taken from the global mixture error
   double mu = 0.3;                  // rule step (normalised LMS)
   int warm = 512;                   // first prune
+  bool competence = false;          // true: version 4.2 competence-weighted mixture; false (4.3): plain average of the units
   Params(double g0 = 0.2, double g1 = 0.05) : glr0(g0), glr1(g1) {}
+  static Params v42(double g0 = 0.2, double g1 = 0.05) { Params p(g0, g1); p.competence = true; return p; }
 };
 
-// The network: 3 layers x 16 units, competitive mixture over all 48 units.
+// The network: 3 layers x 16 units, mixture over all 48 units (plain average, or competence-weighted with competence).
 template <class T> struct Net {
+  static constexpr long kRenormEvery = 4096;                 // exact renormalisation of the tracked hyperplane norms
   int d = 0; Layer<T> L[3]; long t = 0; Params P;
   Work<T> ws;                                                // scratch for predict()/learn()
   void init(int d_, uint64_t seed = 1, const Params& p = Params()) {
     d = d_; P = p; t = 0;
-    L[0].init(d, d + 1); L[1].init(16, d + 1); L[2].init(16, d + 1);
+    L[0].init(d, d + 1, P.competence); L[1].init(16, d + 1, P.competence); L[2].init(16, d + 1, P.competence);
     Rng rng(seed); for (auto& l : L) l.random_hyperplanes(rng);
     ws.init(*this);
   }
@@ -527,21 +569,34 @@ template <class T> struct Net {
     u[d] = 1; nn = std::sqrt(nn); for (int i = 0; i <= d; i++) u[i] /= nn;
     T* xg = w.tmp.data();
     L[0].forward(x, u, w.lw[0], xg); L[1].forward(w.lw[0].pred.data(), u, w.lw[1], xg); L[2].forward(w.lw[1].pred.data(), u, w.lw[2], xg);
-    T cs = 0, comp[48];
-    for (int l = 0; l < 3; l++) for (int k = 0; k < 16; k++) { w.o[l * 16 + k] = w.lw[l].pred[k]; comp[l * 16 + k] = w.lw[l].comp[k]; cs += comp[l * 16 + k]; }
-    T out = 0; for (int i = 0; i < 48; i++) { w.r[i] = comp[i] / cs; out += w.r[i] * w.o[i]; }
+    for (int l = 0; l < 3; l++) for (int k = 0; k < 16; k++) w.o[l * 16 + k] = w.lw[l].pred[k];
+    T out = 0;
+    if (P.competence) {                                      // competence-weighted mixture (version 4.2)
+      T cs = 0, comp[48];
+      for (int l = 0; l < 3; l++) for (int k = 0; k < 16; k++) { comp[l * 16 + k] = w.lw[l].comp[k]; cs += comp[l * 16 + k]; }
+      for (int i = 0; i < 48; i++) { w.r[i] = comp[i] / cs; out += w.r[i] * w.o[i]; }
+    } else {                                                 // plain average (version 4.3)
+      const T r = (T)1 / 48;
+      for (int i = 0; i < 48; i++) { w.r[i] = r; out += r * w.o[i]; }
+    }
     w.out = out;
     return out;
   }
   T predict(const T* x) { return infer(x, ws); }
   void learn(T y) {                   // must follow predict() on the same sample
-    T gl = (T)P.glr1 + (T)(P.glr0 - P.glr1) * std::exp(-(T)t / (T)P.tau), sr2 = 0, es[48];
-    for (int i = 0; i < 48; i++) sr2 += ws.r[i] * ws.r[i];
+    T gl = (T)P.glr1 + (T)(P.glr0 - P.glr1) * std::exp(-(T)t / (T)P.tau), es[48];
     T eg = y - ws.out, glob = (T)P.glob;
-    for (int i = 0; i < 48; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg * ws.r[i] / sr2;
+    if (P.competence) {                // es_i = own error share + responsibility share r_i / sum r^2 of the mixture error
+      T sr2 = 0;
+      for (int i = 0; i < 48; i++) sr2 += ws.r[i] * ws.r[i];
+      for (int i = 0; i < 48; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg * ws.r[i] / sr2;
+    } else {                           // equal weights: r_i / sum r^2 = 1
+      for (int i = 0; i < 48; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg;
+    }
     for (int l = 0; l < 3; l++) L[l].update(y, (T)P.mu, gl, es + 16 * l, ws.u.data(), ws.lw[l]);
     t++;
     if (t >= P.warm && t % 64 == 0) for (auto& l : L) l.structure_step();
+    if (t % kRenormEvery == 0) for (auto& l : L) l.renormalise();
   }
   T step(const T* x, T y) { T p = predict(x); learn(y); return p; }   // test-then-train on one sample
   bool pruned() const { return L[0].pruned && L[1].pruned && L[2].pruned; }

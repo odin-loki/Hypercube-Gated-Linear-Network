@@ -1,8 +1,15 @@
 # HGLN: Hypercube Gated Linear Network
 
-**Author:** Odin Loch (odin-loki). Version 4.2.1. Licence: [AGPL-3.0-or-later](LICENSE). Uses [FORGE](https://github.com/odin-loki/FORGE) for run-time SIMD dispatch and GPU execution ([docs/FORGE.md](docs/FORGE.md)).
+**Author:** Odin Loch (odin-loki). Version 4.3. Licence: [AGPL-3.0-or-later](LICENSE). Uses [FORGE](https://github.com/odin-loki/FORGE) for run-time SIMD dispatch and GPU execution ([docs/FORGE.md](docs/FORGE.md)).
 
 HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per sample. It has three layers of 16 units. Each unit learns 4 hyperplanes that carve the input into 16 regions, and blends 16 linear rules by a soft heatmap over those regions. The output is a weighted mixture of all 48 units, and each unit learns partly from its share of the mixture's error. There is no backpropagation, no batching and no stored data.
+
+**Version 4.3** changes the maths in two places, chosen after a measured study of 23 variants ([docs/ALGORITHM.md](docs/ALGORITHM.md)):
+
+- **Exact norm tracking for the hyperplanes:** the same model, with two passes per hyperplane removed.
+- **A plain average of the units instead of the competence-weighted mixture:** at least as accurate on the benchmarks, and it removes the competence map.
+
+`Params::v42()` gives the previous version exactly. The study also shows the remaining structure (4 hyperplanes, 3 layers of 16, 60% density, per-unit gate weights) all earns its cost.
 
 ## Contents
 
@@ -25,6 +32,7 @@ HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per
 | `docs/TGN_spec.md`, `docs/TGN_impl_spec.md` | Algorithm spec and implementation spec |
 | `docs/OPTIMISATION.md` | What was optimised, how it was checked, measurements |
 | `docs/API.md`, `docs/FORGE.md` | C++ API reference; relation to FORGE |
+| `docs/ALGORITHM.md`, `research/alg/` | Version 4.3 algorithm study: 23 variants on the spec's benchmarks |
 | `docs/government_summary.md` | One-page summary for external readers |
 | `research/` | Prototype scripts and stored experiment results |
 

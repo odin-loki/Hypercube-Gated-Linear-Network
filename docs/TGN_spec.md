@@ -166,6 +166,14 @@ Shuffles 10 and 11 were also used for the earlier mixture and diversify checks, 
 
 **C++ speed.** The first, unoptimised port took about 11 to 14 us per sample for one network at d = 8, and about 465 to 490 us (float64) and 310 to 330 us (float32) per sample for 10 networks at d = 64. That was roughly 6 to 7 times slower than a matched 3x16 MLP at d = 8 and 17 to 22 times slower at d = 64. The optimised library takes about 6 us at d = 8, and at d = 64 with 10 networks about 246 us (float64) and 72 us (float32) on one thread, or 52 us and 23 us with the networks on 4 threads. The MLP takes about 2 us and 26 us. Details in `TGN_impl_spec.md` section 7 and `OPTIMISATION.md`.
 
+## 7c. Version 4.3
+
+Two changes to the procedure, chosen after measuring 23 variants on the benchmarks above (details: `ALGORITHM.md`):
+1. **Exact norm tracking.** The hyperplanes are stored unnormalised, with their squared lengths updated in closed form. This is the same model, with no renormalisation pass.
+2. **Plain average.** The mixture is a plain average and the competence map is gone: `es_i = (1 - glob)(y - o_i) + glob (y - out)`. Over 3 seed sets and 5 digit shuffles it is at least as accurate. It is better on A post-drift (28/30 seeds) and B pre-drift (25/30), and 0.002 worse on C pre-drift.
+
+Cutting corners, units, layers, connections or gate parameters, or sharing or projecting the gates, all lost accuracy.
+
 ## 8. Limitations
 
 - **Selection.** The mixture and the global gradient were chosen after seeing results on the same synthetic seeds and digits shuffles used for comparison. Numbers are mildly optimistic.

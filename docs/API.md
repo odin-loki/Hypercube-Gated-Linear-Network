@@ -22,7 +22,7 @@ double p = net.step(x, y);          // predict then learn
 | `bool pruned()`, `long t` | Whether the prune has run; samples learned |
 | `size_t model_bytes()` | Bytes held by the model |
 
-`Params`: `glr0`, `glr1`, `tau` (gate-rate schedule), `glob` (global-error share, 0.75), `mu` (rule step, 0.3) and `warm` (prune time, 512). The constants are documented in `docs/TGN_impl_spec.md` section 2.
+`Params`: `glr0`, `glr1`, `tau` (gate-rate schedule), `glob` (global-error share, 0.75), `mu` (rule step, 0.3) and `warm` (prune time, 512). `competence` (default `false`, version 4.3: the mixture is a plain average of the units; `true`, or `Params::v42()`, gives the 4.2 competence-weighted mixture exactly). The constants are documented in `docs/TGN_impl_spec.md` section 2.
 
 `Work<T>`: per-sample scratch. Make one with `Work<T> w; w.init(net);`. One `Work` can serve any number of networks with the same `d`.
 
@@ -60,11 +60,12 @@ The internal layout is built for SIMD and keeps only active columns. These acces
 
 | Accessor | Reference value |
 |---|---|
-| `hyperplane(k, b, i)`, `get_hyperplanes(dst)`, `set_hyperplanes(src)` | `H[k][b][i]` (dense U x 4 x D) |
+| `hyperplane(k, b, i)`, `get_hyperplanes(dst)` | `H[k][b][i]`, unit rows (dense U x 4 x D) |
+| `hyperplane_raw`, `hyperplane_sqnorm`, `get_hyperplanes_raw(dst, sq)`, `set_hyperplanes(src, sq)` | The stored, unnormalised rows and their squared lengths (version 4.3 norm tracking); exact state |
 | `gate_weight(k, i)` | `p[k][i]` |
 | `rule(k, c, j)` | `W[k][c][j]` (0 for a pruned column) |
 | `active(k, j)` | `M[k][j] > 0` |
-| `competence(k, c)` | `m[k][c]` |
+| `competence(k, c)` | `m[k][c]` (0 without `Params::competence`) |
 | `activity(k, j)` | `A[k][j]` (0 after the prune, when `A` is freed) |
 
 ## Build flags

@@ -154,22 +154,27 @@ class HC2(HC):
 
 class HGLN:
     """3 hidden layers of Wd units (no separate readout). Prediction = competitive mixture over all 3*Wd units."""
-    def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512):
+    def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512, competence=True):
         r = np.random.default_rng(seed)
         s.L = [HC2(Wd, d, 16, d, r, glr0), HC2(Wd, Wd, 16, d, r, glr0), HC2(Wd, Wd, 16, d, r, glr0)]
         s.Wd, s.glr0, s.glr1, s.tau, s.mu, s.glob, s.warm, s.t = Wd, glr0, glr1, tau, mu, glob, warm, 0
+        s.competence = competence   # False: version 4.3, plain average of the units (no competence weighting)
     def predict(s, x):
         x = np.asarray(x, float); u = feat(x); a = x
         for L in s.L: a = L.forward(a, u)
         s.o = np.concatenate([L.pred for L in s.L])
-        comp = np.concatenate([L.comp() for L in s.L])
-        s.r = comp / comp.sum()                            # competitive weights over units
+        if s.competence:
+            comp = np.concatenate([L.comp() for L in s.L])
+            s.r = comp / comp.sum()                        # competitive weights over units
+        else:
+            s.r = np.full(len(s.o), 1.0 / len(s.o))        # version 4.3: equal weights
         s.out = float((s.r * s.o).sum()); return s.out
     def learn(s, y):
         gl = s.glr1 + (s.glr0 - s.glr1) * np.exp(-s.t / s.tau)          # fixed gate-rate schedule
         for L in s.L: L.glr = gl
         e_loc = y - s.o; e_glob = y - s.out
-        es = (1 - s.glob) * e_loc + s.glob * e_glob * s.r / (s.r ** 2).sum()   # own error + responsibility-share of mixture error
+        share = s.r / (s.r ** 2).sum() if s.competence else 1.0             # equal weights: r / sum r^2 = 1
+        es = (1 - s.glob) * e_loc + s.glob * e_glob * share   # own error + responsibility-share of mixture error
         for i, L in enumerate(s.L): L.update(y, s.mu, es[i * s.Wd:(i + 1) * s.Wd])
         s.t += 1
         if s.t >= s.warm and s.t % 64 == 0:                              # consolidation: fixed density 0.6

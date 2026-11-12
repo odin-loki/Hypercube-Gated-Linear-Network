@@ -77,10 +77,10 @@ int main() {
       Net<double> a; a.init(8, 2); double nm; run_stream(a, 8, Nwarm, 6, &nm); Net<double> b; b.init(8, 99);
       for (int l = 0; l < 3; l++) { const auto& L = a.L[l]; int U = 16, D = L.D, N1 = L.N1;
         std::vector<double> H((size_t)U * 4 * D), p((size_t)U * D), W((size_t)U * 16 * N1), M((size_t)U * N1), A((size_t)U * N1), m((size_t)U * 16);
-        L.get_hyperplanes(H.data());
+        std::vector<double> Q((size_t)U * 4); L.get_hyperplanes_raw(H.data(), Q.data());
         for (int k = 0; k < U; k++) { for (int i = 0; i < D; i++) p[k * D + i] = L.gate_weight(k, i); for (int c = 0; c < 16; c++) { m[k * 16 + c] = L.competence(k, c); for (int j = 0; j < N1; j++) W[(k * 16 + c) * N1 + j] = L.rule(k, c, j); }
           for (int j = 0; j < N1; j++) { M[k * N1 + j] = L.active(k, j); A[k * N1 + j] = L.activity(k, j); } }
-        b.L[l].import_dense(H.data(), p.data(), W.data(), M.data(), A.data(), m.data(), L.pruned); }
+        b.L[l].import_dense(H.data(), p.data(), W.data(), M.data(), A.data(), m.data(), L.pruned, Q.data()); }
       b.t = a.t; std::vector<double> o1, o2; run_stream(a, 8, 800, 7, &nm, &o1); run_stream(b, 8, 800, 7, &nm, &o2);
       CHECK(o1 == o2, Nwarm < 512 ? "import_dense round trip before the prune continues identically" : "import_dense round trip after the prune continues identically"); } }
   printf(fails ? "%d test(s) FAILED\n" : "all tests passed\n", fails); return fails ? 1 : 0;
