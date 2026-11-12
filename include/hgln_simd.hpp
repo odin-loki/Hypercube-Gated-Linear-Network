@@ -11,24 +11,34 @@
 // Included by hgln.hpp when HGLN_WITH_FORGE is defined; link the CMake target hgln_simd. C++17.
 #pragma once
 #include <atomic>
+#include <cstdint>
 #include <string>
 
 namespace hgln {
 template <class T> struct Layer;
 template <class T> struct LayerWork;
+template <class T> struct UpdateArgs;
+struct LayerQ; struct LayerQWork; struct QCfg; struct QStep;   // the integer net (hgln_q.hpp)
 
 namespace simd {
 // One entry per unit count U = 8, 12, 16 (index hgln::unit_index(U)). gates + rules = the layer's forward pass.
 template <class T> struct LayerKernels {
-  void (*gates[3])(const Layer<T>&, const T* u, LayerWork<T>& w);
+  void (*gates[3])(const Layer<T>&, const T* u, LayerWork<T>& w, const LayerWork<T>* lo);
   void (*rules[3])(const Layer<T>&, const T* in, LayerWork<T>& w, T* xg);
-  void (*update[3])(Layer<T>&, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w);
+  void (*update[3])(Layer<T>&, const UpdateArgs<T>& a, const LayerWork<T>& w);
+};
+// The integer net's kernels, one entry per lane layout: [0] 8 lanes (8 units), [1] 16 lanes (12 or 16 units).
+struct LayerKernelsQ {
+  void (*gates[2])(const LayerQ&, const QCfg&, const int32_t* s, const LayerQWork* lo, LayerQWork& w);
+  void (*rules[2])(const LayerQ&, const QCfg&, const int32_t* in, LayerQWork& w);
+  void (*update[2])(LayerQ&, const QCfg&, const QStep&, const int32_t* s, const LayerQWork& w, const LayerQWork* lo);
 };
 struct Table {
   const char* target;                   // "scalar", "avx2", "avx512", "neon", "sve", "rvv"
   int vector_bits;                      // register width the table was built for (0 = baseline ISA)
   LayerKernels<float> f32;
   LayerKernels<double> f64;
+  LayerKernelsQ q;                      // integer net (v5.0)
 };
 
 const char* const* targets();           // null-terminated list of the tables built into this binary

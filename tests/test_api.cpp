@@ -148,5 +148,17 @@ int main() {
     Params pv(0.2, 0.05); pv.competence = true; pv.fanout = true; Net<double> f; f.init(8, 1, pv); double n4; run_stream(f, 8, 5000, 11, &n4);
     printf("      fanout units=12 late NMSE %.3f; fanout with competence (4.2) %.3f\n", n3, n4);
     CHECK(o1 == o3 && n3 < 0.35 && n4 < 0.35, "fanout: deterministic; also learns with units=12 and with the competence mixture"); }
+  { // version 5.0 float options: cross-layer latch, latch credit, gate error (Params::v5 with all 16 corners)
+    Params P = Params::v5(); P.corners = 16;
+    Net<double> a, b, c; a.init(8, 1, P); b.init(8, 1, P); c.init(8, 1, with_units(8, true));
+    double n1, n2, n3; std::vector<double> o1, o2, o3;
+    run_stream(a, 8, 5000, 11, &n1, &o1); run_stream(b, 8, 5000, 11, &n2, &o2); run_stream(c, 8, 5000, 11, &n3, &o3);
+    printf("      v5 float options late NMSE %.3f (8 units fan-out without them: %.3f)\n", n1, n3);
+    CHECK(o1 == o2 && o1 != o3 && n1 < 0.35, "v5 float options (latch, credit, global gate error): deterministic, change the model, learn");
+    bool threw = false; try { Net<float> q; q.init(8, 1, Params::v5()); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw, "the float Net rejects top-k corners (Params::v5() has corners = 6; NetQ implements them)");
+    P.latch_credit = 0; P.gate_err = 1; Net<double> d; d.init(8, 1, P); double n4; run_stream(d, 8, 3000, 11, &n4);
+    CHECK(n4 < 0.4, "latch without credit, own-error gates: learns");
+  }
   printf(fails ? "%d test(s) FAILED\n" : "all tests passed\n", fails); return fails ? 1 : 0;
 }

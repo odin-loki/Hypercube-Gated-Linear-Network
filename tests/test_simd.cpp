@@ -3,6 +3,7 @@
 // equal to the header-only kernels (Layer::forward_k/update_k with the vector-extension policy, compiled here).
 // Copyright (C) Odin Loch. Licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).
 #include "hgln.hpp"
+#include "hgln_q.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,11 +15,15 @@ namespace {
 // The header-only kernels as a table, so the same Net code can be run through them.
 struct RefF : detail::VxOps<float> {};
 struct RefD : detail::VxOps<double> {};
-template <class T, class P, int U> void rgat(const Layer<T>& L, const T* u, LayerWork<T>& w) { L.template gates_k<P, U>(u, w); }
+template <class T, class P, int U> void rgat(const Layer<T>& L, const T* u, LayerWork<T>& w, const LayerWork<T>* lo) { L.template gates_k<P, U>(u, w, lo); }
 template <class T, class P, int U> void rrul(const Layer<T>& L, const T* in, LayerWork<T>& w, T* xg) { L.template rules_k<P, U>(in, w, xg); }
-template <class T, class P, int U> void rupd(Layer<T>& L, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { L.template update_k<P, U>(y, mu, glr, es, u, w); }
+template <class T, class P, int U> void rupd(Layer<T>& L, const UpdateArgs<T>& a, const LayerWork<T>& w) { L.template update_k<P, U>(a, w); }
+struct RefQ {};
+template <int UL> void qg(const LayerQ& L, const QCfg& C, const int32_t* s, const LayerQWork* lo, LayerQWork& w) { detail::qk::gates<RefQ, UL>(L, C, s, lo, w); }
+template <int UL> void qr(const LayerQ& L, const QCfg& C, const int32_t* in, LayerQWork& w) { detail::qk::rules<RefQ, UL>(L, C, in, w); }
+template <int UL> void qu(LayerQ& L, const QCfg& C, const QStep& S, const int32_t* s, const LayerQWork& w, const LayerQWork* lo) { detail::qk::update<RefQ, UL>(L, C, S, s, w, lo); }
 #define REF_K3(T, P) {{&rgat<T, P, 8>, &rgat<T, P, 12>, &rgat<T, P, 16>}, {&rrul<T, P, 8>, &rrul<T, P, 12>, &rrul<T, P, 16>}, {&rupd<T, P, 8>, &rupd<T, P, 12>, &rupd<T, P, 16>}}
-const simd::Table header_table = {"header", 0, REF_K3(float, RefF), REF_K3(double, RefD)};
+const simd::Table header_table = {"header", 0, REF_K3(float, RefF), REF_K3(double, RefD), {{&qg<8>, &qg<16>}, {&qr<8>, &qr<16>}, {&qu<8>, &qu<16>}}};
 
 int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; std::printf("FAIL %s:%d: ", __FILE__, __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
@@ -41,9 +46,10 @@ struct Run { std::vector<unsigned char> pred, outs, model, infer; };
 
 // One stream: learn N samples (predictions and the 3U unit outputs recorded every step), then predict-only through
 // infer() and run_streams() on a second block. Inputs include values large enough to saturate the gates.
-template <class T> Run run(int d, int N, uint64_t seed, int units, bool fanout) {
+template <class T> Run run(int d, int N, uint64_t seed, int units, bool fanout, bool v5 = false) {
   Net<T> g; Params P; if (d >= 32) P = Params(0.02, 0.02);
   P.units = units; P.fanout = fanout; P.competence = units == 12 || fanout;   // both mixtures covered
+  if (v5) { P = d >= 32 ? Params::v5(0.02, 0.02) : Params::v5(); P.corners = 16; P.units = units; P.fanout = fanout; if (!fanout) { P.latch = 0.2; P.latch_credit = 1.0; P.gate_err = 1; } }
   g.init(d, seed, P);
   Rng rng(seed * 7919 + 13);
   std::vector<T> x(d);
@@ -67,18 +73,56 @@ template <class T> Run run(int d, int N, uint64_t seed, int units, bool fanout) 
   return r;
 }
 
-template <class T> void compare_all(int d, int N, uint64_t seed, int units, bool fanout, const std::vector<const simd::Table*>& tabs) {
+template <class T> void compare_all(int d, int N, uint64_t seed, int units, bool fanout, const std::vector<const simd::Table*>& tabs, bool v5 = false) {
   simd::install(&header_table);
-  const Run ref = run<T>(d, N, seed, units, fanout);
+  const Run ref = run<T>(d, N, seed, units, fanout, v5);
   for (const simd::Table* t : tabs) {
     simd::install(t);
     CHECK(&simd::active() == t, "install(%s)", t->target);
-    const Run got = run<T>(d, N, seed, units, fanout);
+    const Run got = run<T>(d, N, seed, units, fanout, v5);
     const bool ok = got.pred == ref.pred && got.outs == ref.outs && got.model == ref.model && got.infer == ref.infer;
     CHECK(ok, "%s d=%d U=%d%s %s: differs from the header-only kernels (pred %d outs %d model %d infer %d)", sizeof(T) == 4 ? "float32" : "float64",
           d, units, fanout ? " fanout" : "", t->target, got.pred == ref.pred, got.outs == ref.outs, got.model == ref.model, got.infer == ref.infer);
-    std::printf("  %-7s %s d=%-3d U=%-2d%s N=%d: %s (%zu prediction bytes, %zu model bytes)\n", t->target, sizeof(T) == 4 ? "float32" : "float64", d, units, fanout ? " fanout" : "", N,
+    std::printf("  %-7s %s%s d=%-3d U=%-2d%s N=%d: %s (%zu prediction bytes, %zu model bytes)\n", t->target, sizeof(T) == 4 ? "float32" : "float64", v5 ? " latch" : "", d, units, fanout ? " fanout" : "", N,
                 ok ? "bit-identical" : "DIFFERENT", ref.pred.size() + ref.outs.size() + ref.infer.size(), ref.model.size());
+  }
+}
+// integer net (hgln_q.hpp): predictions, unit outputs and the whole model state through each table
+Run run_q(int d, int N, uint64_t seed, const Params& P) {
+  NetQ<float> g; g.init(d, seed, P);
+  Rng rng(seed * 7919 + 13); std::vector<float> x(d); Run r;
+  for (int t = 0; t < N; t++) {
+    const double sc = (t % 97 == 0) ? 40.0 : 1.0;
+    for (int i = 0; i < d; i++) x[i] = (float)(sc * (2 * rng.uni() - 1));
+    float y = (float)(std::sin(3 * (double)x[0]) * std::cos(2 * (double)x[1 % d]) + 0.5 * (double)x[2 % d] * (double)x[3 % d]);
+    if (t % 5 == 0) y = y > 0 ? 1.f : -1.f;
+    const float p = g.predict(x.data()); g.learn(y);
+    put(r.pred, &p, 1); put(r.outs, g.ws.o.data(), g.ws.o.size());
+  }
+  put(r.model, &g.t, 1);
+  for (const auto& l : g.L) {
+    int hdr[3] = {l.cs, l.cp, (int)l.pruned}; put(r.model, hdr, 3);
+    put(r.model, l.H.data(), l.H.size()); put(r.model, l.p.data(), l.p.size()); put(r.model, l.W.data(), l.W.size());
+    put(r.model, l.A.data(), l.A.size()); put(r.model, l.cols.data(), l.cols.size()); put(r.model, l.ncol.data(), l.ncol.size());
+  }
+  const int M = 200; std::vector<float> X((size_t)M * d), out((size_t)2 * M);
+  for (auto& v : X) v = (float)(2 * rng.uni() - 1);
+  WorkQ w; w.init(g);
+  for (int t = 0; t < M; t++) out[t] = g.infer(X.data() + (size_t)t * d, w);
+  std::vector<NetQ<float>> nets(1, g);
+  run_streams(nets, X.data(), (const float*)nullptr, out.data() + M, (size_t)M, 2);
+  put(r.infer, out.data(), out.size());
+  return r;
+}
+void compare_q(int d, int N, uint64_t seed, const Params& P, const char* what, const std::vector<const simd::Table*>& tabs) {
+  simd::install(&header_table);
+  const Run ref = run_q(d, N, seed, P);
+  for (const simd::Table* t : tabs) {
+    simd::install(t);
+    const Run got = run_q(d, N, seed, P);
+    const bool ok = got.pred == ref.pred && got.outs == ref.outs && got.model == ref.model && got.infer == ref.infer;
+    CHECK(ok, "int16 %s d=%d U=%d %s: differs from the header-only kernels (pred %d outs %d model %d infer %d)", what, d, P.units, t->target, got.pred == ref.pred, got.outs == ref.outs, got.model == ref.model, got.infer == ref.infer);
+    std::printf("  %-7s int16 %-10s d=%-3d U=%-2d bits %d/%d corners %-2d N=%d: %s (%zu model bytes)\n", t->target, what, d, P.units, P.wbits, P.abits, P.corners, N, ok ? "bit-identical" : "DIFFERENT", ref.model.size());
   }
 }
 }  // namespace
@@ -103,6 +147,16 @@ int main() {
     }
   compare_all<float>(8, 2500, 19, 16, true, tabs);
   compare_all<double>(8, 2500, 19, 16, true, tabs);
+  for (int units : {8, 12, 16}) {                  // version 5.0 float options: latch, credit, gate error (fan-out and chain)
+    compare_all<float>(8, 2500, 23, units, true, tabs, true); compare_all<double>(8, 2500, 23, units, true, tabs, true);
+    compare_all<double>(64, 1200, 29, units, false, tabs, true);
+  }
+  for (int units : {8, 12, 16}) for (int d : {8, 64}) {   // integer net: v5 defaults, both bit widths, past the prune and t = 4096
+    Params P = d >= 32 ? Params::v5(0.02, 0.02) : Params::v5(); P.units = units;
+    compare_q(d, d == 8 ? 4300 : 1500, 31 + d + units, P, "v5", tabs);
+    P.wbits = P.abits = 12; P.corners = units == 12 ? 16 : 8; P.fanout = units != 16;
+    compare_q(d, d == 8 ? 2000 : 900, 37 + d + units, P, "12-bit", tabs);
+  }
   for (const simd::Table* t : tabs) { CHECK(simd::force(t->target) && &simd::active() == t, "force(%s)", t->target); }
   simd::install(nullptr);
   CHECK(&simd::active() == &chosen, "install(nullptr) did not return to the automatic choice");

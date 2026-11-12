@@ -13,7 +13,9 @@
 // same tag and the same flags as FORGE's own kernels_<target>.cpp, so their copies are interchangeable.
 #define HGLN_SIMD_KERNEL_TU 1
 #define HGLN_HD static inline __attribute__((always_inline))
+#define HGLN_QHD static inline __attribute__((always_inline))
 #include "hgln.hpp"
+#include "hgln_q.hpp"
 #include <type_traits>
 #if HGLN_SIMD_FORGE_VEC
 #include <forge/simd/vec.hpp>
@@ -75,16 +77,22 @@ struct FOps : detail::VxOps<float> {};
 #endif
 struct DOps : detail::VxOps<double> {};
 
-template <class T, class P, int UU> void gat(const Layer<T>& L, const T* u, LayerWork<T>& w) { L.template gates_k<P, UU>(u, w); }
+template <class T, class P, int UU> void gat(const Layer<T>& L, const T* u, LayerWork<T>& w, const LayerWork<T>* lo) { L.template gates_k<P, UU>(u, w, lo); }
 template <class T, class P, int UU> void rul(const Layer<T>& L, const T* in, LayerWork<T>& w, T* xg) { L.template rules_k<P, UU>(in, w, xg); }
-template <class T, class P, int UU> void upd(Layer<T>& L, T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) {
-  L.template update_k<P, UU>(y, mu, glr, es, u, w);
+template <class T, class P, int UU> void upd(Layer<T>& L, const UpdateArgs<T>& a, const LayerWork<T>& w) { L.template update_k<P, UU>(a, w); }
+// integer net: the kernels of hgln_q.hpp instantiated with this TU's policy (internal linkage)
+struct QOps {};
+template <int UL> void qgat(const LayerQ& L, const QCfg& C, const int32_t* s, const LayerQWork* lo, LayerQWork& w) { detail::qk::gates<QOps, UL>(L, C, s, lo, w); }
+template <int UL> void qrul(const LayerQ& L, const QCfg& C, const int32_t* in, LayerQWork& w) { detail::qk::rules<QOps, UL>(L, C, in, w); }
+template <int UL> void qupd(LayerQ& L, const QCfg& C, const QStep& S, const int32_t* s, const LayerQWork& w, const LayerQWork* lo) {
+  detail::qk::update<QOps, UL>(L, C, S, s, w, lo);
 }
 }  // namespace
 
 extern const Table table;
 #define HGLN_SIMD_K3(T, P) {{&gat<T, P, 8>, &gat<T, P, 12>, &gat<T, P, 16>}, {&rul<T, P, 8>, &rul<T, P, 12>, &rul<T, P, 16>}, \
                              {&upd<T, P, 8>, &upd<T, P, 12>, &upd<T, P, 16>}}
-const Table table = {HGLN_SIMD_NAME, HGLN_SIMD_BITS, HGLN_SIMD_K3(float, FOps), HGLN_SIMD_K3(double, DOps)};
+const Table table = {HGLN_SIMD_NAME, HGLN_SIMD_BITS, HGLN_SIMD_K3(float, FOps), HGLN_SIMD_K3(double, DOps),
+                     {{&qgat<8>, &qgat<16>}, {&qrul<8>, &qrul<16>}, {&qupd<8>, &qupd<16>}}};
 #undef HGLN_SIMD_K3
 }  // namespace hgln::simd::HGLN_SIMD_NS

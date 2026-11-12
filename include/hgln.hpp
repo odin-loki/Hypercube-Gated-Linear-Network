@@ -156,12 +156,24 @@ class ThreadPool {
 };
 
 template <class T> struct Layer;
+template <class T> struct LayerWork;
+// Inputs of one layer's learning step (Layer::update).
+template <class T> struct UpdateArgs {
+  T y = 0, mu = 0, glr = 0, eg = 0;                          // target, rule step, gate rate, global error y - out
+  const T* es = nullptr;                                     // U mixed errors (rule steps; gate steps with gate_err 0)
+  const T* u = nullptr;                                      // side information (d+1)
+  const T* acc_in = nullptr;                                 // 4 x U gate steps routed here by upper layers, or null
+  T* acc_out = nullptr;                                      // 4 x U latch credit routed to the lower layer, or null
+  const LayerWork<T>* lo = nullptr;                          // the lower layer's work (latch credit: its kap)
+};
 
 // Per-sample scratch of one layer: written by forward, read by update. Not part of the model.
 template <class T> struct LayerWork {
   detail::ABuf<T> inp, a, zn, h, f, pred, comp, x2, pp;      // inp: N1 inputs incl. bias; a, zn: 4 x U; h, f: 16 x U
+  detail::ABuf<T> kap, hold;                                 // 4 x U: d a / d(12 z) and the latch's held part (Params::latch)
   void init(int N1, int U) {
     inp.assign(N1, 0); a.assign(U * 4, 0); zn.assign(U * 4, 0); h.assign(U * 16, 0); f.assign(U * 16, 0);
+    kap.assign(U * 4, 0); hold.assign(U * 4, 0);
     pred.assign(U, 0); comp.assign(U, 0); x2.assign(U, 0); pp.assign(U, 0);
   }
 };
@@ -288,6 +300,9 @@ template <class T> struct Layer {
   int cs = 0;                                                // column stride of W / cols (max active columns per unit)
   bool pruned = false;                                       // the one-off prune has run (A is then freed)
   bool has_competence = false;                               // keep the competence map m (version 4.2 mixture)
+  T latch = 0;                                               // cross-layer latch theta (Params::latch; layers 2 and 3)
+  T credit = 0;                                              // latch credit scale (Params::latch_credit)
+  int gate_err = 0;                                          // Params::gate_err: 0 mixed es, 1 own error, 2 global error
   detail::ABuf<T> H;                                         // D x 4 x U   hyperplanes, NOT normalised: [i][b][unit]
   detail::ABuf<T> q, nq, rs;                                 // 4 x U       |H_b|^2, |H_b| and 1/|H_b| (norm tracking)
   detail::ABuf<T> p;                                         // D x U       gate weights: [i][unit]
@@ -400,34 +415,39 @@ template <class T> struct Layer {
   // the kernel is picked once per call by U (template argument UU = U).
   // forward = gates (depend only on the side information u) then rules (depend on the previous layer's outputs).
 #if defined(HGLN_WITH_FORGE) && !defined(HGLN_SIMD_KERNEL_TU)
-  void gates(const T* u, LayerWork<T>& w) const { simd::layer_kernels<T>().gates[unit_index(U)](*this, u, w); }
+  void gates(const T* u, LayerWork<T>& w, const LayerWork<T>* lo = nullptr) const { simd::layer_kernels<T>().gates[unit_index(U)](*this, u, w, lo); }
   void rules(const T* in, LayerWork<T>& w, T* xg) const { simd::layer_kernels<T>().rules[unit_index(U)](*this, in, w, xg); }
-  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { simd::layer_kernels<T>().update[unit_index(U)](*this, y, mu, glr, es, u, w); }
+  void update(const UpdateArgs<T>& a, const LayerWork<T>& w) { simd::layer_kernels<T>().update[unit_index(U)](*this, a, w); }
 #else
-  void gates(const T* u, LayerWork<T>& w) const {
-    switch (U) { case 8: gates_k<detail::VxOps<T>, 8>(u, w); break; case 12: gates_k<detail::VxOps<T>, 12>(u, w); break; default: gates_k<detail::VxOps<T>, 16>(u, w); }
+  void gates(const T* u, LayerWork<T>& w, const LayerWork<T>* lo = nullptr) const {
+    switch (U) { case 8: gates_k<detail::VxOps<T>, 8>(u, w, lo); break; case 12: gates_k<detail::VxOps<T>, 12>(u, w, lo); break; default: gates_k<detail::VxOps<T>, 16>(u, w, lo); }
   }
   void rules(const T* in, LayerWork<T>& w, T* xg) const {
     switch (U) { case 8: rules_k<detail::VxOps<T>, 8>(in, w, xg); break; case 12: rules_k<detail::VxOps<T>, 12>(in, w, xg); break; default: rules_k<detail::VxOps<T>, 16>(in, w, xg); }
   }
-  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) {
+  void update(const UpdateArgs<T>& a, const LayerWork<T>& w) {
     switch (U) {
-      case 8: update_k<detail::VxOps<T>, 8>(y, mu, glr, es, u, w); break;
-      case 12: update_k<detail::VxOps<T>, 12>(y, mu, glr, es, u, w); break;
-      default: update_k<detail::VxOps<T>, 16>(y, mu, glr, es, u, w);
+      case 8: update_k<detail::VxOps<T>, 8>(a, w); break;
+      case 12: update_k<detail::VxOps<T>, 12>(a, w); break;
+      default: update_k<detail::VxOps<T>, 16>(a, w);
     }
   }
 #endif
-  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg) const { gates(u, w); rules(in, w, xg); }
+  // compatibility form of update (no latch credit; global error unused unless gate_err = 2)
+  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w, T eg = 0) {
+    UpdateArgs<T> a; a.y = y; a.mu = mu; a.glr = glr; a.eg = eg; a.es = es; a.u = u; update(a, w);
+  }
+  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg, const LayerWork<T>* lo = nullptr) const { gates(u, w, lo); rules(in, w, xg); }
 
   // Forward pass for all units = gates_k then rules_k. in: n inputs; u: D side-information values; xg: scratch of at
   // least N1. Lane = unit for everything except the rule dot products (lane = corner). O: vector policy (VxOps);
   // UU: compile-time copy of U (unit-lane work runs on detail::UnitOps<O, UU>, corner-lane work on O::V).
-  template <class O, int UU> HGLN_INLINE void forward_k(const T* HGLN_RESTRICT in, const T* HGLN_RESTRICT u, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
-    gates_k<O, UU>(u, w); rules_k<O, UU>(in, w, xg);
+  template <class O, int UU> HGLN_INLINE void forward_k(const T* HGLN_RESTRICT in, const T* HGLN_RESTRICT u, LayerWork<T>& w, T* HGLN_RESTRICT xg, const LayerWork<T>* lo = nullptr) const {
+    gates_k<O, UU>(u, w, lo); rules_k<O, UU>(in, w, xg);
   }
   // Gates and heatmap: depend only on u, so all layers' gates can run before any rule stage (Net::infer).
-  template <class O, int UU> HGLN_NOINLINE void gates_k(const T* HGLN_RESTRICT u, LayerWork<T>& w) const {
+  // lo: the layer whose gate bits this layer's cross-layer latch holds (Params::latch > 0, layers 2 and 3), or null.
+  template <class O, int UU> HGLN_NOINLINE void gates_k(const T* HGLN_RESTRICT u, LayerWork<T>& w, const LayerWork<T>* lo = nullptr) const {
     typedef detail::UnitOps<O, UU> Q; typedef typename Q::V VU;
     // gates: z_b = (H_b . (p * u)) / |H_b| with the stored, unnormalised H_b, i ascending; |p * u|^2 for the update
     VU z0 = Q::zero(), z1 = z0, z2 = z0, z3 = z0, pp = z0;
@@ -438,9 +458,9 @@ template <class T> struct Layer {
       z2 += Q::load(Hi + 2 * UU) * pu; z3 += Q::load(Hi + 3 * UU) * pu;
       pp += pu * pu;
     }
-    gates_finish_k<O, UU>(z0, z1, z2, z3, pp, w);
+    gates_finish_k<O, UU>(z0, z1, z2, z3, pp, w, lo);
   }
-  template <class O, int UU, class VU> HGLN_INLINE void gates_finish_k(const VU& z0, const VU& z1, const VU& z2, const VU& z3, const VU& pp, LayerWork<T>& w) const {
+  template <class O, int UU, class VU> HGLN_INLINE void gates_finish_k(const VU& z0, const VU& z1, const VU& z2, const VU& z3, const VU& pp, LayerWork<T>& w, const LayerWork<T>* lo = nullptr) const {
     typedef detail::UnitOps<O, UU> Q;
     T* HGLN_RESTRICT zz = w.zn.data();
     Q::store(zz, z0 * Q::load(&rs[0])); Q::store(zz + UU, z1 * Q::load(&rs[UU]));
@@ -448,6 +468,15 @@ template <class T> struct Layer {
     Q::store(w.pp.data(), pp);
     T* HGLN_RESTRICT aw = w.a.data();
     for (int q = 0; q < 4 * UU; q++) aw[q] = hgln_gate<T>(zz[q]);                 // 4U gates, [b][unit]
+    if (latch > 0 && lo) {                // cross-layer latch: set/reset around +-theta, holding the lower layer's bit
+      for (int q = 0; q < 4 * UU; q++) {
+        const T st = (T)1 / ((T)1 + std::exp(-BETA * (zz[q] - latch))), rt = (T)1 / ((T)1 + std::exp(-BETA * (-zz[q] - latch))), q0 = lo->a[q];
+        aw[q] = clipv(st + ((T)1 - st - rt) * q0, (T)1e-4, (T)(1 - 1e-4));
+        w.kap[q] = st * ((T)1 - st) * ((T)1 - q0) + rt * ((T)1 - rt) * q0; w.hold[q] = (T)1 - st - rt;
+      }
+    } else if (latch > 0) {
+      for (int q = 0; q < 4 * UU; q++) { w.kap[q] = aw[q] * ((T)1 - aw[q]); w.hold[q] = 0; }
+    }
     // 16-corner heatmap h[c] as a tensor product; same multiplication order as the reference (bit 0 first)
     const VU a0 = Q::load(aw), a1 = Q::load(aw + UU), a2 = Q::load(aw + 2 * UU), a3 = Q::load(aw + 3 * UU);
     const VU one = Q::zero() + (T)1;
@@ -491,8 +520,9 @@ template <class T> struct Layer {
     for (int k = 0; k < UU; k++) w.pred[k] = clipv(mx[k], (T)-2, (T)2);
   }
 
-  template <class O, int UU> HGLN_NOINLINE void update_k(T y, T mu, T glr, const T* HGLN_RESTRICT es, const T* HGLN_RESTRICT u, const LayerWork<T>& w) {
+  template <class O, int UU> HGLN_NOINLINE void update_k(const UpdateArgs<T>& args, const LayerWork<T>& w) {
     typedef typename O::V V16; typedef detail::UnitOps<O, UU> Q; typedef typename Q::V VU;
+    const T y = args.y, mu = args.mu, glr = args.glr; const T* HGLN_RESTRICT es = args.es; const T* HGLN_RESTRICT u = args.u;
     const T* HGLN_RESTRICT inp = w.inp.data(); const T* HGLN_RESTRICT h = w.h.data(); const T* HGLN_RESTRICT f = w.f.data();
     const VU esv = Q::load(es);
     // competence map: m[c] += 0.02 * h[c] * (e^2 - m[c]), e = the unit's own error
@@ -518,12 +548,29 @@ template <class T> struct Layer {
         if (c & 8) F1[3] += hf;
       }
       const T* HGLN_RESTRICT aw = w.a.data();
+      // error driving the gate steps (Params::gate_err): mixed es, the unit's own error, or the global error
+      alignas(64) T egv[UU];
+      if (gate_err == 2) for (int k = 0; k < UU; k++) egv[k] = args.eg;
+      else if (gate_err == 1) for (int k = 0; k < UU; k++) egv[k] = y - w.pred[k];
+      const VU gev = gate_err == 0 ? esv : Q::load(egv);
+      const bool latched = latch > 0 && args.lo;
       for (int b = 0; b < 4; b++) {
         const VU ab = Q::load(aw + b * UU), F0 = tot - F1[b];
-        const VU g = BETA * (F1[b] * ((T)1 - ab) - F0 * ab);
         alignas(64) T gv[UU];
-        Q::store(gv, glr * esv * g);
+        if (latched) {                    // g = 12 kap (F1/a - F0/(1-a)); credit: the held part, through the lower bit
+          const VU dm = F1[b] / ab - F0 / ((T)1 - ab);
+          Q::store(gv, glr * gev * (BETA * Q::load(&w.kap[b * UU]) * dm));
+          if (credit > 0 && args.acc_out) {
+            alignas(64) T cv[UU];
+            Q::store(cv, glr * gev * (credit * BETA * Q::load(&args.lo->kap[b * UU]) * dm * Q::load(&w.hold[b * UU])));
+            for (int k = 0; k < UU; k++) args.acc_out[b * UU + k] += clipv(cv[k], (T)-0.05, (T)0.05);
+          }
+        } else {
+          const VU g = BETA * (F1[b] * ((T)1 - ab) - F0 * ab);
+          Q::store(gv, glr * gev * g);
+        }
         for (int k = 0; k < UU; k++) cbs[b][k] = clipv(gv[k], (T)-0.05, (T)0.05);
+        if (args.acc_in) for (int k = 0; k < UU; k++) cbs[b][k] += args.acc_in[b * UU + k];
       }
       // normalised LMS rate per unit
       Q::store(c2s, (mu * esv) / ((T)1e-3 + h2 * Q::load(w.x2.data())));
@@ -620,6 +667,12 @@ template <class T> struct Layer {
   }
 };
 
+#ifndef HGLN_V5_WBITS
+#define HGLN_V5_WBITS 16
+#endif
+#ifndef HGLN_V5_ABITS
+#define HGLN_V5_ABITS 16
+#endif
 struct Params {
   double glr0 = 0.2, glr1 = 0.05;   // gate learning rate schedule start/end (8-input streams); use 0.02/0.02 for 64-input classification
   double tau = 1000;                // schedule time constant (samples)
@@ -631,21 +684,43 @@ struct Params {
                                     // 12 / 8 units: about 0.7x / 0.45x the work and state per network (docs/ALGORITHM.md)
   bool fanout = false;              // true: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 then
                                     // run side by side: 2 sequential rule stages per sample); false: the 1-2-3 chain
+  double latch = 0;                 // > 0: cross-layer latch with dead band theta = latch on layers 2 and 3 (each bit
+                                    // holds the same unit's bit of the layer it reads from - layer 1 with fanout - when
+                                    // |z| < theta; stateless in time); 0: plain gates (versions 4.x)
+  double latch_credit = 0;          // > 0: route the latch's held part of the gate gradient, times this scale, to the
+                                    // lower layer's bit (layers are then updated 3, 2, 1); 0: off
+  int gate_err = 0;                 // error that drives the gate steps: 0 the mixed error es (4.x), 1 the unit's own error,
+                                    // 2 the global mixture error y - out (5.0). Rule steps always use es.
+  int corners = 16;                 // hard top-k corners per unit (integer net NetQ: 1..16; the float Net: 16 only)
+  int wbits = 16, abits = 16;       // integer net: effective bits of the state (W, H, p) and of the activations, 12..16
   Params(double g0 = 0.2, double g1 = 0.05) : glr0(g0), glr1(g1) {}
   static Params v42(double g0 = 0.2, double g1 = 0.05) { Params p(g0, g1); p.competence = true; return p; }
+  // version 5.0 defaults (research/alg/tuned_v5.json): 8 units, fan-out, cross-layer latch 0.1 with credit 0.5, gates on
+  // the global error, glob 0.95, top-6 corners, the integer datapath's bit widths. Used by NetQ (hgln_q.hpp); the float
+  // Net takes it with corners = 16 (it has no top-k corners).
+  static Params v5(double g0 = 0.2, double g1 = 0.05) {
+    Params p(g0, g1); p.units = 8; p.fanout = true; p.latch = 0.1; p.latch_credit = 0.5; p.gate_err = 2; p.glob = 0.95;
+    p.corners = 6; p.wbits = HGLN_V5_WBITS; p.abits = HGLN_V5_ABITS; return p;
+  }
 };
 
 // The network: 3 layers x U units (Params::units), mixture over all 3U units (plain average, or competence-weighted).
 // Per sample, the gates of all 3 layers (they depend only on the input) run first, then the rule stages in order.
 template <class T> struct Net {
+  typedef T real_type;
+  typedef Work<T> work_type;
+  static Params default_params(double g0 = 0.2, double g1 = 0.05) { return Params(g0, g1); }
   static constexpr long kRenormEvery = 4096;                 // exact renormalisation of the tracked hyperplane norms
   int d = 0; Layer<T> L[3]; long t = 0; Params P;
   Work<T> ws;                                                // scratch for predict()/learn()
   void init(int d_, uint64_t seed = 1, const Params& p = Params()) {
     if (!valid_units(p.units)) throw std::invalid_argument("hgln: Params::units must be 8, 12 or 16");
+    if (p.corners != 16) throw std::invalid_argument("hgln: the float Net has no top-k corners (Params::corners must be 16; NetQ has them)");
+    if (p.gate_err < 0 || p.gate_err > 2) throw std::invalid_argument("hgln: Params::gate_err must be 0, 1 or 2");
     d = d_; P = p; t = 0;
     const int U = P.units;
     L[0].init(d, d + 1, P.competence, U); L[1].init(U, d + 1, P.competence, U); L[2].init(U, d + 1, P.competence, U);
+    for (int l = 0; l < 3; l++) { L[l].latch = (T)P.latch; L[l].credit = (T)P.latch_credit; L[l].gate_err = P.gate_err; }
     Rng rng(seed); for (auto& l : L) l.random_hyperplanes(rng);
     ws.init(*this);
   }
@@ -661,7 +736,7 @@ template <class T> struct Net {
     T* xg = w.tmp.data();
     const int U = L[0].U, NU = 3 * U;
     // gates first (independent of the previous layer), then the rule stages, which form the sequential chain
-    L[0].gates(u, w.lw[0]); L[1].gates(u, w.lw[1]); L[2].gates(u, w.lw[2]);
+    L[0].gates(u, w.lw[0]); L[1].gates(u, w.lw[1], &w.lw[0]); L[2].gates(u, w.lw[2], &w.lw[P.fanout ? 0 : 1]);
     L[0].rules(x, w.lw[0], xg); L[1].rules(w.lw[0].pred.data(), w.lw[1], xg);
     L[2].rules(w.lw[P.fanout ? 0 : 1].pred.data(), w.lw[2], xg);   // fanout: layers 2 and 3 both read layer 1
     for (int l = 0; l < 3; l++) for (int k = 0; k < U; k++) w.o[l * U + k] = w.lw[l].pred[k];
@@ -690,7 +765,18 @@ template <class T> struct Net {
     } else {                           // equal weights: r_i / sum r^2 = 1
       for (int i = 0; i < NU; i++) es[i] = (1 - glob) * (y - ws.o[i]) + glob * eg;
     }
-    for (int l = 0; l < 3; l++) L[l].update(y, (T)P.mu, gl, es + U * l, ws.u.data(), ws.lw[l]);
+    UpdateArgs<T> a; a.y = y; a.mu = (T)P.mu; a.glr = gl; a.eg = eg; a.u = ws.u.data();
+    if (P.latch > 0 && P.latch_credit > 0) {                 // latch credit: layers 3, 2, then 1 (which receives it)
+      alignas(64) T acc[3][4 * kMaxUnits];
+      for (auto& r : acc) for (auto& v : r) v = 0;
+      for (int l = 2; l >= 0; l--) {
+        const int lo = l == 0 ? -1 : (P.fanout ? 0 : l - 1);
+        a.es = es + U * l; a.acc_in = acc[l]; a.acc_out = lo >= 0 ? acc[lo] : nullptr; a.lo = lo >= 0 ? &ws.lw[lo] : nullptr;
+        L[l].update(a, ws.lw[l]);
+      }
+    } else {
+      for (int l = 0; l < 3; l++) { a.es = es + U * l; a.lo = l == 0 ? nullptr : &ws.lw[P.fanout && l == 2 ? 0 : l - 1]; L[l].update(a, ws.lw[l]); }
+    }
     t++;
     if (t >= P.warm && t % 64 == 0) for (auto& l : L) l.structure_step();
     if (t % kRenormEvery == 0) for (auto& l : L) l.renormalise();
@@ -703,13 +789,13 @@ template <class T> struct Net {
 // Run many independent networks over one shared input stream, in parallel (one network per task). All nets must have
 // the same d. X: N x d. Y: nets x N targets (row per network), or nullptr for predict only (model unchanged).
 // P: nets x N outputs, or nullptr. Exactly equivalent to looping predict/learn sample by sample for each network.
-template <class T> void run_streams(std::vector<Net<T>>& nets, const T* X, const T* Y, T* P, size_t N, int threads = 0) {
+template <class NetT, class T> void run_streams(std::vector<NetT>& nets, const T* X, const T* Y, T* P, size_t N, int threads = 0) {
   const int C = (int)nets.size();
   if (!C) return;
   const int d = nets[0].d;
   if (!Y) {                                                    // predict only: parallel over sample chunks (const path)
     const int chunk = 64, nch = (int)((N + chunk - 1) / chunk), nt = threads <= 0 ? hardware_threads() : threads;
-    std::vector<Work<T>> works(std::max(1, std::min(nt, nch)));
+    std::vector<typename NetT::work_type> works(std::max(1, std::min(nt, nch)));
     for (auto& w : works) w.init(nets[0]);
     parallel_for(nch, (int)works.size(), [&](int ch, int wi) {
       size_t a = (size_t)ch * chunk, b = std::min(N, a + chunk);
@@ -719,19 +805,19 @@ template <class T> void run_streams(std::vector<Net<T>>& nets, const T* X, const
     return;
   }
   parallel_for(C, threads, [&](int k, int) {
-    Net<T>& g = nets[k]; const T* yk = Y + (size_t)k * N;
+    NetT& g = nets[k]; const T* yk = Y + (size_t)k * N;
     for (size_t t = 0; t < N; t++) { T v = g.predict(X + t * d); g.learn(yk[t]); if (P) P[(size_t)k * N + t] = v; }
   });
 }
 
-// One-vs-rest classifier: one Net per class on +1/-1 targets.
+// One-vs-rest classifier: one network per class on +1/-1 targets (NetT: Net<T>, or NetQ<T> from hgln_q.hpp).
 // Heads share nothing, so they run in parallel: train_batch()/predict_batch() for blocks of samples, or, after
 // set_threads(n), train()/predict() spread the heads of each single sample over a persistent pool.
-template <class T> struct Classifier {
-  int d = 0, C = 0; std::vector<Net<T>> nets; std::vector<T> score;
+template <class T, class NetT = Net<T>> struct Classifier {
+  int d = 0, C = 0; std::vector<NetT> nets; std::vector<T> score;
   std::shared_ptr<ThreadPool> pool;                          // optional, for per-sample parallelism
-  void init(int d_, int classes, uint64_t seed = 1, const Params& p = Params(0.02, 0.02)) {
-    d = d_; C = classes; nets.assign(C, Net<T>()); score.assign(C, 0);
+  void init(int d_, int classes, uint64_t seed = 1, const Params& p = NetT::default_params(0.02, 0.02)) {
+    d = d_; C = classes; nets.assign(C, NetT()); score.assign(C, 0);
     for (int k = 0; k < C; k++) nets[k].init(d, seed * 1000003ULL + k, p);
   }
   // Use n threads (0 = all hardware threads, 1 = none) inside train() and predict(). Worth it from about d >= 32 or
@@ -755,7 +841,7 @@ template <class T> struct Classifier {
   // Train on N samples in order (X: N x d, labels: N). Same result as N calls to train(); heads run in parallel.
   void train_batch(const T* X, const int* labels, size_t N, int threads = 0) {
     parallel_for(C, threads, [&](int k, int) {
-      Net<T>& g = nets[k];
+      NetT& g = nets[k];
       for (size_t t = 0; t < N; t++) { g.predict(X + t * d); g.learn(labels[t] == k ? (T)1 : (T)-1); }
     });
   }
@@ -763,7 +849,7 @@ template <class T> struct Classifier {
   void predict_batch(const T* X, size_t N, int* out, T* scores = nullptr, int threads = 0) const {
     if (!C) return;
     const int chunk = 32, nch = (int)((N + chunk - 1) / chunk), nt = threads <= 0 ? hardware_threads() : threads;
-    std::vector<Work<T>> works(std::max(1, std::min(nt, nch)));
+    std::vector<typename NetT::work_type> works(std::max(1, std::min(nt, nch)));
     for (auto& w : works) w.init(nets[0]);
     parallel_for(nch, (int)works.size(), [&](int ch, int wi) {
       size_t a = (size_t)ch * chunk, b = std::min(N, a + chunk);

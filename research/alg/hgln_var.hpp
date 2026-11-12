@@ -6,7 +6,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <stdexcept>
 #include <vector>
+
+#include "../../include/hgln_qspec.hpp"
 
 namespace hv {
 
@@ -53,6 +57,12 @@ struct Var {
                              // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
   int warm = 512;
+  bool intspec = false;      // HGLN v5.0 integer specification (include/hgln_qspec.hpp), run by QNet below: wbits/abits
+                             // (0 = 16), sparse_k (0 = 16 corners), hybrid = 3 (fan-out), theta with theta_mode 4
+                             // (cross-layer latch), credit, gate_err, glob, mu, glr0/glr1/tau, warm. Needs uniform = 1;
+                             // norm_track is irrelevant (H is renormalised exactly on every update).
+  bool intspec_ginit = false; // intspec, research only: start from the float model's Gaussian hyperplanes (rounded)
+                             // instead of the specification's Philox initialisation - isolates the datapath's effect
 };
 
 // Integer emulation: x -> nearest (or stochastically rounded) multiple of 2^-frac, saturated to `bits` signed bits.
@@ -258,9 +268,230 @@ struct Layer {
   }
 };
 
+
+// ---------------------------------------------------------------------------------------------------------------------
+// QNet: the version 5.0 integer specification (include/hgln_qspec.hpp, section by section), written as plainly as
+// possible in the dense reference layout. This is the reference that the library's NetQ must match bit for bit.
+namespace qs = hgln::qspec;
+struct QNet {
+  int d = 0, U = 16, K = 16, gate_err = 0, warm = 512; bool fanout = false, latch = false, credit = false;
+  int64_t cscale = 0;                                   // latch credit scale, Q16
+  bool gauss_init = false;                              // Var::intspec_ginit
+  double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
+  qs::Fmt F{}; uint64_t seed = 1; int64_t t = 0; bool pruned = false; int32_t thq = 0;
+  struct QL {
+    int n = 0, N1 = 0, D = 0;
+    std::vector<int32_t> H, p, W, M, A;               // H[(k*4+b)*D+i]  p[k*D+i]  W[(k*16+c)*N1+j]  M, A[k*N1+j]
+    std::vector<int32_t> x, a, kap, hold, hs, h, f, o, acc; std::vector<char> sel;
+  } L[3];
+  std::vector<int32_t> s; int32_t S = 0;
+  static constexpr int32_t CB = 53687091;               // 0.05 at Q30
+  uint32_t k0() const { return (uint32_t)seed; }
+  uint32_t k1() const { return (uint32_t)(seed >> 32); }
+  void init(int d_, uint64_t seed_, const Var& V) {
+    if (!V.uniform) throw std::invalid_argument("intspec needs uniform=1");
+    if (V.hybrid != 0 && V.hybrid != 3) throw std::invalid_argument("intspec: hybrid must be 0 or 3 (fan-out)");
+    if (V.theta > 0 && V.theta_mode != 4) throw std::invalid_argument("intspec: only the cross-layer latch (theta_mode 4)");
+    if (V.glr_scale != 1 || V.rule_err != 0) throw std::invalid_argument("intspec: glr_scale/rule_err unsupported");
+    if (V.K != 4 || V.layers != 3 || V.density != 0.6 || V.gate_src || V.proj || V.no_p || V.share_gates || V.p_shared)
+      throw std::invalid_argument("intspec: unsupported switch");
+    d = d_; seed = seed_; U = V.U; K = V.sparse_k > 0 ? V.sparse_k : 16; fanout = V.hybrid == 3; latch = V.theta > 0;
+    credit = V.credit && V.credit_scale > 0; cscale = qs::round_param(V.credit_scale, 16); gauss_init = V.intspec_ginit; gate_err = V.gate_err; warm = V.warm; glr0 = V.glr0; glr1 = V.glr1; tau = V.tau; glob = V.glob; mu = V.mu;
+    F = qs::make_fmt(V.abits > 0 ? V.abits : 16, V.wbits > 0 ? V.wbits : 16);
+    thq = qs::round_param(V.theta, F.FA); t = 0; pruned = false;
+    for (int l = 0; l < 3; l++) {
+      QL& q = L[l]; q.n = l == 0 ? d : U; q.N1 = q.n + 1; q.D = d + 1;
+      q.H.assign((size_t)U * 4 * q.D, 0); q.p.assign((size_t)U * q.D, 1 << F.FP); q.W.assign((size_t)U * 16 * q.N1, 0);
+      q.M.assign((size_t)U * q.N1, 1); q.A.assign((size_t)U * q.N1, (int32_t)qs::div_rne((int64_t)1 << (F.FA + 8), 1000));
+      q.x.assign(q.N1, 0); q.a.assign(U * 4, 0); q.kap.assign(U * 4, 0); q.hold.assign(U * 4, 0); q.acc.assign(U * 4, 0);
+      q.hs.assign(U * 16, 0); q.h.assign(U * 16, 0); q.f.assign(U * 16, 0); q.o.assign(U, 0); q.sel.assign(U * 16, 0);
+      if (gauss_init) continue;
+      for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) {
+        std::vector<int32_t> v(q.D);
+        for (int i = 0; i < q.D; i++) v[i] = qs::init_component(seed, l, k, b, i, q.D);
+        qs::init_normalise(q.D, F, [&](int i) { return v[i]; }, [&](int i, int32_t h) { q.H[((size_t)k * 4 + b) * q.D + i] = h; });
+      }
+    }
+    if (gauss_init) {   // research only (intspec_ginit=1): the float model's Gaussian hyperplanes, rounded to Q(WB-2)
+      Rng rng(seed);
+      for (int l = 0; l < 3; l++) for (int k = 0; k < U; k++) for (int b = 0; b < 4; b++) {
+        std::vector<double> v(d + 1); double nn = 0;
+        for (int i = 0; i <= d; i++) { v[i] = i == d ? 0 : rng.normal(); nn += v[i] * v[i]; }
+        nn = std::sqrt(nn); for (int i = 0; i <= d; i++) L[l].H[((size_t)k * 4 + b) * (d + 1) + i] = (int32_t)std::nearbyint(v[i] / nn * (1 << F.FH));
+      }
+    }
+    s.assign(d + 1, 0);
+  }
+  QL* lower(int l) { return l == 0 ? nullptr : (fanout ? &L[0] : &L[l - 1]); }
+  double predict(const double* xin) {
+    std::vector<int32_t> xq(d);
+    int64_t nn = (int64_t)F.ONE * F.ONE;
+    for (int j = 0; j < d; j++) { xq[j] = qs::quantise(xin[j], F.FA, F.MA); nn += (int64_t)xq[j] * xq[j]; }
+    const int64_t g = (int64_t)qs::isqrt((uint64_t)nn << 6), rcp = ((int64_t)1 << (34 + F.FA)) / g;
+    for (int j = 0; j < d; j++) s[j] = (int32_t)qs::rne(xq[j] * rcp, 31);
+    s[d] = (int32_t)qs::rne((int64_t)F.ONE * rcp, 31);
+    const int sh14 = 16 - F.AB;
+    for (int l = 0; l < 3; l++) {
+      QL& q = L[l]; QL* lo = lower(l);
+      const int32_t* in = l == 0 ? xq.data() : lo->o.data();
+      for (int j = 0; j < q.n; j++) q.x[j] = in[j];
+      q.x[q.n] = F.ONE;
+      for (int k = 0; k < U; k++) {
+        for (int b = 0; b < 4; b++) {            // gates
+          uint32_t z = 0;
+          for (int i = 0; i < q.D; i++) {
+            const int32_t ps = (int32_t)qs::sat(qs::rne((int64_t)q.p[(size_t)k * q.D + i] * s[i], F.FP), F.MA);
+            z += (uint32_t)(q.H[((size_t)k * 4 + b) * q.D + i] * ps);
+          }
+          const int32_t zq = (int32_t)qs::sat(qs::rne((int32_t)z, F.FH), F.MA), z14 = zq * (1 << sh14);
+          const int kb = k * 4 + b;
+          int32_t a14;
+          if (latch && lo) {
+            const int32_t th14 = thq * (1 << sh14), st = qs::sig14(z14 - th14), rt = qs::sig14(-z14 - th14), q14 = lo->a[kb] * (1 << sh14);
+            a14 = (int32_t)qs::clampi(st + qs::rne((int64_t)(16384 - st - rt) * q14, 14), 2, 16382);
+            q.kap[kb] = (int32_t)(qs::rne(qs::rne((int64_t)st * (16384 - st), 14) * (16384 - q14), 14) + qs::rne(qs::rne((int64_t)rt * (16384 - rt), 14) * q14, 14));
+            q.hold[kb] = 16384 - st - rt;
+          } else a14 = qs::sig14(z14);
+          q.a[kb] = (int32_t)qs::clampi(qs::rne(a14, sh14), 1, F.ONE - 1);
+          if (!(latch && lo)) { const int64_t aq = (int64_t)q.a[kb] << sh14; q.kap[kb] = (int32_t)qs::rne(aq * (16384 - aq), 14); q.hold[kb] = 0; }
+        }
+        for (int c = 0; c < 16; c++) {          // heatmap, bit 0 first
+          int64_t v = 0;
+          for (int b = 0; b < 4; b++) {
+            const int64_t xb = ((c >> b) & 1) ? q.a[k * 4 + b] : F.ONE - q.a[k * 4 + b];
+            v = b == 0 ? xb : qs::rne(v * xb, F.FA);
+          }
+          q.hs[k * 16 + c] = (int32_t)v;
+        }
+        int64_t sm = 0;                          // top-K corners
+        for (int c = 0; c < 16; c++) {
+          int rank = 0; const int64_t kc = (int64_t)q.hs[k * 16 + c] * 16 + (15 - c);
+          for (int c2 = 0; c2 < 16; c2++) rank += (int64_t)q.hs[k * 16 + c2] * 16 + (15 - c2) > kc;
+          q.sel[k * 16 + c] = rank < K; if (rank < K) sm += q.hs[k * 16 + c];
+        }
+        const uint32_t R = (uint32_t)(((int64_t)1 << 30) / std::max<int64_t>(sm, 1));
+        for (int c = 0; c < 16; c++)
+          q.h[k * 16 + c] = K >= 16 ? q.hs[k * 16 + c] : (q.sel[k * 16 + c] ? (int32_t)qs::rne((int64_t)q.hs[k * 16 + c] * R, 30 - F.FA) : 0);
+        int32_t mix = 0;                         // rules and mixture
+        for (int c = 0; c < 16; c++) {
+          uint32_t acc = 0;
+          for (int j = 0; j < q.N1; j++) if (q.M[(size_t)k * q.N1 + j]) acc += (uint32_t)(q.W[((size_t)k * 16 + c) * q.N1 + j] * q.x[j]);
+          q.f[k * 16 + c] = (int32_t)qs::sat(qs::rne((int32_t)acc, F.WB - 2), F.MA);
+          mix += q.h[k * 16 + c] * q.f[k * 16 + c];
+        }
+        q.o[k] = (int32_t)qs::sat(qs::rne(mix, F.FF), F.MA);
+      }
+    }
+    S = 0; for (int l = 0; l < 3; l++) for (int k = 0; k < U; k++) S += L[l].o[k];
+    return (double)S / (double)((int64_t)3 * U << F.FA);
+  }
+  void learn(double y) {
+    const int NU = 3 * U;
+    const int64_t yq = qs::quantise(y, F.FA, 1 << (F.FA + 6));
+    const int64_t eg = qs::div_rne(NU * yq - S, NU), G = qs::round_param(glob, 16), Mq = qs::round_param(mu, 16);
+    const int64_t glq = qs::gl_q24(t, glr0, glr1, tau);
+    const uint32_t tl = (uint32_t)t, th = (uint32_t)((uint64_t)t >> 32);
+    for (auto& q : L) std::fill(q.acc.begin(), q.acc.end(), 0);
+    for (int l = 2; l >= 0; l--) {               // upper layers first: credit reaches the lower layer in this sample
+      QL& q = L[l]; QL* lo = lower(l); const int D = q.D, N1 = q.N1;
+      for (int k = 0; k < U; k++) {
+        const int64_t e = yq - q.o[k], es = qs::rne((65536 - G) * e + G * eg, 16);
+        const int64_t egate = gate_err == 2 ? eg : (gate_err == 1 ? e : es);
+        const int64_t ge = qs::sat32(qs::rne(glq * egate, F.FA));
+        int64_t tot = 0, F1[4] = {0, 0, 0, 0};
+        for (int c = 0; c < 16; c++) if (q.sel[k * 16 + c]) {
+          const int64_t hf = (int64_t)q.hs[k * 16 + c] * q.f[k * 16 + c];
+          tot += hf; for (int b = 0; b < 4; b++) if ((c >> b) & 1) F1[b] += hf;
+        }
+        int64_t cb[4];
+        for (int b = 0; b < 4; b++) {
+          const int kb = k * 4 + b; const int64_t a = q.a[kb], num = F1[b] * (F.ONE - a) - (tot - F1[b]) * a;
+          int64_t Gt;
+          if (latch && lo) {
+            const int64_t den = a * (F.ONE - a);
+            auto dz = [&](int64_t kap) {             // 12 kap (F1/a - F0/(1-a)) at Q24
+              const int sh = F.FF - 10; int64_t nu = 12 * kap * num, de = den;
+              if (sh >= 0) de <<= sh; else nu *= (int64_t)1 << -sh;
+              return (int64_t)qs::sat32(qs::div_rne(nu, de));
+            };
+            Gt = dz(q.kap[kb]);
+            if (credit) {
+              const int64_t G2 = qs::sat32(qs::rne(qs::sat32(qs::rne(dz(lo->kap[kb]) * q.hold[kb], 14)) * cscale, 16));
+              lo->acc[kb] += (int32_t)qs::clampi(qs::rne(ge * G2, 18), -CB, CB);
+            }
+          } else Gt = qs::sat32(qs::rne(12 * num, 3 * F.AB - 32));
+          cb[b] = qs::clampi(qs::rne(ge * Gt, 18), -CB, CB) + q.acc[kb];
+        }
+        // p step (old H) and hyperplane step (old p), then exact renormalisation
+        std::vector<int64_t> Hr((size_t)4 * D); int64_t N2[4] = {0, 0, 0, 0};
+        for (int i = 0; i < D; i++) {
+          int64_t ssum = 0; const int64_t cp = (int64_t)q.p[(size_t)k * D + i] * s[i];
+          for (int b = 0; b < 4; b++) {
+            const int64_t Hv = q.H[((size_t)k * 4 + b) * D + i];
+            ssum += cb[b] * Hv;
+            const int64_t hr = (Hv << 8) + qs::rne(cb[b] * cp, 19 + F.AB);
+            Hr[(size_t)b * D + i] = hr; N2[b] += hr * hr;
+          }
+          const int64_t Y = ((int64_t)q.p[(size_t)k * D + i] << (29 + F.AB)) + s[i] * ssum;
+          const qs::Philox4 r = qs::philox4x32_10((uint32_t)(((i >> 3) << 4) | k), 4 * l + qs::kArrP, tl, th, k0(), k1());
+          q.p[(size_t)k * D + i] = (int32_t)qs::clampi(qs::sr(Y, 29 + F.AB, qs::half16(r, (i >> 1) & 3, i & 1)), 0, 3 << F.FP);
+        }
+        for (int b = 0; b < 4; b++) {
+          if (N2[b] == 0) continue;
+          const int64_t rc = (int64_t)(((uint64_t)1 << 54) / qs::isqrt((uint64_t)N2[b]));
+          for (int i = 0; i < D; i++) {
+            const qs::Philox4 r = qs::philox4x32_10((uint32_t)((((i >> 3) * 4 + b) << 4) | k), 4 * l + qs::kArrH, tl, th, k0(), k1());
+            q.H[((size_t)k * 4 + b) * D + i] = (int32_t)qs::sat(qs::sr(Hr[(size_t)b * D + i] * rc, 56 - F.WB, qs::half16(r, (i >> 1) & 3, i & 1)), F.MW);
+          }
+        }
+        // rule step
+        int64_t h2 = 0, x2 = 0;
+        for (int c = 0; c < 16; c++) h2 += (int64_t)q.h[k * 16 + c] * q.h[k * 16 + c];
+        for (int j = 0; j < N1; j++) if (q.M[(size_t)k * N1 + j]) x2 += (int64_t)q.x[j] * q.x[j];
+        const int64_t den = qs::rne(h2, 2 * F.FA - 18) * qs::rne(x2, 2 * F.FA - 12) + 1073742;
+        const int64_t c2 = qs::sat32(qs::div_rne((Mq * es) * ((int64_t)1 << (38 - F.FA)), den));
+        const int FWs = 26 + F.AB - F.WB;
+        for (int c = 0; c < 16; c++) {
+          const int64_t sc = qs::sat32(qs::rne(c2 * q.h[k * 16 + c], F.FA));
+          if (sc == 0) continue;
+          int slot = 0;
+          for (int j = 0; j < N1; j++) {
+            if (!q.M[(size_t)k * N1 + j]) continue;
+            const qs::Philox4 r = qs::philox4x32_10((uint32_t)((k << 16) | ((slot >> 3) << 4) | c), 4 * l + qs::kArrW, tl, th, k0(), k1());
+            int32_t& w = q.W[((size_t)k * 16 + c) * N1 + j];
+            w = (int32_t)qs::sat(qs::sr(((int64_t)w << FWs) + sc * q.x[j], FWs, qs::half16(r, (slot >> 1) & 3, slot & 1)), F.MW);
+            slot++;
+          }
+        }
+        if (!pruned) for (int j = 0; j < N1; j++) {
+          int32_t& A = q.A[(size_t)k * N1 + j];
+          A += (int32_t)qs::rne(1311 * (((int64_t)std::abs(q.x[j]) << 8) - A), 16);
+        }
+      }
+    }
+    t++;
+    if (!pruned && t >= warm && t % 64 == 0) {
+      for (auto& q : L) {
+        const int n = q.n, nt = n <= 4 ? n : (6 * n + 5) / 10;
+        for (int k = 0; k < U; k++) {
+          std::vector<int> act; std::vector<int64_t> sc(n, 0);
+          for (int j = 0; j < n; j++) if (q.M[(size_t)k * q.N1 + j]) act.push_back(j);
+          if ((int)act.size() <= nt) continue;
+          for (int j : act) { int64_t sw = 0; for (int c = 0; c < 16; c++) sw += std::abs(q.W[((size_t)k * 16 + c) * q.N1 + j]); sc[j] = sw * q.A[(size_t)k * q.N1 + j]; }
+          std::stable_sort(act.begin(), act.end(), [&](int x, int y) { return sc[x] < sc[y]; });
+          for (int i = 0; i < (int)act.size() - nt; i++) q.M[(size_t)k * q.N1 + act[i]] = 0;
+        }
+      }
+      pruned = true;
+    }
+  }
+};
+
 struct Net {
   int d = 0; Var V; std::vector<Layer> L; std::vector<double> u, o, r, R, us, prev; double out = 0; long t = 0; bool pruned = false; Rng qrng{12345};
+  std::shared_ptr<QNet> q;                       // intspec: the integer specification runs instead
   void init(int d_, uint64_t seed, const Var& v) {
+    q.reset(); if (v.intspec) { q = std::make_shared<QNet>(); q->init(d_, seed, v); }
     d = d_; V = v; t = 0; pruned = false; L.assign(V.layers, Layer());
     int Du = V.proj > 0 ? V.proj : d + 1;
     Rng rng(seed);
@@ -277,6 +508,7 @@ struct Net {
     u.assign(d + 1, 0); us.assign(std::max(Du, V.U + 1), 0); o.assign((size_t)V.layers * V.U, 0); r = o;
   }
   double predict(const double* x) {
+    if (q) return out = q->predict(x);
     double nn = 1; for (int i = 0; i < d; i++) { u[i] = x[i]; nn += x[i] * x[i]; }
     u[d] = 1; nn = std::sqrt(nn); for (int i = 0; i <= d; i++) u[i] /= nn;
     std::vector<double> side(u);
@@ -309,6 +541,7 @@ struct Net {
     return out;
   }
   void learn(double y) {
+    if (q) { q->learn(y); t++; return; }
     int G = V.layers * V.U; double gl = V.glr_scale * (V.glr1 + (V.glr0 - V.glr1) * std::exp(-(double)t / V.tau)), sr2 = 0;
     for (int i = 0; i < G; i++) sr2 += r[i] * r[i];
     std::vector<double> es(G);

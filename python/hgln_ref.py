@@ -131,17 +131,43 @@ class HC(GatedLayer):
 
 
 class HC2(HC):
-    """Hypercube unit with a per-corner competence map m (running squared error of the unit's own prediction)."""
-    def __init__(s, U, n_in, K, d, rng, glr):
-        super().__init__(U, n_in, K, d, rng, glr, False, 0.0); s.m = np.full((U, 16), 0.3)
+    """Hypercube unit with a per-corner competence map m (running squared error of the unit's own prediction).
+    latch > 0 (version 5.0): cross-layer latch - with a lower layer given, each bit holds the same unit's bit of the
+    lower layer inside the dead band |z| < latch: a = set + (1 - set - reset) a_lower."""
+    def __init__(s, U, n_in, K, d, rng, glr, latch=0.0):
+        super().__init__(U, n_in, K, d, rng, glr, False, 0.0); s.m = np.full((U, 16), 0.3); s.latch = latch
+    def forward(s, a, u, lower=None):
+        out = super().forward(a, u)
+        s.latched = s.latch > 0 and lower is not None
+        if s.latched:
+            z = np.einsum('ubd,ud->ub', s.H, s.pu) + s.delta
+            st = 1 / (1 + np.exp(-BETA * (z - s.latch))); rt = 1 / (1 + np.exp(-BETA * (-z - s.latch))); q0 = lower.a
+            s.a = np.clip(st + (1 - st - rt) * q0, 1e-4, 1 - 1e-4)
+            s.kap = st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0; s.hold = 1 - st - rt
+            s.h = np.prod(np.where(s.B[None] > 0.5, s.a[:, None, :], 1 - s.a[:, None, :]), axis=2)
+            s.mix = (s.h * s.f).sum(1); s.pred = np.clip(s.mix, -2, 2); out = s.pred
+        else:
+            s.kap = s.a * (1 - s.a); s.hold = np.zeros_like(s.a)
+        return out
     def comp(s):                                           # input-dependent competence of each unit
         return 1.0 / ((s.h * s.m).sum(1) + 1e-3)
-    def update(s, y, mu, es):                              # es: the error signal this unit learns from
+    def update(s, y, mu, es, eg=None, gate_err=0, acc_in=None, acc_out=None, lower=None, credit=0.0):
+        """es: the error the rules learn from; the gate steps use es (gate_err 0), the unit's own error (1) or the global
+        error eg (2). Latch credit: the held part of each latched bit's gradient, times credit, goes to acc_out (the
+        lower layer's bits); acc_in is added to this layer's (clipped) gate steps."""
         e = y - s.pred
         s.m = s.m + 0.02 * s.h * ((e ** 2)[:, None] - s.m)
         hf = s.h * s.f; F1 = hf @ s.B; F0 = hf.sum(1, keepdims=True) - F1
-        g = BETA * (F1 * (1 - s.a) - F0 * s.a)             # d mix / d z_b
-        c = np.clip(s.glr * es[:, None] * g, -0.05, 0.05)
+        ge = es if gate_err == 0 else (e if gate_err == 1 else np.full_like(es, eg))
+        if s.latched:
+            dm = F1 / s.a - F0 / (1 - s.a)
+            c = np.clip(s.glr * ge[:, None] * (BETA * s.kap * dm), -0.05, 0.05)
+            if credit > 0 and acc_out is not None:
+                acc_out += np.clip(s.glr * ge[:, None] * (credit * BETA * lower.kap * dm * s.hold), -0.05, 0.05)
+        else:
+            g = BETA * (F1 * (1 - s.a) - F0 * s.a)         # d mix / d z_b
+            c = np.clip(s.glr * ge[:, None] * g, -0.05, 0.05)
+        if acc_in is not None: c = c + acc_in
         dp = np.einsum('ub,ubd->ud', c, s.H * s.u[None, None, :])
         s.H = s.H + c[:, :, None] * s.pu[:, None, :]; s.H /= np.linalg.norm(s.H, axis=2, keepdims=True)
         s.p = np.clip(s.p + dp, 0.0, 3.0)
@@ -155,16 +181,18 @@ class HC2(HC):
 class HGLN:
     """3 hidden layers of Wd units (no separate readout). Prediction = competitive mixture over all 3*Wd units.
     fanout=True: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 both fed by layer 1)."""
-    def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512, competence=True, fanout=False):
+    def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512, competence=True, fanout=False,
+                 latch=0.0, latch_credit=0.0, gate_err=0):
         r = np.random.default_rng(seed)
-        s.L = [HC2(Wd, d, 16, d, r, glr0), HC2(Wd, Wd, 16, d, r, glr0), HC2(Wd, Wd, 16, d, r, glr0)]
+        s.L = [HC2(Wd, d, 16, d, r, glr0, latch), HC2(Wd, Wd, 16, d, r, glr0, latch), HC2(Wd, Wd, 16, d, r, glr0, latch)]
+        s.latch, s.credit, s.gate_err = latch, latch_credit, gate_err
         s.Wd, s.glr0, s.glr1, s.tau, s.mu, s.glob, s.warm, s.t = Wd, glr0, glr1, tau, mu, glob, warm, 0
         s.competence = competence   # False: version 4.3, plain average of the units (no competence weighting)
         s.fanout = fanout
     def predict(s, x):
         x = np.asarray(x, float); u = feat(x)
-        a1 = s.L[0].forward(x, u); a2 = s.L[1].forward(a1, u)
-        s.L[2].forward(a1 if s.fanout else a2, u)
+        a1 = s.L[0].forward(x, u); a2 = s.L[1].forward(a1, u, s.L[0])
+        s.L[2].forward(a1 if s.fanout else a2, u, s.L[0] if s.fanout else s.L[1])
         s.o = np.concatenate([L.pred for L in s.L])
         if s.competence:
             comp = np.concatenate([L.comp() for L in s.L])
@@ -178,7 +206,14 @@ class HGLN:
         e_loc = y - s.o; e_glob = y - s.out
         share = s.r / (s.r ** 2).sum() if s.competence else 1.0             # equal weights: r / sum r^2 = 1
         es = (1 - s.glob) * e_loc + s.glob * e_glob * share   # own error + responsibility-share of mixture error
-        for i, L in enumerate(s.L): L.update(y, s.mu, es[i * s.Wd:(i + 1) * s.Wd])
+        if s.latch > 0 and s.credit > 0:                                  # layers 3, 2, 1: credit reaches layer 1
+            acc = [np.zeros((s.Wd, 4)) for _ in s.L]
+            for i in (2, 1, 0):
+                lo = None if i == 0 else (0 if s.fanout else i - 1)
+                s.L[i].update(y, s.mu, es[i * s.Wd:(i + 1) * s.Wd], e_glob, s.gate_err, acc[i], None if lo is None else acc[lo],
+                              None if lo is None else s.L[lo], s.credit)
+        else:
+            for i, L in enumerate(s.L): L.update(y, s.mu, es[i * s.Wd:(i + 1) * s.Wd], e_glob, s.gate_err)
         s.t += 1
         if s.t >= s.warm and s.t % 64 == 0:                              # consolidation: fixed density 0.6
             for L in s.L: L.structure_step(1.0)

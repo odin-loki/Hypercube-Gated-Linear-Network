@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# make            build the CLI (float64/float32), tests and the CUDA emulator into build/
+# make            build the CLI (float64/float32, and hgln_q: the v5.0 integer net), tests and the CUDA emulator into build/
 # make test       run every test that can run without a GPU (about a minute)
 # make ptx        compile the CUDA kernel to PTX with clang (no CUDA SDK needed), sm_70 and sm_80, float64 and float32
 # make bench      the speed benchmarks quoted in docs/OPTIMISATION.md
@@ -10,16 +10,21 @@ ARCH ?= -march=native
 CXXFLAGS ?= -O3 $(ARCH) -std=c++17 -ffp-contract=off -Wall -Wextra -pthread
 BIN = build
 LIB = include/hgln.hpp include/hgln_gate.h
+QLIB = $(LIB) include/hgln_q.hpp include/hgln_qspec.hpp research/alg/hgln_var.hpp
 KERN = cuda/hgln_kernel.h cuda/hgln_dims.h cuda/hgln_host.h include/hgln_gate.h
 PTXFLAGS = -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version -O3 -ffp-contract=off -Wall -Werror -Icuda -Iinclude -S
-all: $(BIN)/hgln_d $(BIN)/hgln_f $(BIN)/test_api $(BIN)/cuda_emu $(BIN)/cuda_emu_f
+all: $(BIN)/hgln_d $(BIN)/hgln_f $(BIN)/hgln_q $(BIN)/test_api $(BIN)/test_q $(BIN)/cuda_emu $(BIN)/cuda_emu_f
 $(BIN):
 	mkdir -p $(BIN)
 $(BIN)/hgln_d: src/hgln_cli.cpp $(LIB) | $(BIN)
 	$(CXX) $(CXXFLAGS) -Iinclude $< -o $@
 $(BIN)/hgln_f: src/hgln_cli.cpp $(LIB) | $(BIN)
 	$(CXX) $(CXXFLAGS) -DUSE_FLOAT -Iinclude $< -o $@
+$(BIN)/hgln_q: src/hgln_cli.cpp $(QLIB) | $(BIN)
+	$(CXX) $(CXXFLAGS) -DUSE_INT -Iinclude $< -o $@
 $(BIN)/test_api: tests/test_api.cpp $(LIB) | $(BIN)
+	$(CXX) $(CXXFLAGS) -Iinclude $< -o $@
+$(BIN)/test_q: tests/test_q.cpp $(QLIB) | $(BIN)
 	$(CXX) $(CXXFLAGS) -Iinclude $< -o $@
 $(BIN)/cuda_emu: cuda/cuda_emu.cpp $(KERN) $(LIB) | $(BIN)
 	$(CXX) -O2 -std=c++20 -ffp-contract=off -pthread -Wno-psabi -Icuda -Iinclude $< -o $@
@@ -33,8 +38,9 @@ ptx: cuda/hgln_ptx.cu cuda/hgln_dims.h $(KERN) | $(BIN)
 	@! grep -l '\.extern \.func' $(BIN)/*.ptx || (echo "PTX has unresolved external calls" && false)
 test: all
 	sh scripts/run_tests.sh
-bench: $(BIN)/hgln_d $(BIN)/hgln_f
+bench: $(BIN)/hgln_d $(BIN)/hgln_f $(BIN)/hgln_q
 	./$(BIN)/hgln_d bench 8 1 20000 1; ./$(BIN)/hgln_d bench 64 10 3000; ./$(BIN)/hgln_f bench 64 10 3000
+	./$(BIN)/hgln_q bench 8 1 20000 1; ./$(BIN)/hgln_q bench 64 10 3000
 clean:
-	rm -f $(BIN)/hgln_d $(BIN)/hgln_f $(BIN)/test_api $(BIN)/cuda_emu $(BIN)/cuda_emu_f $(BIN)/*.ptx   # leaves CMake build trees under build/ alone
+	rm -f $(BIN)/hgln_d $(BIN)/hgln_f $(BIN)/hgln_q $(BIN)/test_api $(BIN)/test_q $(BIN)/cuda_emu $(BIN)/cuda_emu_f $(BIN)/*.ptx   # leaves CMake build trees under build/ alone
 .PHONY: all test clean ptx bench

@@ -120,7 +120,8 @@ template <class T> long Bank<T>::samples_seen(std::size_t n) const { return p_ &
 
 static bool same_params(const Params& a, const Params& b) {
   return a.glr0 == b.glr0 && a.glr1 == b.glr1 && a.tau == b.tau && a.glob == b.glob && a.mu == b.mu && a.warm == b.warm &&
-         a.competence == b.competence && a.units == b.units && a.fanout == b.fanout;
+         a.competence == b.competence && a.units == b.units && a.fanout == b.fanout &&
+         a.latch == b.latch && a.latch_credit == b.latch_credit && a.gate_err == b.gate_err;
 }
 
 template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::string* why) {
@@ -128,6 +129,8 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
   Impl& I = *p_;
   if (nets.empty()) return fail(why, "no networks");
   const int d = nets[0].d;
+  if (nets[0].P.latch != 0 || nets[0].P.latch_credit != 0 || nets[0].P.gate_err != 0)
+    return fail(why, "the GPU kernel does not support the version 5 latch / latch credit / gate_err options yet");
   if (d < 1 || d > HG_MAXN) return fail(why, "d must be 1.." + std::to_string(HG_MAXN) + " (got " + std::to_string(d) + ")");
   for (auto& n : nets) {
     if (n.d != d) return fail(why, "all networks must have the same d");
