@@ -146,6 +146,18 @@ Every row includes the 4.3 changes; the baseline row is 4.3 itself.
 - The fan-out (H3) has no delay and is the only usable hybrid. It is as good or slightly better before the drift and equal on digits, but re-adapts more slowly after the drift (+0.013 to +0.024 on B and C, every seed set).
 - It saves no work. It shortens the critical path of a sample, which helps where the layers can run concurrently (the GPU). It is offered as the opt-in `Params::fanout`.
 
+**In the library.** `Params::units` (8, 12 or 16) and `Params::fanout` are available on the CPU. Width 16 without fan-out is bit-identical to 4.3. Measured with `hgln_cli bench d nets N 1 units` (FORGE build, AVX-512 table, one thread, best of 3; bytes per network after the prune):
+
+| Units | d=8, 1 net, f64 (µs) | d=8, f32 | d=64, 10 nets, f64 | d=64, 10 nets, f32 | Bytes d=8 (f64) | Bytes d=64 (f64) |
+|---|---|---|---|---|---|---|
+| 16 | 4.26 | 2.43 | 168 | 66.4 | 82,368 | 259,584 |
+| 12 | 3.11 | 2.23 | 96.4 | 52.1 | 52,560 | 185,472 |
+| 8 | 1.96 | 1.30 | 55.3 | 32.6 | 31,200 | 119,808 |
+
+- The cuts are real: 12 units take 0.57-0.73x the time and 0.64-0.71x the memory; 8 units take 0.33-0.54x and 0.38-0.46x.
+- In float32 on AVX-512, 12 units gain less (0.78-0.92x). A layer's 16 per-unit lanes fit one AVX-512 register, while 12 need an 8-lane and a 4-lane instruction.
+- Computing all gates first and running the rule stages at the end gave no measurable CPU speed change (about ±3%), and neither did the fan-out: on one thread the work is the same. Their benefit is on the GPU, where they remove barriers.
+
 ## 5. Parallelism
 
 Within one network, a sample has this dependency structure (exact, no change to the model):

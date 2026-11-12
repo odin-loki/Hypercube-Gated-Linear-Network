@@ -22,7 +22,7 @@ double p = net.step(x, y);          // predict then learn
 | `bool pruned()`, `long t` | Whether the prune has run; samples learned |
 | `size_t model_bytes()` | Bytes held by the model |
 
-`Params`: `glr0`, `glr1`, `tau` (gate-rate schedule), `glob` (global-error share, 0.75), `mu` (rule step, 0.3) and `warm` (prune time, 512). `competence` (default `false`, version 4.3: the mixture is a plain average of the units; `true`, or `Params::v42()`, gives the 4.2 competence-weighted mixture exactly). The constants are documented in `docs/TGN_impl_spec.md` section 2.
+`Params`: `glr0`, `glr1`, `tau` (gate-rate schedule), `glob` (global-error share, 0.75), `mu` (rule step, 0.3) and `warm` (prune time, 512). `units` (units per layer: 16 by default, or 12 or 8, the cost/accuracy trade-off in `ALGORITHM.md` section 4b; anything else throws `std::invalid_argument`). `fanout` (default `false`; `true` makes layers 2 and 3 both read layer 1, so a sample has 2 sequential rule stages instead of 3; it re-adapts a little more slowly after a drift). `competence` (default `false`, version 4.3: the mixture is a plain average of the units; `true`, or `Params::v42()`, gives the 4.2 competence-weighted mixture exactly). The constants are documented in `docs/TGN_impl_spec.md` section 2.
 
 `Work<T>`: per-sample scratch. Make one with `Work<T> w; w.init(net);`. One `Work` can serve any number of networks with the same `d`.
 

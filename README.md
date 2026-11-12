@@ -9,7 +9,9 @@ HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per
 - **Exact norm tracking for the hyperplanes:** the same model, with two passes per hyperplane removed.
 - **A plain average of the units instead of the competence-weighted mixture:** at least as accurate on the benchmarks, and it removes the competence map.
 
-`Params::v42()` gives the previous version exactly. The study also shows the remaining structure (4 hyperplanes, 3 layers of 16, 60% density, per-unit gate weights) all earns its cost.
+`Params::v42()` gives the previous version exactly. Two opt-in settings trade accuracy for speed or parallelism:
+- `Params::units = 12` or `8` (units per layer): about 0.6-0.7x or 0.35-0.5x the time and memory, at a measured cost mostly in re-adaptation after a drift.
+- `Params::fanout`: 2 sequential rule stages per sample instead of 3. The study also shows the remaining structure (4 hyperplanes, 3 layers of 16, 60% density, per-unit gate weights) all earns its cost.
 
 ## Contents
 
