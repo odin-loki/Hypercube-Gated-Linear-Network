@@ -8,7 +8,7 @@ project(HGLN VERSION 4.2.1 LANGUAGES C CXX)
 
 option(HGLN_WITH_FORGE "Build the FORGE SIMD-dispatch and GPU backends" ON)
 option(HGLN_BUILD_TESTS "Build HGLN tests" ON)
-set(FORGE_SOURCE_DIR "" CACHE PATH "Local FORGE checkout (copied and patched in the build tree); empty = fetch FORGE_GIT_TAG")
+set(HGLN_FORGE_SOURCE_DIR "" CACHE PATH "Local FORGE checkout (copied and patched in the build tree); empty = fetch FORGE_GIT_TAG")
 set(FORGE_GIT_REPOSITORY "https://github.com/odin-loki/FORGE" CACHE STRING "FORGE repository")
 set(FORGE_GIT_TAG "b135941680664502fec59924f51d3c3dc11e23e9" CACHE STRING "FORGE commit the patches apply to")
 

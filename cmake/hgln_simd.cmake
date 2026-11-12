@@ -1,4 +1,88 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Placeholder: owned by the SIMD work. Must define target hgln_simd.
-add_library(hgln_simd INTERFACE)
-target_link_libraries(hgln_simd INTERFACE hgln)
+# hgln_simd: HGLN's per-sample layer kernels compiled once per CPU target (src/simd/kernels_<target>.cpp), one table
+# chosen at run time through forge::simd (FORGE_SIMD_TARGET honoured). Targets and flags mirror FORGE's own
+# multiversioned kernels (FORGE CMakeLists, forge_simd_mv); every kernel TU also gets -ffp-contract=off so no
+# multiply-add is fused and all tables give the same bits as the header-only build.
+# Copyright (C) Odin Loch. Licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).
+include(CheckCXXSourceCompiles)
+set(_hs ${PROJECT_SOURCE_DIR}/src/simd)
+option(HGLN_SIMD_FORGE_VEC "float32 kernels on FORGE Tier P vec<float, Tg> (OFF: GCC/Clang vector extensions)" ON)
+
+add_library(hgln_simd STATIC ${_hs}/dispatch.cpp)
+target_link_libraries(hgln_simd PUBLIC hgln forge_simd_mv)
+target_compile_features(hgln_simd PRIVATE cxx_std_23)   # FORGE's headers (dispatch.cpp and the kernel TUs)
+set_target_properties(hgln_simd PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(_hgln_nocontract "/fp:precise")
+else()
+  set(_hgln_nocontract "-ffp-contract=off")
+endif()
+set(_hgln_simd_defs)
+
+# hgln_simd_kernel(<name> <source> [flags...]): one kernel table as an object library linked into hgln_simd.
+function(hgln_simd_kernel name src)
+  add_library(hgln_simd_${name} OBJECT ${src})
+  target_link_libraries(hgln_simd_${name} PRIVATE hgln forge_simd)
+  target_compile_features(hgln_simd_${name} PRIVATE cxx_std_23)
+  target_compile_options(hgln_simd_${name} PRIVATE ${ARGN} ${_hgln_nocontract})
+  target_compile_definitions(hgln_simd_${name} PRIVATE $<$<NOT:$<BOOL:${HGLN_SIMD_FORGE_VEC}>>:HGLN_SIMD_FORGE_VEC=0>)
+  set_target_properties(hgln_simd_${name} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_sources(hgln_simd PRIVATE $<TARGET_OBJECTS:hgln_simd_${name}>)
+endfunction()
+
+# First flag set that compiles a fixed-length scalable-vector probe (as FORGE's forge_probe_flags).
+function(hgln_probe_flags out header type attr bits)
+  foreach(cand IN LISTS ARGN)
+    string(REPLACE "|" ";" _fl "${cand}")
+    string(REPLACE "|" " " CMAKE_REQUIRED_FLAGS "${cand}")
+    unset(_hgln_ok CACHE)
+    check_cxx_source_compiles("#include <${header}>\ntypedef ${type} t __attribute__((${attr}));\nstatic_assert(sizeof(t)*8==${bits});\nint main(){return 0;}" _hgln_ok)
+    if(_hgln_ok)
+      set(${out} "${_fl}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${out} "" PARENT_SCOPE)
+endfunction()
+
+hgln_simd_kernel(scalar ${_hs}/kernels_scalar.cpp)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64" OR (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+  hgln_simd_kernel(neon ${_hs}/kernels_neon.cpp)
+  list(APPEND _hgln_simd_defs HGLN_SIMD_HAVE_NEON=1)
+  foreach(b 128 256 512 1024)
+    hgln_probe_flags(_fl arm_sve.h svfloat32_t "arm_sve_vector_bits(${b})" ${b}
+      "-march=armv8.2-a+sve|-msve-vector-bits=${b}" "-mcpu=generic+sve|-msve-vector-bits=${b}")
+    if(_fl)
+      hgln_simd_kernel(sve${b} ${_hs}/kernels_sve.cpp ${_fl})
+      list(APPEND _hgln_simd_defs HGLN_SIMD_HAVE_SVE${b}=1)
+    endif()
+  endforeach()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+  foreach(b 128 256 512 1024)
+    hgln_probe_flags(_fl riscv_vector.h vfloat32m1_t "riscv_rvv_vector_bits(${b})" ${b}
+      "-march=rv64gcv_zvl${b}b|-mrvv-vector-bits=${b}" "-mcpu=baseline_rv64+v+zvl${b}b|-mrvv-vector-bits=${b}")
+    if(_fl)
+      hgln_simd_kernel(rvv${b} ${_hs}/kernels_rvv.cpp ${_fl})
+      list(APPEND _hgln_simd_defs HGLN_SIMD_HAVE_RVV${b}=1)
+    endif()
+  endforeach()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+  if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    hgln_simd_kernel(avx2 ${_hs}/kernels_avx2.cpp /arch:AVX2)
+    hgln_simd_kernel(avx512 ${_hs}/kernels_avx512.cpp /arch:AVX512)
+  else()
+    hgln_simd_kernel(avx2 ${_hs}/kernels_avx2.cpp -mavx2 -mfma -mf16c)
+    hgln_simd_kernel(avx512 ${_hs}/kernels_avx512.cpp -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
+  endif()
+  list(APPEND _hgln_simd_defs HGLN_SIMD_HAVE_AVX2=1 HGLN_SIMD_HAVE_AVX512=1)
+endif()
+target_compile_definitions(hgln_simd PRIVATE ${_hgln_simd_defs})
+message(STATUS "HGLN: SIMD kernel tables: scalar ${_hgln_simd_defs}")
+
+if(HGLN_BUILD_TESTS)
+  add_executable(hgln_test_simd ${PROJECT_SOURCE_DIR}/tests/test_simd.cpp)
+  target_link_libraries(hgln_test_simd PRIVATE hgln hgln_simd)
+  target_compile_definitions(hgln_test_simd PRIVATE HGLN_WITH_FORGE=1)
+  target_compile_options(hgln_test_simd PRIVATE ${_hgln_nocontract})   # its header-only reference kernels too
+  add_test(NAME hgln_simd_tables COMMAND hgln_test_simd)
+endif()

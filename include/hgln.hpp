@@ -33,6 +33,9 @@
 #include <vector>
 
 #include "hgln_gate.h"
+#if defined(HGLN_WITH_FORGE) || defined(HGLN_SIMD_KERNEL_TU)
+#include "hgln_simd.hpp"   // [SIMD hook] run-time dispatched per-CPU kernels (CMake build with FORGE; see src/simd/)
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define HGLN_RESTRICT __restrict__
@@ -170,9 +173,14 @@ template <class T> struct Work {
   }
 };
 
-#if defined(__GNUC__) && !defined(__clang__)
+// Wide vector types are only passed between inline functions of this header (and within one kernel TU), so the
+// "ABI changes with -mavx..." note does not apply.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpsabi"
+#elif defined(__GNUC__)
 #pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpsabi"   // wide vector types are only passed between inline functions of this header
+#pragma GCC diagnostic ignored "-Wpsabi"
 #endif
 namespace detail {
 // Small fixed-width vectors. With GCC/Clang these are native vector types (lowered to SSE/AVX/AVX-512 or NEON);
@@ -205,13 +213,20 @@ template <class T, int N> inline Vec<T, N> vload(const T* p) { Vec<T, N> r; for 
 template <class T, int N> inline void vstore(T* p, const Vec<T, N>& v) { for (int i = 0; i < N; i++) p[i] = v.v[i]; }
 template <class T, int N> inline Vec<T, N> vzero() { Vec<T, N> r; for (int i = 0; i < N; i++) r.v[i] = 0; return r; }
 #endif
+// The 16-lane vector policy the layer kernels are written against (Layer::forward_k / update_k). The SIMD backend
+// (src/simd/) instantiates the same kernels once per CPU target with its own policy.
+template <class T> struct VxOps {
+  typedef Vec<T, 16> V;
+  static HGLN_INLINE V load(const T* p) { return vload<T, 16>(p); }
+  static HGLN_INLINE void store(T* p, const V& v) { vstore<T, 16>(p, v); }
+  static HGLN_INLINE V zero() { return vzero<T, 16>(); }
+};
 }  // namespace detail
 
 // One layer: U units; each unit = 4 hyperplanes -> 16-corner heatmap -> 16 linear rules blended by the heatmap.
 template <class T> struct Layer {
   static constexpr T BETA = 12;
   static constexpr int U = 16;                               // units per layer
-  typedef detail::Vec<T, 16> V16;
   int n = 0, D = 0, N1 = 0;                                  // inputs, side-info size (d+1), inputs+bias
   int nt = 0;                                                // prune target: active inputs kept per unit
   int cs = 0;                                                // column stride of W / cols (max active columns per unit)
@@ -291,34 +306,44 @@ template <class T> struct Layer {
     return (H.size() + p.size() + W.size() + m.size() + A.size()) * sizeof(T) + (cols.size() + ncol.size()) * sizeof(int32_t);
   }
 
+  // ---- [SIMD hook] With HGLN_WITH_FORGE, forward/update call the kernels compiled for this CPU (hgln_simd.hpp,
+  // chosen once at run time); otherwise, and inside the kernel TUs, they are the inline kernels below.
+#if defined(HGLN_WITH_FORGE) && !defined(HGLN_SIMD_KERNEL_TU)
+  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg) const { simd::layer_kernels<T>().forward(*this, in, u, w, xg); }
+  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { simd::layer_kernels<T>().update(*this, y, mu, glr, es, u, w); }
+#else
+  void forward(const T* in, const T* u, LayerWork<T>& w, T* xg) const { forward_k<detail::VxOps<T>>(in, u, w, xg); }
+  void update(T y, T mu, T glr, const T* es, const T* u, const LayerWork<T>& w) { update_k<detail::VxOps<T>>(y, mu, glr, es, u, w); }
+#endif
+
   // Forward pass for all units. in: n inputs; u: D side-information values; xg: scratch of at least N1.
-  // Lane = unit for everything except the rule dot products (lane = corner).
-  void forward(const T* HGLN_RESTRICT in, const T* HGLN_RESTRICT u, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
-    using detail::vload; using detail::vstore;
+  // Lane = unit for everything except the rule dot products (lane = corner). O: 16-lane vector policy (VxOps).
+  template <class O> void forward_k(const T* HGLN_RESTRICT in, const T* HGLN_RESTRICT u, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
+    typedef typename O::V V16;
     T* HGLN_RESTRICT inp = w.inp.data();
     for (int j = 0; j < n; j++) inp[j] = in[j];
     inp[n] = 1;
     // gates: z_b = sum_i H[i][b] * (p[i] * u[i]), i ascending
-    V16 z0 = detail::vzero<T, 16>(), z1 = z0, z2 = z0, z3 = z0;
+    V16 z0 = O::zero(), z1 = z0, z2 = z0, z3 = z0;
     for (int i = 0; i < D; i++) {
       const T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U];
-      const V16 pu = vload<T, 16>(&p[(size_t)i * U]) * u[i];
-      z0 += vload<T, 16>(Hi) * pu; z1 += vload<T, 16>(Hi + U) * pu;
-      z2 += vload<T, 16>(Hi + 2 * U) * pu; z3 += vload<T, 16>(Hi + 3 * U) * pu;
+      const V16 pu = O::load(&p[(size_t)i * U]) * u[i];
+      z0 += O::load(Hi) * pu; z1 += O::load(Hi + U) * pu;
+      z2 += O::load(Hi + 2 * U) * pu; z3 += O::load(Hi + 3 * U) * pu;
     }
     alignas(64) T zz[4 * U];
-    vstore<T, 16>(zz, z0); vstore<T, 16>(zz + U, z1); vstore<T, 16>(zz + 2 * U, z2); vstore<T, 16>(zz + 3 * U, z3);
+    O::store(zz, z0); O::store(zz + U, z1); O::store(zz + 2 * U, z2); O::store(zz + 3 * U, z3);
     T* HGLN_RESTRICT aw = w.a.data();
     for (int q = 0; q < 4 * U; q++) aw[q] = hgln_gate<T>(zz[q]);                  // 64 gates, [b][unit]
     // 16-corner heatmap h[c] as a tensor product; same multiplication order as the reference (bit 0 first)
     {
-      const V16 a0 = vload<T, 16>(aw), a1 = vload<T, 16>(aw + U), a2 = vload<T, 16>(aw + 2 * U), a3 = vload<T, 16>(aw + 3 * U);
-      const V16 one = detail::vzero<T, 16>() + (T)1;
+      const V16 a0 = O::load(aw), a1 = O::load(aw + U), a2 = O::load(aw + 2 * U), a3 = O::load(aw + 3 * U);
+      const V16 one = O::zero() + (T)1;
       const V16 b0 = one - a0, b1 = one - a1, b2 = one - a2, b3 = one - a3;
       V16 q1[4] = {b0 * b1, a0 * b1, b0 * a1, a0 * a1}, q2[8];
       for (int c = 0; c < 4; c++) { q2[c] = q1[c] * b2; q2[c + 4] = q1[c] * a2; }
       T* HGLN_RESTRICT h = w.h.data();
-      for (int c = 0; c < 8; c++) { vstore<T, 16>(h + c * U, q2[c] * b3); vstore<T, 16>(h + (c + 8) * U, q2[c] * a3); }
+      for (int c = 0; c < 8; c++) { O::store(h + c * U, q2[c] * b3); O::store(h + (c + 8) * U, q2[c] * a3); }
     }
     // rule outputs f[c][unit]: per unit, gather the active inputs and run 16 dot products as one corner-lane accumulator
     T* HGLN_RESTRICT f = w.f.data();
@@ -328,45 +353,45 @@ template <class T> struct Layer {
       for (int q = 0; q < nc; q++) { T v = inp[ck[q]]; xg[q] = v; x2 += v * v; }
       w.x2[k] = x2;
       const T* HGLN_RESTRICT Wk = &W[(size_t)k * cs * 16];
-      V16 acc = detail::vzero<T, 16>();
-      for (int q = 0; q < nc; q++) acc += vload<T, 16>(Wk + q * 16) * xg[q];
+      V16 acc = O::zero();
+      for (int q = 0; q < nc; q++) acc += O::load(Wk + q * 16) * xg[q];
       alignas(64) T fa[16];
-      vstore<T, 16>(fa, acc);
+      O::store(fa, acc);
       for (int c = 0; c < 16; c++) f[c * U + k] = fa[c];
     }
     // mixture of the 16 rules and the competence-weighted confidence, all units at once (c ascending)
     const T* HGLN_RESTRICT h = w.h.data();
-    V16 mix = detail::vzero<T, 16>(), cm = mix;
+    V16 mix = O::zero(), cm = mix;
     for (int c = 0; c < 16; c++) {
-      const V16 hc = vload<T, 16>(h + c * U);
-      mix += hc * vload<T, 16>(f + c * U); cm += hc * vload<T, 16>(&m[c * U]);
+      const V16 hc = O::load(h + c * U);
+      mix += hc * O::load(f + c * U); cm += hc * O::load(&m[c * U]);
     }
     alignas(64) T mx[U];
-    vstore<T, 16>(mx, mix);
+    O::store(mx, mix);
     for (int k = 0; k < U; k++) w.pred[k] = clipv(mx[k], (T)-2, (T)2);
-    vstore<T, 16>(w.comp.data(), (detail::vzero<T, 16>() + (T)1) / (cm + (T)1e-3));
+    O::store(w.comp.data(), (O::zero() + (T)1) / (cm + (T)1e-3));
   }
 
-  void update(T y, T mu, T glr, const T* HGLN_RESTRICT es, const T* HGLN_RESTRICT u, const LayerWork<T>& w) {
-    using detail::vload; using detail::vstore;
+  template <class O> void update_k(T y, T mu, T glr, const T* HGLN_RESTRICT es, const T* HGLN_RESTRICT u, const LayerWork<T>& w) {
+    typedef typename O::V V16;
     const T* HGLN_RESTRICT inp = w.inp.data(); const T* HGLN_RESTRICT h = w.h.data(); const T* HGLN_RESTRICT f = w.f.data();
-    const V16 esv = vload<T, 16>(es);
+    const V16 esv = O::load(es);
     // competence map: m[c] += 0.02 * h[c] * (e^2 - m[c]), e = the unit's own error
     {
-      const V16 e = (detail::vzero<T, 16>() + y) - vload<T, 16>(w.pred.data()), e2 = e * e;
+      const V16 e = (O::zero() + y) - O::load(w.pred.data()), e2 = e * e;
       for (int c = 0; c < 16; c++) {
         T* HGLN_RESTRICT mc = &m[c * U];
-        const V16 mv = vload<T, 16>(mc);
-        vstore<T, 16>(mc, mv + (T)0.02 * vload<T, 16>(h + c * U) * (e2 - mv));
+        const V16 mv = O::load(mc);
+        O::store(mc, mv + (T)0.02 * O::load(h + c * U) * (e2 - mv));
       }
     }
     // gate gradient: F1_b = sum over corners with bit b set of h*f, F0_b = tot - F1_b (c ascending, as the reference)
     alignas(64) T cbs[4][U];                                                      // gate steps [b][unit]
     alignas(64) T c2s[U];
     {
-      V16 tot = detail::vzero<T, 16>(), F1[4] = {tot, tot, tot, tot}, h2 = tot;
+      V16 tot = O::zero(), F1[4] = {tot, tot, tot, tot}, h2 = tot;
       for (int c = 0; c < 16; c++) {
-        const V16 hc = vload<T, 16>(h + c * U), hf = hc * vload<T, 16>(f + c * U);
+        const V16 hc = O::load(h + c * U), hf = hc * O::load(f + c * U);
         tot += hf; h2 += hc * hc;
         if (c & 1) F1[0] += hf;
         if (c & 2) F1[1] += hf;
@@ -375,25 +400,25 @@ template <class T> struct Layer {
       }
       const T* HGLN_RESTRICT aw = w.a.data();
       for (int b = 0; b < 4; b++) {
-        const V16 ab = vload<T, 16>(aw + b * U), F0 = tot - F1[b];
+        const V16 ab = O::load(aw + b * U), F0 = tot - F1[b];
         const V16 g = BETA * (F1[b] * ((T)1 - ab) - F0 * ab);
         alignas(64) T gv[U];
-        vstore<T, 16>(gv, glr * esv * g);
+        O::store(gv, glr * esv * g);
         for (int k = 0; k < U; k++) cbs[b][k] = clipv(gv[k], (T)-0.05, (T)0.05);
       }
       // normalised LMS rate per unit
-      vstore<T, 16>(c2s, (mu * esv) / ((T)1e-3 + h2 * vload<T, 16>(w.x2.data())));
+      O::store(c2s, (mu * esv) / ((T)1e-3 + h2 * O::load(w.x2.data())));
     }
     // rule step: W_c += c2 * h_c * xm for every corner, over the active columns only (lane = corner)
     for (int k = 0; k < U; k++) {
       alignas(64) T sc[16];
       for (int c = 0; c < 16; c++) sc[c] = c2s[k] * h[c * U + k];
-      const V16 scv = vload<T, 16>(sc);
+      const V16 scv = O::load(sc);
       const int nc = ncol[k]; const int32_t* HGLN_RESTRICT ck = &cols[(size_t)k * cs];
       T* HGLN_RESTRICT Wk = &W[(size_t)k * cs * 16];
       for (int q = 0; q < nc; q++) {
         T* Wq = Wk + q * 16;
-        vstore<T, 16>(Wq, vload<T, 16>(Wq) + scv * inp[ck[q]]);
+        O::store(Wq, O::load(Wq) + scv * inp[ck[q]]);
       }
       if (!pruned) {                                                                // activity only feeds the prune
         T* HGLN_RESTRICT Ak = &A[(size_t)k * N1];
@@ -402,31 +427,31 @@ template <class T> struct Layer {
     }
     // all units at once (unit = lane), fused: p step (uses OLD H), hyperplane step (uses OLD p, i.e. the forward
     // pass's p*u), squared norms accumulated on the fly
-    const V16 c0 = detail::vload<T, 16>(cbs[0]), c1 = detail::vload<T, 16>(cbs[1]), c2 = detail::vload<T, 16>(cbs[2]), c3 = detail::vload<T, 16>(cbs[3]);
-    V16 n0 = detail::vzero<T, 16>(), n1 = n0, n2 = n0, n3 = n0;
+    const V16 c0 = O::load(cbs[0]), c1 = O::load(cbs[1]), c2 = O::load(cbs[2]), c3 = O::load(cbs[3]);
+    V16 n0 = O::zero(), n1 = n0, n2 = n0, n3 = n0;
     for (int i = 0; i < D; i++) {
       const T ui = u[i]; T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U]; T* HGLN_RESTRICT pi = &p[(size_t)i * U];
-      V16 h0 = detail::vload<T, 16>(Hi), h1 = detail::vload<T, 16>(Hi + U), h2 = detail::vload<T, 16>(Hi + 2 * U), h3 = detail::vload<T, 16>(Hi + 3 * U);
-      const V16 pv = detail::vload<T, 16>(pi);
+      V16 h0 = O::load(Hi), h1 = O::load(Hi + U), h2 = O::load(Hi + 2 * U), h3 = O::load(Hi + 3 * U);
+      const V16 pv = O::load(pi);
       const V16 dp = ((c0 * h0 * ui + c1 * h1 * ui) + c2 * h2 * ui) + c3 * h3 * ui;   // reference order: dp += cb_b*H_b*u
       const V16 pu = pv * ui;
       h0 += c0 * pu; h1 += c1 * pu; h2 += c2 * pu; h3 += c3 * pu;
-      detail::vstore<T, 16>(Hi, h0); detail::vstore<T, 16>(Hi + U, h1); detail::vstore<T, 16>(Hi + 2 * U, h2); detail::vstore<T, 16>(Hi + 3 * U, h3);
+      O::store(Hi, h0); O::store(Hi + U, h1); O::store(Hi + 2 * U, h2); O::store(Hi + 3 * U, h3);
       n0 += h0 * h0; n1 += h1 * h1; n2 += h2 * h2; n3 += h3 * h3;
       alignas(64) T np[U];
-      detail::vstore<T, 16>(np, pv + dp);
+      O::store(np, pv + dp);
       for (int k = 0; k < U; k++) pi[k] = clipv(np[k], (T)0, (T)3);
     }
     // renormalise each hyperplane. Multiplying by 1/|H| instead of dividing by |H| (as the NumPy reference does)
     // differs by at most 1 ulp per element and avoids D x 64 divisions, the slowest part of the update.
     alignas(64) T inv[4][U];
-    detail::vstore<T, 16>(inv[0], n0); detail::vstore<T, 16>(inv[1], n1); detail::vstore<T, 16>(inv[2], n2); detail::vstore<T, 16>(inv[3], n3);
+    O::store(inv[0], n0); O::store(inv[1], n1); O::store(inv[2], n2); O::store(inv[3], n3);
     for (int b = 0; b < 4; b++) for (int k = 0; k < U; k++) inv[b][k] = (T)1 / std::sqrt(inv[b][k]);
-    const V16 r0 = detail::vload<T, 16>(inv[0]), r1 = detail::vload<T, 16>(inv[1]), r2 = detail::vload<T, 16>(inv[2]), r3 = detail::vload<T, 16>(inv[3]);
+    const V16 r0 = O::load(inv[0]), r1 = O::load(inv[1]), r2 = O::load(inv[2]), r3 = O::load(inv[3]);
     for (int i = 0; i < D; i++) {
       T* HGLN_RESTRICT Hi = &H[(size_t)i * 4 * U];
-      detail::vstore<T, 16>(Hi, detail::vload<T, 16>(Hi) * r0); detail::vstore<T, 16>(Hi + U, detail::vload<T, 16>(Hi + U) * r1);
-      detail::vstore<T, 16>(Hi + 2 * U, detail::vload<T, 16>(Hi + 2 * U) * r2); detail::vstore<T, 16>(Hi + 3 * U, detail::vload<T, 16>(Hi + 3 * U) * r3);
+      O::store(Hi, O::load(Hi) * r0); O::store(Hi + U, O::load(Hi + U) * r1);
+      O::store(Hi + 2 * U, O::load(Hi + 2 * U) * r2); O::store(Hi + 3 * U, O::load(Hi + 3 * U) * r3);
     }
   }
 
@@ -604,7 +629,12 @@ template <class T> struct Classifier {
   size_t model_bytes() const { size_t s = 0; for (auto& g : nets) s += g.model_bytes(); return s; }
 };
 
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
 #pragma GCC diagnostic pop
+// GCC reports -Wpsabi where it emits the out-of-line instantiation, usually the end of the including file, so the
+// push/pop region above does not cover it; keep only this one warning off for the rest of the file.
+#pragma GCC diagnostic ignored "-Wpsabi"
 #endif
 }  // namespace hgln

@@ -1,5 +1,7 @@
 # HGLN optimisation notes (version 4.2-opt)
 
+> **Update:** the CMake build now uses FORGE for run-time SIMD dispatch (faster than the native build below: 4.9 µs at d = 8, 192 µs at d = 64 with 10 nets) and for GPU execution through FORGE's CUDA/HIP runtime. See [FORGE.md](FORGE.md).
+
 **Author:** Odin Loch. Licence: AGPL-3.0-or-later.
 
 This page records what was changed to make the C++ library and the CUDA kernel faster, more parallel and smaller in memory. It covers how each change was checked, what was measured, and what was not done. The algorithm is unchanged: it is still the procedure in `TGN_impl_spec.md` section 4.
@@ -78,8 +80,8 @@ The emulator (`cuda_emu d nets T threads [shared]`) now exits non-zero on a mism
 
 ## 4. Not done, and ideas not tried
 
-- **Runtime CPU dispatch.** The fast path depends on the compile flags. A build without `-march` (plain SSE2) is correct but runs at the original speed (about 15 us at d = 8). `make ARCH=-march=x86-64-v3` gives a binary for any AVX2 machine. FORGE's `simd` layer picks kernels at run time, and so could HGLN (see `FORGE.md`).
-- **FMA contraction.** `-ffp-contract=fast` was about 20% faster at d = 64 in one (noisy) measurement. It changes the last bits relative to the reference, and would break the exact library-vs-kernel agreement unless both are built that way, so it is off.
+- **Runtime CPU dispatch.** *Now done with FORGE, see `FORGE.md`; this item describes the header-only build.* The fast path depends on the compile flags. A build without `-march` (plain SSE2) is correct but runs at the original speed (about 15 us at d = 8). `make ARCH=-march=x86-64-v3` gives a binary for any AVX2 machine. FORGE's `simd` layer picks kernels at run time, and so could HGLN (see `FORGE.md`).
+- **FMA contraction.** It is now explicitly off everywhere (`-ffp-contract=off` in the Makefile, in every SIMD and GPU translation unit, and in the PTX/AMDGPU builds). Correction: g++ defaults to `-ffp-contract=fast` for C++ even with `-std=c++17`, and clang's CUDA mode fuses multiply-adds too. So the measurements in section 1 (Makefile, g++ `-march=native`) were taken with FMAs fused, and the first PTX contained FMAs. With contraction off, every build (g++ or clang, any `-march`, any SIMD table, the fallback path) gives the same output bits.
 - **Splitting one network across threads.** One network's sample costs 2.5 to 15 us, and the layers depend on each other, so a hand-off per layer would cost about as much as it saves. Only independent networks are parallelised.
 - **GPU.** Nothing has run on a GPU. Real-hardware parity, race behaviour and speed are unknown, as before.
 - **Skipping negligible corners** (roadmap item 6 of the implementation spec) changes the algorithm and was not attempted.

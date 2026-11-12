@@ -1,27 +1,103 @@
-# HGLN and FORGE
+# HGLN on FORGE: SIMD and GPU
 
-[FORGE](https://github.com/odin-loki/FORGE) is Odin Loch's C++23 library for running AI models on CPUs and GPUs. It covers runtime SIMD dispatch, GPU runtimes loaded with `dlopen`, a thread pool, NUMA and memory budgets. Both projects are AGPL-3.0-or-later. This page records what HGLN took from FORGE and where FORGE could help further. HGLN itself stays a dependency-free C++17 header, and nothing here makes FORGE a requirement.
+[FORGE](https://github.com/odin-loki/FORGE) is Odin Loch's C++23 library for running AI models on CPUs and GPUs. HGLN's CMake build uses it for two things:
 
-## Used now
+- **SIMD.** It picks, at run time, the CPU kernel table that suits the machine (scalar, AVX2, AVX-512; NEON, SVE and RVV are also built on those architectures).
+- **GPU.** It runs the HGLN kernel through FORGE's CUDA/HIP runtime, with no nvcc, CUDA SDK or ROCm needed at build time.
 
-**Header-free CUDA build with clang (from FORGE's `gpu/` and `ops/gen/gpu_gen.py`).** FORGE builds its CUDA images with
+The header-only library (`include/hgln.hpp`) still works on its own with any C++17 compiler (`make`). FORGE is only needed for the CMake build. Both projects are AGPL-3.0-or-later.
 
-    clang -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_70|sm_80 -O3 -Werror -S
+## Build
 
-It needs no CUDA SDK, reads thread IDs through NVVM builtins and makes no libdevice calls. HGLN now does the same in `cuda/hgln_ptx.cu` (`make ptx`), so its kernel compiles to PTX for sm_70 and sm_80 in float64 and float32. The original kernel had never been compiled for a GPU target. The PTX has no external calls, so a CUDA driver can JIT and load it with `cuModuleLoadData`, which is how FORGE loads its own images. Not done: assembling it with `ptxas` and running it on hardware.
+```sh
+# FORGE needs a C++23 compiler (clang 18 or g++ 14), CMake >= 3.25, Ninja, Python 3
+CXX=clang++-18 CC=clang-18 cmake -S . -B build/forge -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/forge
+ctest --test-dir build/forge          # 15 tests, about 90 s on 4 cores (the GPU mock tests take most of it)
+./build/forge/hgln_cli info           # SIMD table in use, CPU features, tables built
+./build/forge/hgln_gpu info           # GPU devices, or why there are none
+```
 
-## Could use next (not done)
+How FORGE is obtained (`cmake/hgln_forge.cmake`):
 
-| FORGE part | What it would give HGLN | Notes |
-|---|---|---|
-| `gpu::cuda_hip` runtime (dlopen of `libcuda`/`libamdhip64`, PTX loading, streams, graphs) | Running the HGLN kernel on a GPU with no nvcc and no CUDA SDK at build time, using the PTX from `make ptx` | The runtime runs FORGE's own spec ops (`run_op`). It does not expose "load this module and launch that symbol", so HGLN needs either a small generic module/launch entry point in FORGE, or a FORGE op for HGLN. FORGE's CUDA path has run on an RTX 3090, so this is the shortest route to a first real GPU test of HGLN |
-| HIP image build (`--offload-arch=gfx90a ...`) | An AMD GPU build of the same kernel source | The kernel uses only `__syncthreads`, shared memory and plain arithmetic, so the port should be small. Untried |
-| `simd` dispatch (`detect()`, one kernel table per target: scalar, AVX2, AVX-512, NEON, SVE, RVV) | One portable binary that runs the fast path on any CPU | HGLN's speed now depends on `-march`: a plain x86-64 build is correct but about 2.5x slower (OPTIMISATION.md section 4). Compiling `Layer::forward`/`update` once per target and choosing at start-up, as FORGE does, would remove that |
-| `simd/math.hpp` (vectorised exp and friends) | A shared, tested vector exp | HGLN's own `hgln_gate()` already vectorises. Using FORGE's would only remove duplicated code |
-| `task::pool` (`pool::global()`, lock-free dispatch while workers are awake) | One pool shared with the rest of an application, so HGLN never oversubscribes cores when it is embedded next to FORGE inference | HGLN's `ThreadPool`/`parallel_for` fit the same `(item, worker)` shape, so an adapter is a few lines |
-| `os::numa` (node-local allocation, thread binding) and `os::hugepages` | On multi-socket machines, keeping each network's state on the node of the thread that trains it | Matters for the many-network, float64 case, which is partly memory-bound (OPTIMISATION.md section 1) |
-| `mem` budgets (`memory.md`) | Admission control: refuse to create more networks than fit | A network's size is known up front (`Net::model_bytes()`) |
-| `.fpk` model file (BLAKE3, Ed25519 signing, encryption) | Saving, loading, signing and shipping trained HGLN networks | HGLN has no save/load yet. The `Layer` accessors give everything a serialiser needs |
-| `forge-serve` / load balancer | Serving an online learner behind an HTTP API, with predict and learn endpoints | Would need an HGLN session type in FORGE |
+- By default it fetches FORGE at the pinned commit `FORGE_GIT_TAG` (currently `b135941`).
+- Alternatively, `-DHGLN_FORGE_SOURCE_DIR=/path/to/FORGE` uses a local checkout.
+- Either way FORGE is copied into the build tree, patched there with every file in `third_party/forge-patches/` (the checkout itself is never modified), and added as a subproject with its own tests, apps and examples off.
 
-The first two rows are the most direct: they would get HGLN onto real GPUs without nvcc.
+Targets:
+
+| Target | Contents |
+|---|---|
+| `hgln` | The header-only library (INTERFACE) |
+| `hgln_simd` | The dispatched CPU kernels. Linking it and defining `HGLN_WITH_FORGE=1` routes `Layer::forward`/`update` through the chosen table |
+| `hgln_gpu` | `hgln::gpu::Bank`, plus the embedded GPU images |
+| `hgln_cli`, `hgln_cli_f` | The CLI (float64 / float32) with SIMD dispatch, plus `info` |
+| `hgln_gpu` executable | `info`, `selftest`, `bench` on a GPU |
+
+## SIMD: run-time dispatch (`include/hgln_simd.hpp`, `src/simd/`)
+
+- **What is built per target.** The per-sample kernels (`Layer::forward_k` / `update_k` in `hgln.hpp`) are compiled once per CPU target, each in its own translation unit (`src/simd/kernels_<target>.cpp`). The targets and flags are FORGE's: x86-64 scalar; AVX2 (`-mavx2 -mfma -mf16c`); AVX-512 (`-mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma`); aarch64 NEON and SVE per vector length; riscv64 RVV per VLEN. Every TU adds `-ffp-contract=off`.
+- **How the table is chosen.** The table is picked once per process from FORGE's own choice (`forge::simd::active()`). That means FORGE's feature and OS-state checks apply, and `FORGE_SIMD_TARGET=scalar|avx2|avx512|...` forces a table exactly as it does for FORGE. You can also choose in code: `hgln::simd::force("avx2")`, `table(name)`, `targets()` and `install(nullptr)` (back to the automatic choice).
+- **Use of FORGE vectors.** The float32 kernels on AVX2, AVX-512, NEON and SVE (up to 512 bits) use FORGE's portable vectors `forge::simd::vec<float, Target>`. They use only add, sub, mul and div, never FORGE's `fma`, so the operation order stays the reference's. FORGE's vectors are float-only, so the float64 kernels use HGLN's own vector code compiled per target. `-DHGLN_SIMD_FORGE_VEC=OFF` uses HGLN's vector code for float32 too.
+- **Same results on every table.** All tables give bit-identical predictions and model state, equal to the header-only build. `tests/test_simd.cpp` checks this. It covers d = 3, 8 and 64, float32 and float64, past the prune, comparing predictions, unit outputs, all layer state and the const `infer` path. A deliberately contracted (FMA) AVX2 build makes the test fail, so the check is real.
+
+**Speed** (µs per sample; middle of 3 runs; 4-vCPU AVX-512 Xeon; same session):
+
+| | Original code | Makefile `-march=native` | FORGE dispatch: avx512 | avx2 | scalar |
+|---|---|---|---|---|---|
+| d = 8, 1 net, float64 | 14.3 | 6.6 | **4.9** | 6.4 | 9.1 |
+| d = 64, 10 nets, float64, 1 thread | 492 | 241 | **192** | 220 | 323 |
+| same, nets on 4 threads | | 57 | **35** | 56 | 75 |
+| d = 64, 10 nets, float32, 1 thread | 334 | 75 | 78 | 81 | |
+| same, nets on 4 threads | | 22 | **20** | 27 | |
+
+The dispatched AVX-512 table is the fastest build in float64 and about equal to the native build in float32. A portable binary no longer loses the fast path: the AVX2 table is roughly native speed in float64. Without dispatch, a build with no `-march` ran the d = 8 case at 9 to 13 µs.
+
+Not tested: the NEON, SVE and RVV tables were syntax-checked with clang for aarch64 and riscv64, but not compiled to code or run (no cross toolchain or qemu here). RVV at 128 bits fails inside FORGE's `vec.hpp` with clang 18, as FORGE's own RVV kernels do. The MSVC branch of `cmake/hgln_simd.cmake` is untested.
+
+## GPU: FORGE's CUDA/HIP runtime (`include/hgln_gpu.hpp`, `src/gpu/`)
+
+```cpp
+hgln::gpu::Bank<double> bank; std::string why;
+if (!bank.open(hgln::gpu::Api::cuda, 0, &why)) { /* no GPU: `why` says why; use the CPU library */ }
+bank.upload(nets);              // std::vector<hgln::Net<double>>, same d and Params
+bank.run(X, Y, P, T);           // X: T x d shared input stream; Y, P: nets x T; state stays on the device
+bank.download(nets);            // back into the CPU networks
+```
+
+- **Kernel images.** `cuda/hgln_ptx.cu` is a header-free wrapper around `cuda/hgln_kernel.h`. CMake compiles it with FORGE's clang (no SDK) into:
+  - PTX for sm_80 and sm_70;
+  - AMDGPU code objects for gfx90a, gfx942 and gfx1100 (FORGE's `FORGE_HIP_ARCHS`).
+
+  Each is built in float64 and float32, with `-ffp-contract=off`. Each image is checked for unresolved symbols, then embedded in the library. If clang lacks a backend, those images are skipped with a message.
+- **Runtime.** `Bank::open(Api::cuda | Api::hip, ordinal, &why, Options{threads, scratch})` opens a `forge::gpu::cuda_hip::runtime`, which dlopens `libcuda` or `libamdhip64`. It then loads the first image the device accepts: sm_80 before sm_70, or the matching gfx target. `HGLN_GPU_IMAGE` forces one.
+- **Scratch.** The per-sample scratch goes in dynamic shared memory when it fits (CUDA opt-in above 48 KB), otherwise in global memory. `Options::scratch` or `HGLN_GPU_SCRATCH` can force either.
+- **FORGE patch.** FORGE's runtime had no public way to load a caller's module, so HGLN carries `third_party/forge-patches/0001-gpu-cuda-hip-caller-modules.patch`. It adds about 45 lines to `forge/gpu/cuda.hpp`: `load_module`, `module_function`, `unload_module`, `max_dynamic_smem`, `set_dynamic_smem` and `launch_kernel`. Each takes the runtime's lock and binds its context. It is written so it can be merged into FORGE as is, after which the patch file can be deleted.
+
+**Tests without a GPU.** `tests/mock_hgln.c` builds stand-ins for `libcuda.so.1` and `libamdhip64.so.6`. They export every entry point FORGE's runtime needs and behave like a driver in these ways:
+
+- they refuse a PTX newer than the mock's architecture, and a code object for another gfx target;
+- they enforce the shared-memory limits;
+- they run the real kernel source on CPU threads, with one barrier per `__syncthreads` and shared memory pre-filled with NaN.
+
+The ctests drive the full path: CPU `Net` → `Bank` → FORGE runtime → mock driver → download. They cover CUDA and HIP; sm_80, sm_70, gfx90a and gfx1100; d = 8, 64 and 100; shared and global scratch; five calls with state resident, crossing the prune; and a mid-stream download and re-upload. Results:
+
+- float64 predictions and state match the CPU library **exactly** (0 difference);
+- float32 is within about 1e-6;
+- a device with too little shared memory falls back to global scratch;
+- a missing driver gives a clear reason.
+
+**Not verified:** nothing has run on real GPU hardware. The PTX has not been through ptxas or a driver JIT, and the AMD code objects have not been loaded by ROCm. Real-hardware results may differ from the CPU in the last bits in float64, because the device `exp` and `sqrt` are not glibc's, so the GPU selftest uses a 1e-9 tolerance there. HIP's shared-memory limit is assumed to be 64 KB, not queried. Speed on a GPU is unknown.
+
+`cuda/hgln_cuda.cu` (the nvcc runtime-API host) is kept as an alternative for anyone with the CUDA SDK. It has never been compiled.
+
+## Other FORGE parts that could help later (not done)
+
+| FORGE part | Use for HGLN |
+|---|---|
+| `task::pool` (one process-wide pool) | Share threads with the rest of an application instead of HGLN's own `ThreadPool` |
+| `os::numa`, `os::hugepages` | Keep each network's state on its thread's NUMA node (the many-network float64 case is partly memory-bound) |
+| `mem` budgets | Admission control when creating many networks (`Net::model_bytes()` is known up front) |
+| `.fpk` model files (signing, encryption) | Saving and shipping trained networks |
+| `forge-serve` | An HTTP endpoint for online predict and learn |
+| Vulkan / OpenCL / Level Zero / Metal runtimes | More GPU vendors; each needs the kernel in that backend's language |

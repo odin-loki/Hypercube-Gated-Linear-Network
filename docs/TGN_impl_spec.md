@@ -10,7 +10,8 @@
 | C++17 library, float64 and float32 | Built and verified against the NumPy reference (section 6) |
 | SIMD tuning, pruned-column compaction, multithreading | Done (section 8, `OPTIMISATION.md`); verified by the same parity tests and by threaded-equals-serial tests |
 | Speed measurement | Measured before and after on one 4-vCPU machine (section 7) |
-| CUDA kernel | Written. It matches the library exactly on a CPU emulator and compiles to PTX for sm_70 and sm_80 with clang (no CUDA SDK). Not run on a GPU; the nvcc host program has not been compiled |
+| CUDA / HIP kernel | Runs through FORGE's CUDA/HIP runtime (`FORGE.md`) and matches the library exactly against a mock driver. Built as PTX (sm_70, sm_80) and AMD code objects with clang, no SDK. Not run on real GPU hardware |
+| Run-time SIMD dispatch | Done with FORGE: scalar, AVX2 and AVX-512 tables, bit-identical |
 
 The library reproduces the algorithm (differences of about 1e-15 in float64 and about 1e-6 in float32 on prediction values). It is still slower than a matched small MLP, but the gap is now 3x at d = 8 and 3 to 9x at d = 64 (section 7).
 

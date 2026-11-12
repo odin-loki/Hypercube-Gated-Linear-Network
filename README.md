@@ -1,6 +1,6 @@
 # HGLN: Hypercube Gated Linear Network
 
-**Author:** Odin Loch (odin-loki). Version 4.2 (optimised build). Licence: [AGPL-3.0-or-later](LICENSE).
+**Author:** Odin Loch (odin-loki). Version 4.2.1. Licence: [AGPL-3.0-or-later](LICENSE). Uses [FORGE](https://github.com/odin-loki/FORGE) for run-time SIMD dispatch and GPU execution ([docs/FORGE.md](docs/FORGE.md)).
 
 HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per sample. It has three layers of 16 units. Each unit learns 4 hyperplanes that carve the input into 16 regions, and blends 16 linear rules by a soft heatmap over those regions. The output is a weighted mixture of all 48 units, and each unit learns partly from its share of the mixture's error. There is no backpropagation, no batching and no stored data.
 
@@ -10,14 +10,18 @@ HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per
 |---|---|
 | `include/hgln.hpp` | Header-only C++17 library: `Net<T>` (regression), `Classifier<T>` (one-vs-rest), `run_streams`, thread helpers. API: [docs/API.md](docs/API.md) |
 | `include/hgln_gate.h` | The gate nonlinearity, shared by the library and the CUDA kernel |
+| `include/hgln_simd.hpp`, `src/simd/` | FORGE build: CPU kernels compiled per target (scalar, AVX2, AVX-512, NEON, SVE, RVV), chosen at run time |
+| `include/hgln_gpu.hpp`, `src/gpu/` | FORGE build: `hgln::gpu::Bank`, many networks on a GPU through FORGE's CUDA/HIP runtime; `hgln_gpu` tool |
+| `CMakeLists.txt`, `cmake/`, `third_party/forge-patches/` | CMake build that fetches and patches FORGE |
 | `src/hgln_cli.cpp` | CLI: `parity`, `bench`, `classify` (built as `build/hgln_d` float64 and `build/hgln_f` float32) |
-| `cuda/hgln_kernel.h` | CUDA kernel: one block per network, many networks in parallel. Compiles to PTX; **never run on a GPU** |
-| `cuda/hgln_ptx.cu` | Header-free wrapper that builds the kernel to PTX with plain clang, no CUDA SDK (`make ptx`) |
+| `cuda/hgln_kernel.h` | GPU kernel: one block per network, many networks in parallel. Built for CUDA and HIP; **never run on a GPU** |
+| `cuda/hgln_ptx.cu` | Header-free wrapper that builds the kernel to PTX / AMDGPU code with plain clang, no SDK |
 | `cuda/hgln_cuda.cu` | nvcc host program (`selftest`, `bench`). **Never compiled** (no nvcc available) |
 | `cuda/cuda_emu.cpp` | Runs the kernel source on the CPU and compares it with the C++ library |
 | `python/hgln_ref.py` | NumPy reference implementation (the oracle) |
 | `python/parity.py`, `python/digits_test.py` | NumPy-vs-C++ parity test and digits accuracy test |
 | `tests/test_api.cpp` | C++ behavioural tests, including threaded-equals-serial checks |
+| `tests/test_simd.cpp`, `tests/test_gpu.cpp`, `tests/mock_hgln.c` | Every SIMD table bit-identical; the full GPU path against a mock CUDA/HIP driver |
 | `docs/TGN_spec.md`, `docs/TGN_impl_spec.md` | Algorithm spec and implementation spec |
 | `docs/OPTIMISATION.md` | What was optimised, how it was checked, measurements |
 | `docs/API.md`, `docs/FORGE.md` | C++ API reference; relation to FORGE |
@@ -26,10 +30,19 @@ HGLN is a stateless online learner: call `predict(x)`, then `learn(y)`, once per
 
 ## Build and test
 
-You need g++ or clang++ (C++20 for the emulator), and Python 3 with numpy and scikit-learn. `make ptx` also needs clang with the NVPTX backend.
+**With FORGE (recommended).** You need clang 18 or g++ 14, CMake 3.25 or newer, Ninja, and Python 3 with numpy and scikit-learn. FORGE is fetched at a pinned commit and patched in the build tree.
+
+    CXX=clang++-18 CC=clang-18 cmake -S . -B build/forge -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build build/forge && ctest --test-dir build/forge     # 15 tests, about 90 s
+    ./build/forge/hgln_cli info                                   # which SIMD table this CPU uses
+    ./build/forge/hgln_gpu info                                   # GPUs found, or why not
+
+This gives one portable binary that picks its CPU kernels at run time, plus the GPU library and tool. Pass `-DHGLN_FORGE_SOURCE_DIR=/path/to/FORGE` to use a local checkout.
+
+**Header-only, no dependencies.** You need g++ or clang++ (C++20 for the emulator), and Python 3 with numpy and scikit-learn. `make ptx` also needs clang with the NVPTX backend.
 
     make            # builds into build/
-    make test       # everything below that can run without a GPU (about 25 seconds)
+    make test       # parity, emulator, PTX, digits (about 25 seconds)
     make bench      # speed benchmarks
     make ARCH=-march=x86-64-v3   # binaries for other AVX2 machines (default: -march=native)
 
@@ -54,19 +67,19 @@ clf.predict_batch(X, N, out);                // parallel over samples
 clf.set_threads(4);                          // optional: parallel heads inside each single train()/predict()
 ```
 
-Many independent networks on one stream, in parallel: `hgln::run_streams(nets, X, Y, P, N)`. Concurrent read-only prediction from one network: `net.infer(x, work)`, with one `hgln::Work` per thread. Inputs should be scaled to roughly [-1, 1]. The gate rate depends on the task (spec section 5).
+Many independent networks on one stream, in parallel: `hgln::run_streams(nets, X, Y, P, N)` on the CPU, or `hgln::gpu::Bank` on a GPU (FORGE build, [docs/API.md](docs/API.md)). Concurrent read-only prediction from one network: `net.infer(x, work)`, with one `hgln::Work` per thread. Inputs should be scaled to roughly [-1, 1]. The gate rate depends on the task (spec section 5).
 
 ## Performance
 
 Measured on a 4-vCPU Xeon with AVX-512, original and optimised builds in the same session (details and method in [docs/OPTIMISATION.md](docs/OPTIMISATION.md)):
 
-| Microseconds per sample | Original | Optimised, 1 thread | Optimised, 4 threads | Matched MLP |
-|---|---|---|---|---|
-| d = 8, 1 network, float64 | 14.3 | 6.0 | (one network) | 2.0 |
-| d = 64, 10 networks, float64 | 492 | 246 | 52 | 26 |
-| d = 64, 10 networks, float32 | 334 | 72.5 | 22.6 | 26 |
+| Microseconds per sample | Original | Header-only, `-march=native` | FORGE build (AVX-512 table), 1 thread | FORGE build, 4 threads | Matched MLP |
+|---|---|---|---|---|---|
+| d = 8, 1 network, float64 | 14.3 | 6.6 | 4.9 | (one network) | 2.0 |
+| d = 64, 10 networks, float64 | 492 | 241 | 192 | 35 | 26 |
+| d = 64, 10 networks, float32 | 334 | 75 | 78 | 20 | 26 |
 
-Memory per network is about 33% lower after the prune at sample 512 (278 KB vs 417 KB at d = 64, float64). The arithmetic is unchanged: float64 parity with NumPy is 1.8e-15 to 2.9e-15, the digits run gives the same 98.5%, and the CUDA kernel on the emulator matches the library exactly.
+Memory per network is about 33% lower after the prune at sample 512 (278 KB vs 417 KB at d = 64, float64). The FORGE build's portable binary is as fast as or faster than a native build. Its AVX2 table, for older CPUs, runs at about native speed in float64. The arithmetic is unchanged: float64 parity with NumPy is 1.8e-15 to 2.9e-15, the digits run gives the same 98.5%, and the CUDA kernel on the emulator matches the library exactly.
 
 ## What was tested (CPU only)
 
@@ -76,14 +89,16 @@ Memory per network is about 33% lower after the prune at sample 512 (278 KB vs 4
 | NumPy vs C++ parity, 2,000 samples, same start | float64 2.9e-15 (d = 8), 1.8e-15 (d = 64); float32 1.3e-6, 1.2e-6. Also with clang++, without `-march`, and with the non-vector fallback |
 | CUDA kernel on the CPU emulator vs C++ | float64 exact (0 difference) for d = 8, 64, 100 and several thread counts, with scratch in global and in shared memory; float32 about 1e-6 |
 | CUDA kernel compiled to PTX (clang 18, sm_70 and sm_80, float64 and float32) | compiles with `-Werror`, no unresolved calls |
+| FORGE SIMD tables (scalar, AVX2, AVX-512) | bit-identical to each other and to the header-only build (predictions and full state) |
+| GPU path through FORGE's CUDA/HIP runtime, against a mock driver that runs the real kernel on CPU threads | float64 exact (0 difference) vs the CPU library; CUDA and HIP; sm_80, sm_70, gfx90a, gfx1100; shared and global scratch; state resident over 5 calls; download and re-upload |
 | Digits, C++ classifier, one shuffle, 3 passes | 98.5% holdout (599 samples), the same as before optimising. The C++ uses different random starting hyperplanes from the NumPy runs, so this is one more draw, not a replication of the 97.0% mean over 5 shuffles in the spec |
 
 ## What was not tested
 
-- **CUDA on a GPU.** The kernel now compiles to PTX with clang and runs correctly on the CPU emulator. Assembly by ptxas, real execution, race behaviour on hardware and speed are all unknown, and `hgln_cuda.cu` has not been compiled. For one stream at batch size 1, expect latency to be dominated by kernel launches; the design targets many networks at once.
+- **A real GPU.** The kernel builds to PTX and AMD code objects and runs correctly through FORGE's runtime against a mock driver. No real driver has loaded it: ptxas, the JIT, ROCm, race behaviour on hardware and speed are all unknown. `hgln_cuda.cu` (nvcc) has never been compiled. For one stream at batch size 1, expect latency to be dominated by kernel launches; the design targets many networks at once.
 - Real-world datasets other than digits; widths above 16; stronger baselines. The spec lists the selection effects behind its numbers.
 - Inputs above 128 dimensions in the CUDA kernel (the prune scratch is fixed at 128; the C++ library has no such limit).
-- Builds for non-x86 CPUs (the code is portable C++17 but was only run on x86-64).
+- Non-x86 CPUs. The NEON, SVE and RVV tables were only syntax-checked; the code was only run on x86-64.
 
 ## Notes
 

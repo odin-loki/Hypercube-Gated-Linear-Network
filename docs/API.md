@@ -71,4 +71,31 @@ The internal layout is built for SIMD and keeps only active columns. These acces
 
 - `-O3 -march=native` (or a fixed `-march`) is needed for the fast path. Without it the code is correct but runs at about the original speed.
 - `-DHGLN_NO_VECTOR_EXT` forces the plain C++ fallback, for testing.
-- For results that match the reference and the CUDA emulator to the last bit, build without FMA contraction. GCC with `-std=c++17` (not `gnu++17`) already does this. Clang contracts by default, so pass `-ffp-contract=off`. With contraction the results still pass parity (about 1e-15), and it is about 20% faster at d = 64 in one measurement.
+- Build with `-ffp-contract=off` (the Makefile and CMake builds do) for results that match the reference, every SIMD table and the GPU kernel to the last bit. g++ fuses multiply-adds by default even with `-std=c++17`, and clang does too. With contraction the results still pass parity (about 1e-15).
+
+## FORGE builds (CMake): SIMD dispatch and GPU
+
+See [FORGE.md](FORGE.md) for the build. Both need the CMake build; the header-only library does not.
+
+**SIMD** (`include/hgln_simd.hpp`, target `hgln_simd`, compile with `HGLN_WITH_FORGE=1`): `Layer::forward`/`update` run through one kernel table chosen at run time. Nothing changes in user code.
+
+| Call | Meaning |
+|---|---|
+| `hgln::simd::active().target` | Table in use: `"scalar"`, `"avx2"`, `"avx512"`, `"neon"`, `"sve"`, `"rvv"` |
+| `hgln::simd::targets()` | Null-terminated list of tables built into the binary |
+| `hgln::simd::force(name)` / `table(name)` | Use a specific table / get it (false / nullptr if this CPU cannot run it) |
+| `hgln::simd::install(nullptr)` | Return to the automatic choice |
+| `FORGE_SIMD_TARGET=name` | Environment override, as for FORGE |
+
+**GPU** (`include/hgln_gpu.hpp`, target `hgln_gpu`):
+
+| Call | Meaning |
+|---|---|
+| `hgln::gpu::device_count(Api::cuda / Api::hip)` | 0 if there is no driver or no device |
+| `Bank<T>::open(api, ordinal, &why, Options{threads, scratch})` | Open a device through FORGE's runtime and load the matching HGLN image |
+| `upload(nets)` | Copy networks (same `d` and `Params`) to the device |
+| `run(X, Y, P, samples)` | X: samples x d (shared stream); Y, P: nets x samples. Same as the CPU predict/learn loop per network; state stays on the device |
+| `download(nets)` | State and sample counts back into CPU networks |
+| `image()`, `device_name()`, `shared_scratch()`, `scratch_bytes()` | What was chosen |
+
+Environment: `HGLN_GPU_IMAGE` (force an image), `HGLN_GPU_SCRATCH=shared|global`, `HGLN_GPU_THREADS`. A `Bank` is not thread-safe; use one per thread.

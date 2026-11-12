@@ -5,6 +5,7 @@
 //                                                          parallel (threads: 0 or omitted = all hardware threads)
 //   hgln_cli classify train.csv test.csv passes [threads]  one-vs-rest classifier, heads trained in parallel;
 //                                                          CSV rows: label,f1..fd (features scaled to about [-1,1])
+//   hgln_cli info                                          build and CPU: SIMD kernel table in use (FORGE build)
 #include "hgln.hpp"
 #include <chrono>
 #include <cstdio>
@@ -49,8 +50,23 @@ static bool read_csv(const char* path, std::vector<real>& X, std::vector<int>& y
   return d > 0;
 }
 
+#ifdef HGLN_WITH_FORGE
+static const char* simd_target() { return simd::active().target; }   // FORGE_SIMD_TARGET=scalar|avx2|avx512|... forces one
+#else
+static const char* simd_target() { return "header"; }               // header-only build: kernels inlined at compile time
+#endif
+
 int main(int argc, char** argv) {
   std::string mode = argc > 1 ? argv[1] : "";
+  if (mode == "info") {
+    printf("real: %s\nsimd target: %s\n", sizeof(real) == 4 ? "float32" : "float64", simd_target());
+#ifdef HGLN_WITH_FORGE
+    printf("cpu: %s\ntables:", simd::cpu_summary().c_str());
+    for (const char* const* n = simd::targets(); *n; n++) printf(" %s%s", *n, simd::table(*n) ? "" : "(unusable)");
+    printf("\n");
+#endif
+    return 0;
+  }
   if (mode == "parity" && argc >= 4) {            // in.bin: int32 d, int32 N, H0,H1,H2 (doubles, 16x4x(d+1) each), X (N*d), y (N)
     FILE* f = fopen(argv[2], "rb"); if (!f) { perror("in.bin"); return 1; }
     int32_t d, N; if (fread(&d, 4, 1, f) != 1 || fread(&N, 4, 1, f) != 1) return 1;
@@ -96,9 +112,9 @@ int main(int argc, char** argv) {
     t0 = now(); run_streams(G, X.data(), (const real*)nullptr, P.data(), N, threads); double tbp = us(t0, now()) / N;
     for (real v : P) sink += v;
     printf("{\"d\":%d,\"nets\":%d,\"real\":\"%s\",\"hgln_us_per_sample\":%.2f,\"hgln_predict_only_us\":%.2f,\"mlp3x16_us_per_sample\":%.2f,"
-           "\"threads\":%d,\"batched_us_per_sample\":%.2f,\"batched_predict_only_us\":%.2f,"
+           "\"simd\":\"%s\",\"threads\":%d,\"batched_us_per_sample\":%.2f,\"batched_predict_only_us\":%.2f,"
            "\"model_bytes_per_net_initial\":%zu,\"model_bytes_per_net_after_prune\":%zu,\"sink\":%g}\n",
-           d, nets, sizeof(real) == 4 ? "float32" : "float64", th, tp, tm, threads, tb, tbp, bytes0, G[0].model_bytes(), (double)sink);
+           d, nets, sizeof(real) == 4 ? "float32" : "float64", th, tp, tm, simd_target(), threads, tb, tbp, bytes0, G[0].model_bytes(), (double)sink);
     return 0;
   }
   if (mode == "classify" && argc >= 5) {
@@ -115,6 +131,6 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
-  fprintf(stderr, "usage: hgln_cli parity in.bin out.bin [glr0 glr1] | bench d nets nsamples [threads] | classify train.csv test.csv passes [threads]\n");
+  fprintf(stderr, "usage: hgln_cli parity in.bin out.bin [glr0 glr1] | bench d nets nsamples [threads] | classify train.csv test.csv passes [threads] | info\n");
   return 1;
 }
