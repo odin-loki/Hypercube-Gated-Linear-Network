@@ -34,7 +34,9 @@ struct Var {
   bool pipeline = false;
   double theta = 0;          // > 0: Schmitt-trigger flip-flop gates: set = sig(12(z-theta)), reset = sig(12(-z-theta)),
                              //      a = set + (1 - set - reset) a_prev  (theta = 0 is exactly the stateless gate)
-  int theta_mode = 0;        // 0: theta for every bit; 1: only odd units latched (mixed population); 2: theta learned per bit
+  int theta_mode = 0;        // 0: theta for every bit; 1: only odd units latched (mixed population); 2: theta learned per bit;
+                             // 3: stateless settled latch a = set/(set+reset); 4: stateless cross-layer latch (previous state =
+                             //    the same unit's bit in the layer this one reads from, same sample; layer 1 stateless)
   double theta_lr = 0.05;
   double theta0 = 0;         // initial theta (theta_mode 2)    // learning rate of theta (theta_mode 2)
   int sparse_k = 0;          // > 0: hard corners - each unit uses only its top-k corners (weights renormalised)
@@ -88,6 +90,7 @@ struct Layer {
       nn = std::sqrt(nn); for (int i = 0; i < D; i++) H[(size_t)k * D + i] = v[i] / nn;
     }
   }
+  const double* lower_a = nullptr;   // cross-layer latch: gate bits of the layer this one reads from (set by the net)
   void forward(const double* in, const double* side, const Var& V, const Layer* owner = nullptr) {
     for (int j = 0; j < n; j++) inp[j] = qn(in[j], V.abits, 1);
     inp[n] = 1;
@@ -102,7 +105,22 @@ struct Layer {
         z[(size_t)k * K + b] = zz;
         const size_t ib = (size_t)k * K + b;
         const double thv = V.theta_mode == 2 ? th[ib] : (V.theta_mode == 1 && (k & 1) == 0 ? 0.0 : V.theta);
-        if (V.theta > 0 && (thv > 0 || V.theta_mode == 2)) {   // SR flip-flop with a dead band: holds its previous value when |z| < theta
+        if (V.theta > 0 && V.theta_mode == 3) {   // settled (fixed-point) state of the SR latch: stateless
+          double st = 1 / (1 + std::exp(-12 * (zz - V.theta))), rt = 1 / (1 + std::exp(-12 * (-zz - V.theta)));
+          double av = st / (st + rt);
+          a[ib] = std::min(std::max(av, 1e-4), 1 - 1e-4);
+          kap[ib] = st * rt * (2 - st - rt) / ((st + rt) * (st + rt));   // d a / d (12 z)
+          ap[ib] = a[ib];
+        } else if (V.theta > 0 && V.theta_mode == 4 && !lower_a) {   // first layer of a cross-layer latch: plain gate
+          double sg = 1 / (1 + std::exp(-12 * zz));
+          a[ib] = std::min(std::max(sg, 1e-4), 1 - 1e-4); kap[ib] = a[ib] * (1 - a[ib]); ap[ib] = a[ib];
+        } else if (V.theta > 0 && V.theta_mode == 4) {   // cross-layer latch: holds the lower layer's bit inside the band
+          double st = 1 / (1 + std::exp(-12 * (zz - V.theta))), rt = 1 / (1 + std::exp(-12 * (-zz - V.theta))), q0 = lower_a[ib];
+          double av = st + (1 - st - rt) * q0;
+          a[ib] = std::min(std::max(av, 1e-4), 1 - 1e-4);
+          kap[ib] = st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0;
+          ap[ib] = a[ib];
+        } else if (V.theta > 0 && (thv > 0 || V.theta_mode == 2)) {   // SR flip-flop with a dead band: holds its previous value when |z| < theta
           double st = 1 / (1 + std::exp(-12 * (zz - thv))), rt = 1 / (1 + std::exp(-12 * (-zz - thv))), q0 = ap[ib];
           double av = st + (1 - st - rt) * q0;
           a[ib] = std::min(std::max(av, 1e-4), 1 - 1e-4);
@@ -266,6 +284,8 @@ struct Net {
         sd[V.U] = 1; q = std::sqrt(q); for (auto& s : sd) s /= q;
       }
       L[l].pold = L[l].p;
+      L[l].lower_a = nullptr;
+      if (V.theta_mode == 4 && l > 0) L[l].lower_a = (V.hybrid == 3 && l == 2) ? L[0].a.data() : L[l - 1].a.data();
       L[l].forward(in, sd.data(), V, (V.share_gates && l > 0) ? &L[0] : nullptr);
     }
     if (V.pipeline || V.hybrid) for (int l = 0; l < V.layers; l++) for (int k = 0; k < V.U; k++) prev[(size_t)l * V.U + k] = L[l].pred[k];
