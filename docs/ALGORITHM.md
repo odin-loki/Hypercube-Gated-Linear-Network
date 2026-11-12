@@ -131,6 +131,21 @@ Every row includes the 4.3 changes; the baseline row is 4.3 itself.
 
 **Pipelined layers (rejected).** Here layer 2 and layer 3 read the layer below's outputs from the previous sample. That would make all three rule stages independent, leaving the mixture as the only step that has to wait. It is much worse on every score (+0.03 to +0.13 NMSE, digits −1.7), so the chain between the layers within a sample is essential.
 
+**Hybrid rule stages.** These keep part of the chain, so a sample needs 2 sequential rule stages instead of 3. All have the same cost as 4.3. NMSE change against 4.3, same seeds, with wins out of 10 (out of 5 for digits):
+
+| Hybrid | A pre | A post | B pre | B post | C pre | C post | Digits |
+|---|---|---|---|---|---|---|---|
+| H1: L3 reads the previous sample's L2 | +0.010 (0) | +0.017 (0) | +0.016 (1) | +0.055 (0) | +0.010 (2) | +0.045 (0) | -0.60 (2) |
+| H2: L2 reads the previous sample's L1 | +0.038 (0) | +0.039 (0) | +0.035 (0) | +0.051 (0) | +0.018 (3) | +0.054 (0) | -1.56 (0) |
+| H4: L3 reads the mean of the previous L2 and the current L1 | +0.008 (0) | +0.016 (0) | +0.008 (2) | +0.047 (0) | +0.007 (1) | +0.035 (1) | -0.33 (1) |
+| **H3, fan-out: L2 and L3 both read the current L1**, seed set 0 | -0.005 (9) | +0.004 (2) | -0.000 (6) | +0.020 (3) | +0.004 (0) | +0.024 (1) | +0.04 (2) |
+| H3, seed set 1 | -0.007 (10) | +0.003 (1) | -0.002 (7) | +0.013 (2) | +0.003 (1) | +0.024 (0) | -0.24 (1) |
+| H3, seed set 2 | -0.004 (10) | +0.002 (2) | +0.002 (3) | +0.023 (1) | +0.005 (2) | +0.020 (1) | +0.07 (3) |
+
+- Any one-sample delay hurts.
+- The fan-out (H3) has no delay and is the only usable hybrid. It is as good or slightly better before the drift and equal on digits, but re-adapts more slowly after the drift (+0.013 to +0.024 on B and C, every seed set).
+- It saves no work. It shortens the critical path of a sample, which helps where the layers can run concurrently (the GPU). It is offered as the opt-in `Params::fanout`.
+
 ## 5. Parallelism
 
 Within one network, a sample has this dependency structure (exact, no change to the model):

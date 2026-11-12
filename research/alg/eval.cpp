@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
     else if (k == "no_p") V.no_p = v != 0; else if (k == "gate_src") V.gate_src = (int)v; else if (k == "proj") V.proj = (int)v;
     else if (k == "share_gates") V.share_gates = v != 0; else if (k == "p_shared") V.p_shared = v != 0;
     else if (k == "norm_track") V.norm_track = v != 0; else if (k == "density") V.density = v; else if (k == "glob") V.glob = v; else if (k == "mu") V.mu = v;
-    else if (k == "pipeline") V.pipeline = v != 0; else if (k == "gate_every") V.gate_every = (int)v; else if (k == "seed_off") seed_off = (int)v;
+    else if (k == "hybrid") V.hybrid = (int)v; else if (k == "pipeline") V.pipeline = v != 0; else if (k == "gate_every") V.gate_every = (int)v; else if (k == "seed_off") seed_off = (int)v;
     else { fprintf(stderr, "unknown key %s\n", k.c_str()); return 1; } }
   const char* tasks[3] = {"A", "B", "C"}; const int W[4][2] = {{0, 512}, {1536, 2048}, {2048, 2560}, {3584, 4096}};
   double syn[3][10][4]; double dig[5][3];

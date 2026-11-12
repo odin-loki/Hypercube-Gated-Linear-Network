@@ -31,7 +31,9 @@ struct Var {
   bool norm_track = false;   // track |H_b| analytically instead of a renormalisation pass (exact in real arithmetic)
   double density = 0.6;      // prune target
   int gate_every = 1;
-  bool pipeline = false;     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
+  bool pipeline = false;
+  int hybrid = 0;            // 1: L3 reads previous-sample L2; 2: L2 reads previous-sample L1; 3: L2 and L3 both read current L1;
+                             // 4: L3 reads (previous-sample L2 + current L1) / 2     // layer l > 0 reads layer l-1's outputs from the PREVIOUS sample: all rule stages independent        // update gates (p, H) only on every n-th sample
   double glr0 = 0.2, glr1 = 0.05, tau = 1000, glob = 0.75, mu = 0.3;
   int warm = 512;
 };
@@ -184,7 +186,12 @@ struct Net {
       q = std::sqrt(q) + 1e-12; for (auto& s : side) s /= q;
     }
     for (int l = 0; l < V.layers; l++) {
+      std::vector<double> mixin;
       const double* in = l == 0 ? x : (V.pipeline ? &prev[(size_t)(l - 1) * V.U] : L[l - 1].pred.data());
+      if (V.hybrid == 1 && l == 2) in = &prev[(size_t)1 * V.U];
+      if (V.hybrid == 2 && l == 1) in = &prev[0];
+      if (V.hybrid == 3 && l == 2) in = L[0].pred.data();
+      if (V.hybrid == 4 && l == 2) { mixin.resize(V.U); for (int k = 0; k < V.U; k++) mixin[k] = 0.5 * (prev[(size_t)V.U + k] + L[0].pred[k]); in = mixin.data(); }
       std::vector<double> sd = side;
       if (l > 0 && V.gate_src == 1) {
         sd.assign(V.U + 1, 0); double q = 1; for (int j = 0; j < V.U; j++) { sd[j] = in[j]; q += in[j] * in[j]; }
@@ -193,7 +200,7 @@ struct Net {
       L[l].pold = L[l].p;
       L[l].forward(in, sd.data(), V, (V.share_gates && l > 0) ? &L[0] : nullptr);
     }
-    if (V.pipeline) for (int l = 0; l < V.layers; l++) for (int k = 0; k < V.U; k++) prev[(size_t)l * V.U + k] = L[l].pred[k];
+    if (V.pipeline || V.hybrid) for (int l = 0; l < V.layers; l++) for (int k = 0; k < V.U; k++) prev[(size_t)l * V.U + k] = L[l].pred[k];
     int G = V.layers * V.U; double cs = 0;
     for (int l = 0; l < V.layers; l++) for (int k = 0; k < V.U; k++) { o[l * V.U + k] = L[l].pred[k]; r[l * V.U + k] = V.uniform ? 1.0 : L[l].comp[k]; cs += r[l * V.U + k]; }
     out = 0; for (int i = 0; i < G; i++) { r[i] /= cs; out += r[i] * o[i]; }
