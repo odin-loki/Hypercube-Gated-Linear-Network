@@ -34,6 +34,8 @@ struct Var {
   bool pipeline = false;
   double theta = 0;          // > 0: Schmitt-trigger flip-flop gates: set = sig(12(z-theta)), reset = sig(12(-z-theta)),
                              //      a = set + (1 - set - reset) a_prev  (theta = 0 is exactly the stateless gate)
+  int gate_err = 0, rule_err = 0;  // error that drives the gate steps / the rule steps: 0 mixed es, 1 own (local), 2 global
+  bool credit = false;       // cross-layer latch: route the held part's gradient back to the lower layer's bit
   int theta_mode = 0;        // 0: theta for every bit; 1: only odd units latched (mixed population); 2: theta learned per bit;
                              // 3: stateless settled latch a = set/(set+reset); 4: stateless cross-layer latch (previous state =
                              //    the same unit's bit in the layer this one reads from, same sample; layer 1 stateless)
@@ -70,7 +72,7 @@ struct Layer {
   // per-sample
   std::vector<double> inp, s, a, h, f, xm, pred, comp, z;
   std::vector<double> cb_acc, dp_acc;
-  std::vector<double> ap, kap, hs, th, dth;   // + per-bit dead band and d a / d theta      // latch state (previous gate bits), d a / d z factor, soft heatmap   // share_gates: gate steps from the other layers; p_shared: summed p step
+  std::vector<double> ap, kap, hs, th, dth, hold;   // hold: d a / d q = 1 - set - reset (cross-layer latch)   // + per-bit dead band and d a / d theta      // latch state (previous gate bits), d a / d z factor, soft heatmap   // share_gates: gate steps from the other layers; p_shared: summed p step
   int pr(int k) const { return pshared ? 0 : k; }
   bool pshared = false, gate_from_owner = false, skip_gate = false;
   void init(int U_, int K_, int n_, int D_) {
@@ -79,7 +81,7 @@ struct Layer {
     A.assign((size_t)U * N1, 1e-3); m.assign((size_t)U * C, 0.3); hn.assign((size_t)U * K, 1);
     inp.assign(N1, 0); s.assign(D, 0); a.assign((size_t)U * K, 0); h.assign((size_t)U * C, 0); f.assign((size_t)U * C, 0);
     xm.assign((size_t)U * N1, 0); pred.assign(U, 0); comp.assign(U, 0); z.assign((size_t)U * K, 0);
-    th.assign((size_t)U * K, 0); dth.assign((size_t)U * K, 0);   // th is set from Var in Net::init
+    th.assign((size_t)U * K, 0); dth.assign((size_t)U * K, 0); hold.assign((size_t)U * K, 0);   // th is set from Var in Net::init
     ap.assign((size_t)U * K, 0.5); kap.assign((size_t)U * K, 0.25); hs.assign((size_t)U * C, 0);
   }
   void random_hyperplanes(Rng& r, bool last_zero) {
@@ -90,7 +92,8 @@ struct Layer {
       nn = std::sqrt(nn); for (int i = 0; i < D; i++) H[(size_t)k * D + i] = v[i] / nn;
     }
   }
-  const double* lower_a = nullptr;   // cross-layer latch: gate bits of the layer this one reads from (set by the net)
+  const double* lower_a = nullptr;
+  double* credit_sink = nullptr; const double* credit_kap = nullptr;   // credit routing to the lower layer   // cross-layer latch: gate bits of the layer this one reads from (set by the net)
   void forward(const double* in, const double* side, const Var& V, const Layer* owner = nullptr) {
     for (int j = 0; j < n; j++) inp[j] = qn(in[j], V.abits, 1);
     inp[n] = 1;
@@ -119,6 +122,7 @@ struct Layer {
           double av = st + (1 - st - rt) * q0;
           a[ib] = std::min(std::max(av, 1e-4), 1 - 1e-4);
           kap[ib] = st * (1 - st) * (1 - q0) + rt * (1 - rt) * q0;
+          hold[ib] = 1 - st - rt;
           ap[ib] = a[ib];
         } else if (V.theta > 0 && (thv > 0 || V.theta_mode == 2)) {   // SR flip-flop with a dead band: holds its previous value when |z| < theta
           double st = 1 / (1 + std::exp(-12 * (zz - thv))), rt = 1 / (1 + std::exp(-12 * (-zz - thv))), q0 = ap[ib];
@@ -162,6 +166,9 @@ struct Layer {
     if (V.p_shared) dp_acc.assign(D, 0);
     for (int k = 0; k < U; k++) {
       double e = y - pred[k], esk = es[k];
+      const double eglob = V.glob > 0 ? (esk - (1 - V.glob) * e) / V.glob : e;
+      const double eg_gate = V.gate_err == 1 ? e : V.gate_err == 2 ? eglob : esk;
+      const double eg_rule = V.rule_err == 1 ? e : V.rule_err == 2 ? eglob : esk;
       double* hk = &h[(size_t)k * C]; double* fk = &f[(size_t)k * C];
       if (!V.uniform) for (int c = 0; c < C; c++) m[(size_t)k * C + c] += 0.02 * hk[c] * (e * e - m[(size_t)k * C + c]);
       double tot = 0, F1[8] = {0};
@@ -176,7 +183,12 @@ struct Layer {
           double& t0 = th[(size_t)k * K + b];
           t0 = std::min(std::max(t0 + std::min(std::max(V.theta_lr * esk * dm * dth[(size_t)k * K + b], -0.01), 0.01), 0.0), 0.5);
         }
-        cb[b] = std::min(std::max(gl * esk * g, -0.05), 0.05);
+        cb[b] = std::min(std::max(gl * eg_gate * g, -0.05), 0.05);
+        if (V.credit && credit_sink) {   // the held part of this bit is the lower layer's decision: credit it there
+          const size_t ib = (size_t)k * K + b;
+          const double gl2 = 12 * credit_kap[ib] * dm * hold[ib];
+          credit_sink[ib] += std::min(std::max(gl * eg_gate * gl2, -0.05), 0.05);
+        }
       }
       if (mode == 1) { for (int b = 0; b < K; b++) sink[(size_t)k * K + b] += cb[b]; }
       if (mode == 2) for (int b = 0; b < K; b++) cb[b] += cb_acc[(size_t)k * K + b];
@@ -208,7 +220,7 @@ struct Layer {
       double h2 = 0, x2 = 0; const double* xk = &xm[(size_t)k * N1];
       for (int c = 0; c < C; c++) h2 += hk[c] * hk[c];
       for (int j = 0; j < N1; j++) x2 += xk[j] * xk[j];
-      double c2 = (V.mu * esk) / (1e-3 + h2 * x2);
+      double c2 = (V.mu * eg_rule) / (1e-3 + h2 * x2);
       if (V.shiftnorm) c2 = V.mu * esk * std::ldexp(1.0, -(int)std::ceil(std::log2(1e-3 + h2 * x2)));   // shift, no divider
       for (int c = 0; c < C; c++) { double sc = c2 * hk[c]; double* Wc = &W[((size_t)k * C + c) * N1]; for (int j = 0; j < N1; j++) Wc[j] += sc * xk[j]; }
       if (!pruned) for (int j = 0; j < N1; j++) A[(size_t)k * N1 + j] = 0.98 * A[(size_t)k * N1 + j] + 0.02 * std::fabs(inp[j]);
@@ -304,6 +316,14 @@ struct Net {
       std::fill(L[0].cb_acc.begin(), L[0].cb_acc.end(), 0.0);
       for (int l = V.layers - 1; l > 0; l--) L[l].update(y, gl, es.data() + l * V.U, V, pruned, 1, L[0].cb_acc.data());
       L[0].update(y, gl, es.data(), V, pruned, 2);
+    } else if (V.credit && V.theta_mode == 4) {
+      std::fill(L[0].cb_acc.begin(), L[0].cb_acc.end(), 0.0);
+      for (int l = V.layers - 1; l > 0; l--) {
+        Layer& low = (V.hybrid == 3 && l == 2) ? L[0] : L[l - 1];
+        L[l].credit_sink = low.cb_acc.data(); L[l].credit_kap = low.kap.data();
+        if (&low != &L[0]) std::fill(low.cb_acc.begin(), low.cb_acc.end(), 0.0);
+      }
+      for (int l = V.layers - 1; l >= 0; l--) L[l].update(y, gl, es.data() + l * V.U, V, pruned, l == 0 || !(V.hybrid == 3) ? 2 : 0);
     } else for (int l = 0; l < V.layers; l++) L[l].update(y, gl, es.data() + l * V.U, V, pruned);
     if (V.qbits > 0) for (auto& l : L) l.quantise(qrng, V.qbits);
     if (V.wbits > 0) for (auto& l : L) l.quantise_int(qrng, V.wbits);
