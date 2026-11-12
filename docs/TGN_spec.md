@@ -180,7 +180,7 @@ Cutting corners, units, layers, connections or gate parameters, or sharing or pr
 - **Partly tuned.** The global share was tuned over three values. The competence rate and gate rates were not tuned for version 4.
 - **Digits.** Test sets are 599 samples, so differences of about 1 point are noise. The share was tuned on the same synthetic seeds and digit shuffles used to report it.
 - **Gate learning rate is task-dependent.** Low (0.02) suited 64-input digits; higher, annealed values suited the 8-input streams. A rule of about 1.6 / d fits both but is untested.
-- **Speed.** Measured in C++ (section 7b): still slower than a matched small MLP on one thread (about 3x at d = 8), though SIMD-tuned and multithreaded across networks. Not sparse or event-driven. The CUDA kernel compiles to PTX and is verified on a CPU emulator, but has not run on a GPU.
+- **Speed.** Measured in C++ (section 7b): still slower than a matched small MLP on one thread (about 3x at d = 8), though SIMD-tuned and multithreaded across networks. Not sparse or event-driven. The CUDA kernel compiles to PTX and is verified on a CPU emulator; it has since run on an NVIDIA RTX 3090, bit-identical to the CPU library (GPU speed not studied).
 - **Competence weighting** is not shown to help (section 7b), and was tested on the three synthetic tasks only.
 - **Baselines.** Online softmax regression and per-sample MLPs. Stronger tuning could change the comparison.
 - **Width.** Width 16 mainly.
@@ -193,7 +193,7 @@ Cutting corners, units, layers, connections or gate parameters, or sharing or pr
 3. Check the 1.6 / d rule for the gate rate on other input sizes.
 4. Wider networks (64-128).
 5. Keep only the strongest few corners active, then measure the accuracy cost.
-6. Run the CUDA kernel on real GPUs (for example through FORGE's driver-API runtime, `FORGE.md`). The SIMD and multithreaded C++ library is done.
+6. Run the CUDA kernel on real GPUs (for example through FORGE's driver-API runtime, `FORGE.md`). The SIMD and multithreaded C++ library is done. *Done for NVIDIA (RTX 3090, bit-identical through FORGE's runtime); AMD is still open.*
 
 ## 10. Reference implementation
 

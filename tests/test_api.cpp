@@ -18,7 +18,8 @@ template <class T> double run_stream(Net<T>& n, int d, int N, uint64_t seed, dou
   }
   double var = sy2 / cnt - (sy / cnt) * (sy / cnt); *late_nmse = se / cnt / var; return *late_nmse;
 }
-static Params with_units(int units, bool fanout = false) { Params P; P.units = units; P.fanout = fanout; return P; }
+// the 4.3 structure with a given width / fan-out (the defaults are version 5.0, checked separately below)
+static Params with_units(int units, bool fanout = false) { Params P = Params::v43(); P.units = units; P.fanout = fanout; return P; }
 // every unit keeps exactly round(0.6 n) inputs and its bias column after the prune
 static bool prune_counts_ok(const Net<double>& a) {
   int good = 0, total = 0;
@@ -115,11 +116,11 @@ int main() {
       CHECK(prune_counts_ok(a), msg); }
     { Net<double> a, b; a.init(8, 5, with_units(units)); b.init(8, 5, with_units(units)); double n1, n2; std::vector<double> o1, o2;
       run_stream(a, 8, 1500, 9, &n1, &o1); run_stream(b, 8, 1500, 9, &n2, &o2);
-      Net<double> c; c.init(8, 5); std::vector<double> o3; run_stream(c, 8, 1500, 9, &n2, &o3);
+      Net<double> c; c.init(8, 5, with_units(16)); std::vector<double> o3; run_stream(c, 8, 1500, 9, &n2, &o3);
       snprintf(msg, sizeof msg, "units=%d: deterministic (same seed and stream, identical predictions) and different from units=16", units);
       CHECK(o1 == o2 && o1 != o3, msg); }
     for (int d : {8, 64}) {
-      Net<double> a, b; a.init(d, 1, with_units(units)); b.init(d, 1);
+      Net<double> a, b; a.init(d, 1, with_units(units)); b.init(d, 1, with_units(16));
       Net<double> a2 = a, b2 = b; double nm; run_stream(a2, d, 700, 2, &nm); run_stream(b2, d, 700, 2, &nm);
       printf("      d=%d model bytes after the prune: units=%d %zu, units=16 %zu (%.2fx)\n", d, units, a2.model_bytes(), b2.model_bytes(), (double)a2.model_bytes() / b2.model_bytes());
       snprintf(msg, sizeof msg, "units=%d d=%d: model_bytes smaller than units=16, before and after the prune", units, d);
@@ -139,13 +140,13 @@ int main() {
       CHECK(same, msg); }
   }
   // ---- fan-out (Params::fanout): layer 3 reads layer 1
-  { Net<double> a, b; a.init(8, 1, with_units(16, true)); b.init(8, 1); double n1, n2; std::vector<double> o1, o2;
+  { Net<double> a, b; a.init(8, 1, with_units(16, true)); b.init(8, 1, with_units(16)); double n1, n2; std::vector<double> o1, o2;
     run_stream(a, 8, 5000, 11, &n1, &o1); run_stream(b, 8, 5000, 11, &n2, &o2);
     printf("      fanout late NMSE after 5000 samples (d=8): %.3f (chain %.3f)\n", n1, n2);
     CHECK(n1 < 0.35 && o1 != o2, "fanout: learns the smooth target (late NMSE < 0.35) and differs from the 1-2-3 chain");
     Net<double> c; c.init(8, 1, with_units(16, true)); std::vector<double> o3; run_stream(c, 8, 5000, 11, &n1, &o3);
     Net<double> e; e.init(8, 1, with_units(12, true)); double n3; run_stream(e, 8, 5000, 11, &n3);
-    Params pv(0.2, 0.05); pv.competence = true; pv.fanout = true; Net<double> f; f.init(8, 1, pv); double n4; run_stream(f, 8, 5000, 11, &n4);
+    Params pv = Params::v42(0.2, 0.05); pv.fanout = true; Net<double> f; f.init(8, 1, pv); double n4; run_stream(f, 8, 5000, 11, &n4);
     printf("      fanout units=12 late NMSE %.3f; fanout with competence (4.2) %.3f\n", n3, n4);
     CHECK(o1 == o3 && n3 < 0.35 && n4 < 0.35, "fanout: deterministic; also learns with units=12 and with the competence mixture"); }
   { // version 5.0 float options: cross-layer latch, latch credit, gate error (Params::v5 with all 16 corners)
@@ -155,10 +156,26 @@ int main() {
     run_stream(a, 8, 5000, 11, &n1, &o1); run_stream(b, 8, 5000, 11, &n2, &o2); run_stream(c, 8, 5000, 11, &n3, &o3);
     printf("      v5 float options late NMSE %.3f (8 units fan-out without them: %.3f)\n", n1, n3);
     CHECK(o1 == o2 && o1 != o3 && n1 < 0.35, "v5 float options (latch, credit, global gate error): deterministic, change the model, learn");
-    bool threw = false; try { Net<float> q; q.init(8, 1, Params::v5()); } catch (const std::invalid_argument&) { threw = true; }
-    CHECK(threw, "the float Net rejects top-k corners (Params::v5() has corners = 6; NetQ implements them)");
+    bool threw = false; try { Params Pc; Pc.corners = 17; Net<float> q; q.init(8, 1, Pc); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw, "Params::corners outside 1..16 throws std::invalid_argument");
     P.latch_credit = 0; P.gate_err = 1; Net<double> d; d.init(8, 1, P); double n4; run_stream(d, 8, 3000, 11, &n4);
     CHECK(n4 < 0.4, "latch without credit, own-error gates: learns");
+  }
+  { // the defaults are version 5.0, top-6 corners included
+    const Params D, V = Params::v5();
+    CHECK(D.units == 8 && D.fanout && D.latch == 0.1 && D.latch_credit == 0.5 && D.gate_err == 2 && D.glob == 0.95 && D.corners == 6 && V.corners == D.corners,
+          "Params() is version 5.0 (8 units, fan-out, latch 0.1, credit 0.5, global-error gates, glob 0.95, top-6 corners)");
+    Net<double> a, b, c; a.init(8, 1); b.init(8, 1); Params P16; P16.corners = 16; c.init(8, 1, P16);
+    double n1, n2, n3; std::vector<double> o1, o2, o3;
+    run_stream(a, 8, 5000, 11, &n1, &o1); run_stream(b, 8, 5000, 11, &n2, &o2); run_stream(c, 8, 5000, 11, &n3, &o3);
+    printf("      v5 defaults late NMSE %.3f (all 16 corners: %.3f)\n", n1, n3);
+    CHECK(o1 == o2 && o1 != o3 && n1 < 0.35, "top-6 corners: deterministic, change the model, learn");
+    bool selk = true;
+    for (int l = 0; l < 3; l++) for (int k = 0; k < a.L[l].U; k++) {
+      int ns = 0; double hs = 0; for (int c2 = 0; c2 < 16; c2++) { ns += a.ws.lw[l].sel[c2 * a.L[l].U + k] != 0; hs += a.ws.lw[l].h[c2 * a.L[l].U + k]; }
+      selk &= ns == 6 && std::fabs(hs - 1) < 1e-12; }
+    CHECK(selk, "top-6 corners: every unit selects exactly 6 corners and their weights sum to 1");
+    Net<float> f; f.init(8, 1); run_stream(f, 8, 5000, 11, &n1); CHECK(n1 < 0.35, "float32 learns with the v5 defaults");
   }
   printf(fails ? "%d test(s) FAILED\n" : "all tests passed\n", fails); return fails ? 1 : 0;
 }

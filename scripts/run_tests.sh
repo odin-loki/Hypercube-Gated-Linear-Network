@@ -9,10 +9,15 @@ for u in 8 12 16; do for m in v43 v42; do for d in 8 64; do
   python3 python/parity.py build/hgln_d $d 1e-12 $m $u; python3 python/parity.py build/hgln_f $d 1e-4 $m $u
 done; done; done
 for d in 8 64; do python3 python/parity.py build/hgln_d $d 1e-12 v43f 16; python3 python/parity.py build/hgln_f $d 1e-4 v43f 16; done
-echo "== NumPy vs C++ parity, version 5.0 float options (cross-layer latch, latch credit, gate error; fan-out and chain)"
-for u in 8 12 16; do for m in v5 v5c; do for d in 8 64; do
-  python3 python/parity.py build/hgln_d $d 1e-12 $m $u; python3 python/parity.py build/hgln_f $d 1e-4 $m $u
-done; done; done
+for d in 8 64; do python3 python/parity.py build/hgln_d $d 1e-12 v43k 16; python3 python/parity.py build/hgln_d $d 1e-12 v43k 12; done
+echo "== NumPy vs C++ parity, version 5.0 options (cross-layer latch, latch credit, gate error, top-K corners; fan-out and chain)"
+# float32 runs only without top-K (v5d): with a hard top-K selection, float32 rounding resolves near-ties differently
+# from the float64 reference and follows another valid trajectory (python/parity.py); the float32 top-K arithmetic is
+# the same template code as float64, and float32 CPU and GPU agree exactly (emulator below, cuda/cuda_emu.cpp)
+for u in 8 12 16; do for m in v5 v5d v5c; do for d in 8 64; do
+  python3 python/parity.py build/hgln_d $d 1e-12 $m $u
+done; done; python3 python/parity.py build/hgln_f 8 1e-4 v5d $u; python3 python/parity.py build/hgln_f 64 1e-4 v5d $u
+done
 echo "== version 5.0 integer net: library vs the research reference of the integer specification (bit-identical)"
 ./build/test_q
 for u in 8 12 16; do for b in 16 12; do ./build/hgln_q parity 8 4500 $u $b 3; ./build/hgln_q parity 64 1500 $u $b 4; done; done
@@ -36,6 +41,21 @@ done; done
   ./build/cuda_emu 8 1 4500 8 1 0 0 $u 1; ./build/cuda_emu 8 1 4200 8 0 1 0 $u 0; ./build/cuda_emu_f 8 1 4500 8 0 1 0 $u 1
 done
 ./build/cuda_emu 64 1 4300 13 0 1 0 12 1
+echo "== CUDA kernel, version 5.0 float options on the CPU emulator vs the C++ library"
+# [v5]: 1 the v5 defaults (latch + credit + global-error gates + top-6 corners), 2 latch + own-error gates, 3 gate_err 2
+# only, 4 = 1 with all 16 corners, 5 top-8 corners only
+for u in 8 12 16; do for fo in 0 1; do
+  for v in 1 2 3 4 5; do
+    ./build/cuda_emu 8 2 700 8 $(( (u + fo + v) % 2 )) 0 0 $u $fo $v; ./build/cuda_emu 64 1 600 13 $(( (u + v) % 2 )) 0 0 $u $fo $v
+  done
+  ./build/cuda_emu_f 8 2 700 8 1 0 0 $u $fo 1; ./build/cuda_emu 100 1 560 16 0 1 0 $u $fo 1
+done; done
+./build/cuda_emu 8 1 4500 8 1 0 0 8 1 1; ./build/cuda_emu 8 2 600 8 0 0 1 8 1 1; ./build/cuda_emu 8 2 600 8 1 0 1 16 0 1
+echo "== integer GPU kernel (NetQ) on the CPU emulator vs the C++ integer net (bit-identical; NOT on a GPU)"
+# args: d nets T threads [units] [bits] [mode]; mode 0 v5, 1 the 4.3 structure, 2 chain latch + credit 1 + top-1, 3 chain top-8
+for u in 8 12 16; do for b in 16 12; do ./build/cuda_emu_q 8 2 700 8 $u $b 0; ./build/cuda_emu_q 64 1 600 13 $u $b 0; done; done
+./build/cuda_emu_q 100 1 560 16 8 16 0; ./build/cuda_emu_q 8 1 4500 8 16 16 1; ./build/cuda_emu_q 8 2 700 8 8 16 2
+./build/cuda_emu_q 64 1 700 16 12 16 3; ./build/cuda_emu_q 8 1 4500 8 8 16 0; ./build/cuda_emu_q 8 2 700 1 8 16 0
 echo "== CUDA kernel compiled to PTX with clang (skipped if clang lacks the NVPTX backend)"
 if ${CLANG:-clang} -print-targets 2>/dev/null | grep -q nvptx64; then make -s ptx && echo "PTX sm_70/sm_80 float64/float32: ok"; else echo "skip: no clang with NVPTX"; fi
 echo "== digits end-to-end (C++ classifier)"

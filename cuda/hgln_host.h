@@ -6,16 +6,20 @@
 #include "hgln_kernel.h"
 #include "hgln.hpp"
 #include <vector>
-struct HgHostState { std::vector<hreal> H, Q, p, W, M, A, m, scratch; std::vector<long> t; int competence = 0, units = 16, fanout = 0; };
+struct HgHostState {
+  std::vector<hreal> H, Q, p, W, M, A, m, scratch; std::vector<long> t; int competence = 0, units = 16, fanout = 0;
+  hreal latch = 0, credit = 0; int gate_err = 0, corners = 16;   // version 5.0 options (Params::latch, latch_credit, gate_err, corners)
+};
 // with_scratch = false: the kernel will use dynamic shared memory, so no global scratch is allocated.
 // H is packed raw (unnormalised) with its squared norms Q, the exact state the library keeps, so the kernel continues
-// bit for bit. s.competence, s.units and s.fanout are the nets' Params::competence, units and fanout (all nets must
+// bit for bit. s.competence, s.units, s.fanout, s.latch, s.credit, s.gate_err and s.corners are the nets' Params (all nets must
 // agree; they are the kernel's arguments). g must be hg_dims(d, units).
 inline void hg_pack(const HgDims& g, const std::vector<hgln::Net<hreal>>& nets, HgHostState& s, bool with_scratch = true) {
   size_t N = nets.size();
   s.H.assign(N * g.Hs, 0); s.Q.assign(N * g.Qs, 0); s.p.assign(N * g.ps, 0); s.W.assign(N * g.Ws, 0); s.M.assign(N * g.Ms, 0); s.A.assign(N * g.Ms, 0);
   s.m.assign(N * g.ms, 0); s.scratch.assign(with_scratch ? N * (size_t)g.scs : 0, 0); s.t.assign(N, 0);
   s.competence = N && nets[0].P.competence ? 1 : 0; s.units = N ? nets[0].units() : 16; s.fanout = N && nets[0].P.fanout ? 1 : 0;
+  s.latch = N ? (hreal)nets[0].P.latch : 0; s.credit = N ? (hreal)nets[0].P.latch_credit : 0; s.gate_err = N ? nets[0].P.gate_err : 0; s.corners = N ? nets[0].P.corners : 16;
   for (size_t n = 0; n < N; n++) {
     s.t[n] = nets[n].t;
     for (int l = 0; l < 3; l++) {

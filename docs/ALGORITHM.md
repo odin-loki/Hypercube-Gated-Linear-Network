@@ -1,8 +1,8 @@
-# HGLN algorithm changes: version 4.3
+# HGLN algorithm changes: versions 4.3 and 5.0
 
 **Author:** Odin Loch. Licence: AGPL-3.0-or-later.
 
-This page asks whether HGLN's mathematics can be made cheaper in operations and memory, and more parallel, without losing accuracy. Every candidate was measured on the benchmarks in `TGN_spec.md`. Two changes passed and became version 4.3; the rest cost accuracy and were not adopted. All numbers below can be regenerated with `research/alg/` (section 7).
+This page asks whether HGLN's mathematics can be made cheaper in operations and memory, and more parallel, without losing accuracy. Every candidate was measured on the benchmarks in `TGN_spec.md`. Two changes passed and became version 4.3; the rest cost accuracy and were not adopted. Version 5.0 (section 8) then takes the cheapest usable structure and adds three learning-rule changes and an integer datapath. All numbers below can be regenerated with `research/alg/` (sections 7 and 8).
 
 ## 1. What changed in 4.3
 
@@ -126,7 +126,7 @@ Every row includes the 4.3 changes; the baseline row is 4.3 itself.
 
 **Reading the table.**
 - At equal cost, fewer units per layer beat fewer hyperplanes: 8 units are about as cheap as 12 units with 3 hyperplanes, and more accurate on most scores.
-- The library therefore offers the width as a setting, `Params::units` = 16 (default), 12 or 8, rather than fewer corners.
+- The library therefore offers the width as a setting, `Params::units` = 8 (the default since 5.0; 16 in 4.3), 12 or 16, rather than fewer corners.
 - What narrowing costs is mostly re-adaptation after the drift (B and C post-drift). Before the drift and on digits, 12 units lose little.
 
 **Pipelined layers (rejected).** Here layer 2 and layer 3 read the layer below's outputs from the previous sample. That would make all three rule stages independent, leaving the mixture as the only step that has to wait. It is much worse on every score (+0.03 to +0.13 NMSE, digits −1.7), so the chain between the layers within a sample is essential.
@@ -160,14 +160,14 @@ Every row includes the 4.3 changes; the baseline row is 4.3 itself.
 
 ## 5. Parallelism
 
-Within one network, a sample has this dependency structure (exact, no change to the model):
+Within one network, a sample has this dependency structure (exact, no change to the model). The counts below describe version 4.3 (3 x 16 = 48 units, chain). With the version 5.0 default it is 3 x 8 = 24 units (96 gates, a 24-term reduction), and with the fan-out layers 2 and 3 both read layer 1, so there are 2 sequential rule stages instead of 3.
 
 1. **Gate pre-activations** of all three layers depend only on the input `u`, so all 192 gates can be computed in parallel, at once.
 2. **Rule evaluation** is the only sequential part: layer 2's input is layer 1's output, so the rule stages run layer by layer (3 steps of 16 independent units each).
 3. **The mixture** is a 48-term reduction.
 4. **Updates** of all three layers are independent once the error signals are known, so all 48 units' updates can run in parallel, and within a unit the gate and rule updates are independent too.
 
-So the critical path of a sample is 3 rule stages, 1 reduction and 1 update stage. The sequence comes from the chain between the layers, not from the global mixture. The mixture is a single 48-term reduction after the third stage, and the global error it produces feeds only the update. Computing all gates first and the three rule stages at the end is an exact reordering. Making the rule stages independent requires the pipelined variant, which is rejected above. Version 4.3 removes the renormalisation stage from it; on the GPU that is one block-wide barrier fewer per sample.
+So the critical path of a sample in 4.3 is 3 rule stages, 1 reduction and 1 update stage (2 rule stages with the 5.0 fan-out). The sequence comes from the chain between the layers, not from the global mixture. The mixture is a single 48-term reduction after the third stage, and the global error it produces feeds only the update. Computing all gates first and the three rule stages at the end is an exact reordering. Making the rule stages independent requires the pipelined variant, which is rejected above. Version 4.3 removes the renormalisation stage from it; on the GPU that is one block-wide barrier fewer per sample.
 
 Across networks there is no dependency at all: class heads, ensemble members and streams parallelise perfectly. `run_streams`, `Classifier::train_batch` and the GPU `Bank` all exploit this.
 
@@ -193,4 +193,85 @@ cd alg && g++ -O3 -march=native -std=c++17 -ffp-contract=off -pthread eval.cpp -
 ./eval data baseline                                # about 7 s on 4 cores; one JSON line
 ./eval data mine uniform=1 norm_track=1 K=3 U=12    # any combination of the switches in hgln_var.hpp
 python3 table.py results.jsonl                      # the table above from stored results
+```
+
+## 8. Version 5.0: cheaper structure plus three learning-rule additions, and an integer datapath
+
+Version 5.0 starts from the cheapest structure section 4b found usable, **8 units per layer with the fan-out** (about 0.35x the work of 4.3), and wins back the accuracy it costs with three changes to how the gates learn, plus top-K corners. Version 5.0 is the library's default (`Params()`, the float `Net` and the integer `NetQ`, CPU and GPU); every change is also a separate setting, and `Params::v43()` gives version 4.3.
+
+### 8a. The additions
+
+- **Cross-layer latch** (`Params::latch = theta`, layers 2 and 3). Each gate bit of layers 2 and 3 becomes a set/reset flip-flop around the dead band `+-theta`, holding the same unit's bit of the layer it reads from (layer 1 with the fan-out) in between:
+  ```
+  st = sig(12 (z - theta)),  rt = sig(12 (-z - theta)),  q0 = the lower layer's bit
+  a  = clip(st + (1 - st - rt) q0)            kap = d a / d(12 z) = st (1 - st)(1 - q0) + rt (1 - rt) q0
+  ```
+  It is stateless (it holds the *current* sample's lower bit, not a stored one), so it adds no state and no sequential dependency. The gate gradient becomes `12 kap (F1/a - F0/(1-a))`.
+- **Latch credit** (`Params::latch_credit`). The part of the gradient that flows through the held bit, `(1 - st - rt)`, is routed to the lower layer's gate step (clipped like any gate step). Layers are updated 3, 2, 1, so layer 1 receives it in the same sample.
+- **Gates learn from the global error** (`Params::gate_err = 2`), with `glob = 0.95`: the gate steps use `y - out` instead of each unit's mixed error. The rule steps still use the mixed error.
+- **Top-K corners** (`Params::corners = 6`). Only the 6 largest of the 16 heatmap values are kept and renormalised for the rule mixture and the rule step; the gate gradient uses the soft values of those 6 corners and skips the other 10. A corner is selected when fewer than K corners have a larger value, ties going to the lower corner index. Saturated gates often give corners of exactly equal value, so this hard selection is sensitive to the last bit of the gate values. The library and the GPU kernels compute them with the same operations (`hgln_gate`, `hgln_exp`) and agree exactly. The NumPy reference uses NumPy's `exp`, can resolve such a tie the other way, and then differs by about 1e-6 (the float64 parity test allows 1e-4 for top-K modes). In float32 the rounding itself, about 1e-7, decides more of these near-ties, so a float32 network follows a different, equally valid trajectory from a float64 one (float32 against float64 C++ differs by up to about 0.2 over 2,000 samples). Float32 is therefore checked against the reference without top-K, and the float32 CPU and GPU agree exactly.
+
+### 8b. Tuning and result
+
+The settings were tuned by coordinate descent (`research/alg/tune.py`, log in `tune.log`, result in `tuned_v5.json`) on seed sets 0 and 1. The score is the mean relative NMSE change over the 6 synthetic windows and 3 time series (`narma10`, `mackey`, `regime`), minus 5% per digits point. Seed set 2 was never seen by the tuning. Against 4.3 (16 units, chain), NMSE change per window and digits points:
+
+| Seed set | A pre | A post | B pre | B post | C pre | C post | narma | mackey | regime | Digits |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | -7% | -6% | -3% | +8% | -6% | -7% | +2% | -13% | +3% | +0.54 |
+| 1 | +0% | -9% | +5% | +8% | -7% | -8% | +3% | -13% | +3% | +0.43 |
+| 2 (held out) | -2% | -10% | -1% | +19% | -4% | -12% | +3% | -12% | +1% | +0.50 |
+
+Most scores improve and digits gain about half a point at about 0.35x the work. The cost is stream B after the drift (+8% to +19%): re-adaptation on that stream is the one place the narrow structure still shows.
+
+### 8c. Integer datapath (`hgln::NetQ`, `include/hgln_qspec.hpp`)
+
+`NetQ` runs the v5 model on int16 state and activations (12 to 16 bits, `Params::wbits` / `abits`), with fixed Q formats per array (spec in the header of `hgln_qspec.hpp`). The forward pass and the per-unit control scalars are integer arithmetic: a 1025-entry sigmoid table, int16 multiply-add dot products, integer divisions and square roots made exact by integer correction. The per-element learning steps (gate weights, hyperplanes and their renormalisation, rule weights) are **mixed**: float32 arithmetic on the int16 state, rounded back to the grid to nearest even (see below). It halves the model's memory against float32. The research reference (`hgln_var.hpp`, `intspec=1`) and the library agree bit for bit, and so does the GPU kernel.
+
+**Rounding of the state updates.** Each update of `W`, `H` and `p` must be rounded back to its 16-bit grid. The first integer spec used stochastic rounding (Philox4x32-10), which is unbiased but cost most of the integer net's time. The study (`results46.jsonl`, float model with each array rounded to the grid after every update; 3 seed sets, mean of the 9 NMSE windows against 4.3, worst single window, digits points):
+
+| Rounding of the 16-bit updates | Mean NMSE change | Worst window | Digits |
+|---|---|---|---|
+| none (v5 float) | -2.3% | +19% | +0.49 |
+| stochastic | -1.8% | +20% | +0.35 |
+| **round to nearest, ties to even** | **-2.4%** | **+15%** | **+0.30** |
+| nearest + error feedback | -2.4% | +18% | +0.41 |
+| floor (drop the low bits) | -4.0% | +18% | -1.21 |
+| toward zero | -1.3% | +30% | -0.30 |
+
+Round to nearest is as accurate as stochastic rounding: the updates are large relative to the grid, so the bias that stochastic rounding removes does not matter here. Plain truncation is worse (floor loses 1.2 digits points; toward zero gives a +30% worst window). **Version 5.0 uses round to nearest everywhere**: no random numbers are used after initialisation.
+
+**The exact integer spec, re-run with round to nearest** (`results47.jsonl`: every row regenerated on the same data, including the 4.3 baselines and the previous stochastic spec):
+
+| Integer spec | Mean NMSE change | Worst window | Digits (mean of 3 seed sets) |
+|---|---|---|---|
+| v5 float | -2.4% | +19% | 97.54% (+0.49) |
+| int16, stochastic (previous) | -2.1% | +20% | 97.31% (+0.26) |
+| **int16, round to nearest** | **-2.3%** | **+15%** | **97.39% (+0.34)** |
+| int12, stochastic | -1.7% | +20% | 97.40% (+0.35) |
+| int12, round to nearest | -1.9% | +16% | 97.13% (+0.08) |
+
+The 4.3 baseline scores 97.05% on digits. Against the stochastic spec, same seeds, round to nearest changes the mean NMSE by -0.7% to +0.9% per seed set, which is noise.
+
+```sh
+B="uniform=1 norm_track=1 U=8 hybrid=3 theta=0.1 theta_mode=4 gate_err=2 credit=1 credit_scale=0.5 sparse_k=6 glob=0.95"
+./eval data v5_float $B                                      # the float model with the v5 settings
+./eval data v50_int16_nearest $B intspec=1 wbits=16 abits=16 # the exact integer spec (round to nearest)
+./eval data v5_i16_nearest $B wbits=16 abits=16 round_mode=1 # float model, updates rounded to a 16-bit grid
+# seed_off=1 / seed_off=2 for the other seed sets
+```
+
+**Mixed float / integer learning steps** (`results48.jsonl`). Done exactly in integers, the gate-weight and hyperplane steps and their renormalisation need 64-bit intermediates (up to 2^60) and an exact square root and division per hyperplane. That made learning the integer net's main cost. The spec now does these per-element steps in float32 instead, on the same int16 state: IEEE single precision, a fixed operation order, no fused multiply-adds, one correctly rounded square root and division per hyperplane, and the result rounded to the int16 grid to nearest even with `rnf(v) = (v + 1.5 2^23) - 1.5 2^23`. The forward pass and the per-unit control scalars stay integer. Float32 is deterministic under these rules, so every CPU target and GPU still gives the same bits. Every row regenerated on the same data, 3 seed sets:
+
+| Integer spec | Mean NMSE change | Worst window | Digits (mean of 3 seed sets) |
+|---|---|---|---|
+| v5 float | -2.4% | +19% | 97.54% |
+| int16, exact integer learning (previous) | -2.3% | +15% | 97.39% |
+| **int16, mixed learning (version 5.0)** | **-2.2%** | **+15%** | **97.33%** |
+| int12, exact integer learning | -1.9% | +16% | 97.13% |
+| int12, mixed learning | -2.1% | +23% | 97.08% |
+
+Against the exact spec, same seeds, the mixed int16 steps change the mean NMSE by -0.3%, -0.2% and +0.6% on the three seed sets, which is noise. At 12 bits one window is worse (+23% against +16%) while the mean is better. The speed gain is in `OPTIMISATION.md` section 5.
+
+```sh
+./eval data v50_int16_mixed $B intspec=1 wbits=16 abits=16   # the current spec (mixed learning steps)
 ```

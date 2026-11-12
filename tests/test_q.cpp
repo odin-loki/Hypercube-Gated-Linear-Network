@@ -3,7 +3,7 @@
 // specification (research/alg/hgln_var.hpp, QNet / intspec=1): every prediction and the whole model state must be
 // bit-identical, for d = 8 and 64, 16/12/8 units, both bit widths, the v5 defaults and the 4.3-like configuration,
 // past the prune and beyond 4096 samples. Also: Philox known-answer vectors, the sigmoid table, the integer helpers,
-// infer/run_streams/Classifier consistency. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
+// infer/run_streams/Classifier consistency. (Philox is used only for the initial hyperplanes.) Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_q.hpp"
 #include "../research/alg/hgln_var.hpp"
 #include <cstdio>
@@ -25,12 +25,6 @@ static void unit_tests() {
     const qspec::Philox4 o = qspec::philox4x32_10(v.c[0], v.c[1], v.c[2], v.c[3], v.k[0], v.k[1]);
     CHECK(!std::memcmp(o.v, v.r, 16), "Philox4x32-10 known-answer vector");
   }
-  // the lane-parallel Philox of the kernels equals the scalar one
-  uint32_t out[4][16];
-  detail::qk::philox_lanes<detail::qk::HeaderPolicy, 16>(0x12340, 7, 99, 1, 0xdeadbeefu, 42, out);
-  bool lanes_ok = true;
-  for (int l = 0; l < 16; l++) { const qspec::Philox4 o = qspec::philox4x32_10(0x12340 + l, 7, 99, 1, 0xdeadbeefu, 42); for (int w = 0; w < 4; w++) lanes_ok &= o.v[w] == out[w][l]; }
-  CHECK(lanes_ok, "lane-parallel Philox equals the scalar Philox");
   // sigmoid table: within 1 of the exact values, symmetric, monotone
   int bad = 0;
   for (int i = 0; i <= 1024; i++) {
@@ -50,7 +44,6 @@ static void unit_tests() {
   bool sq = true;
   for (uint64_t n : {0ull, 1ull, 2ull, 3ull, 4ull, 15ull, 16ull, 17ull, 1ull << 40, (1ull << 40) - 1, 0xFFFFFFFFFFFFull, ~0ull >> 1}) { uint64_t r = qspec::isqrt(n); sq &= r * r <= n && (r + 1) * (r + 1) > n; }
   CHECK(sq, "isqrt exact");
-  CHECK(qspec::sr(5 << 16, 16, 0) == 5 && qspec::sr((5 << 16) + 0x8000, 16, 0x7FFF) == 6 && qspec::sr((5 << 16) + 0x8000, 16, 0x8000) == 5 && qspec::sr(-1, 16, 0xFFFE) == 0, "stochastic rounding");
   const int32_t g0 = qspec::gl_q24(0, 0.2, 0.05, 1000), g1 = qspec::gl_q24(1000, 0.2, 0.05, 1000), g2 = qspec::gl_q24(100000, 0.2, 0.05, 1000);
   CHECK(std::abs(g0 - 3355443) <= 1 && std::abs(g1 - (int)std::nearbyint((0.05 + 0.15 * std::exp(-1.0)) * 16777216)) <= 2 && g2 == 838861, "gate-rate schedule (%d %d %d)", g0, g1, g2);
 }
@@ -114,7 +107,7 @@ int main() {
         compare("v5 defaults", d, d == 8 ? 4600 : 4200, 11 + d + units, P);
       }
   {  // 4.3-like: chain, plain gates, mixed gate error, all 16 corners
-    Params P; P.wbits = 16; P.abits = 14; compare("4.3 structure (chain, dense)", 8, 4400, 5, P);
+    Params P = Params::v43(); P.wbits = 16; P.abits = 14; compare("4.3 structure (chain, dense)", 8, 4400, 5, P);
     P.units = 12; P.corners = 8; P.wbits = 13; P.abits = 16; P.gate_err = 1; compare("chain, top-8, own error", 64, 1300, 6, P);
     Params Q = Params::v5(); Q.fanout = false; Q.latch_credit = 1.0; Q.corners = 1; compare("chain latch, credit 1, top-1", 8, 2000, 7, Q);
   }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// hgln.hpp - Hypercube Gated Linear Network (HGLN v4.3). Header-only C++17, no dependencies beyond the standard library.
+// hgln.hpp - Hypercube Gated Linear Network (HGLN v5.0; Params::v43() / Params::v42() for the earlier versions). Header-only C++17, no dependencies beyond the standard library.
 // Stateless online learner: call predict(x) then learn(y) once per sample.
 // Copyright (C) Odin Loch. Licensed under the GNU Affero General Public License v3.0 or later (see LICENSE).
 //
@@ -171,9 +171,11 @@ template <class T> struct UpdateArgs {
 template <class T> struct LayerWork {
   detail::ABuf<T> inp, a, zn, h, f, pred, comp, x2, pp;      // inp: N1 inputs incl. bias; a, zn: 4 x U; h, f: 16 x U
   detail::ABuf<T> kap, hold;                                 // 4 x U: d a / d(12 z) and the latch's held part (Params::latch)
+  detail::ABuf<T> hs, sel;                                   // top-K corners (Params::corners < 16): the soft heatmap and
+                                                             // the selection (1 / 0), 16 x U; h is then renormalised
   void init(int N1, int U) {
     inp.assign(N1, 0); a.assign(U * 4, 0); zn.assign(U * 4, 0); h.assign(U * 16, 0); f.assign(U * 16, 0);
-    kap.assign(U * 4, 0); hold.assign(U * 4, 0);
+    kap.assign(U * 4, 0); hold.assign(U * 4, 0); hs.assign(U * 16, 0); sel.assign(U * 16, 0);
     pred.assign(U, 0); comp.assign(U, 0); x2.assign(U, 0); pp.assign(U, 0);
   }
 };
@@ -303,6 +305,7 @@ template <class T> struct Layer {
   T latch = 0;                                               // cross-layer latch theta (Params::latch; layers 2 and 3)
   T credit = 0;                                              // latch credit scale (Params::latch_credit)
   int gate_err = 0;                                          // Params::gate_err: 0 mixed es, 1 own error, 2 global error
+  int corners = 16;                                          // Params::corners: top-K corners per unit (16 = all)
   detail::ABuf<T> H;                                         // D x 4 x U   hyperplanes, NOT normalised: [i][b][unit]
   detail::ABuf<T> q, nq, rs;                                 // 4 x U       |H_b|^2, |H_b| and 1/|H_b| (norm tracking)
   detail::ABuf<T> p;                                         // D x U       gate weights: [i][unit]
@@ -469,8 +472,12 @@ template <class T> struct Layer {
     T* HGLN_RESTRICT aw = w.a.data();
     for (int q = 0; q < 4 * UU; q++) aw[q] = hgln_gate<T>(zz[q]);                 // 4U gates, [b][unit]
     if (latch > 0 && lo) {                // cross-layer latch: set/reset around +-theta, holding the lower layer's bit
+      // in simple loops, so that hgln_exp vectorises like the gate (the same scalar operations per gate)
+      alignas(64) T es[4 * kMaxUnits], er[4 * kMaxUnits];
+      for (int q = 0; q < 4 * UU; q++) { es[q] = -BETA * (zz[q] - latch); er[q] = -BETA * (-zz[q] - latch); }
+      for (int q = 0; q < 4 * UU; q++) { es[q] = hgln_exp<T>(es[q]); er[q] = hgln_exp<T>(er[q]); }
       for (int q = 0; q < 4 * UU; q++) {
-        const T st = (T)1 / ((T)1 + std::exp(-BETA * (zz[q] - latch))), rt = (T)1 / ((T)1 + std::exp(-BETA * (-zz[q] - latch))), q0 = lo->a[q];
+        const T st = (T)1 / ((T)1 + es[q]), rt = (T)1 / ((T)1 + er[q]), q0 = lo->a[q];
         aw[q] = clipv(st + ((T)1 - st - rt) * q0, (T)1e-4, (T)(1 - 1e-4));
         w.kap[q] = st * ((T)1 - st) * ((T)1 - q0) + rt * ((T)1 - rt) * q0; w.hold[q] = (T)1 - st - rt;
       }
@@ -485,7 +492,50 @@ template <class T> struct Layer {
     for (int c = 0; c < 4; c++) { q2[c] = q1[c] * b2; q2[c + 4] = q1[c] * a2; }
     T* HGLN_RESTRICT h = w.h.data();
     for (int c = 0; c < 8; c++) { Q::store(h + c * UU, q2[c] * b3); Q::store(h + (c + 8) * UU, q2[c] * a3); }
+    if (corners < 16) top_corners<UU>(w);
   }
+  // Top-K corners (Params::corners = K < 16), per unit: corner c is selected iff fewer than K corners rank above it
+  // (larger soft value, ties to the lower corner); the soft heatmap and the selection are kept for the gate gradient,
+  // and h becomes the selected values renormalised to sum 1 (sum over the selected corners, c ascending), 0 elsewhere.
+  // The rule mixture and the rule step use this h, the gate gradient the soft values of the selected corners.
+  // Ranks without branches, all units at once (lane = unit): for each pair c < c2 the corner with the larger soft value
+  // (ties: the lower corner, c) ranks above the other, which gets + 1. The same ranks as counting per corner. The
+  // selection is applied as a factor 1 / 0, which gives the scalar definition's bits (adding + 0 and multiplying by 1
+  // change nothing; every soft value is > 0, the gates being clipped to [1e-4, 1 - 1e-4]).
+  template <int UU> HGLN_INLINE void top_corners(LayerWork<T>& w) const {   // UU: units, a compile-time constant
+    T* HGLN_RESTRICT h = w.h.data(); T* HGLN_RESTRICT hs = w.hs.data(); T* HGLN_RESTRICT sel = w.sel.data();
+    for (int q = 0; q < 16 * UU; q++) hs[q] = h[q];
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(HGLN_NO_VECTOR_EXT)
+    top_block<(UU >= 16 ? 16 : 8)>(hs, h, sel, UU, 0);
+    if (UU == 12) top_block<4>(hs, h, sel, UU, 8);
+#else
+    alignas(64) int32_t rank[16][kMaxUnits]; alignas(64) T sm[kMaxUnits];
+    for (int c = 0; c < 16; c++) for (int k = 0; k < UU; k++) rank[c][k] = 0;
+    for (int c = 0; c < 16; c++)
+      for (int c2 = c + 1; c2 < 16; c2++)
+        for (int k = 0; k < UU; k++) { const int32_t gt = hs[c2 * UU + k] > hs[c * UU + k]; rank[c][k] += gt; rank[c2][k] += 1 - gt; }
+    for (int k = 0; k < UU; k++) sm[k] = 0;
+    for (int c = 0; c < 16; c++) for (int k = 0; k < UU; k++) if (rank[c][k] < corners) sm[k] += hs[c * UU + k];   // c ascending
+    for (int c = 0; c < 16; c++)
+      for (int k = 0; k < UU; k++) { const bool on = rank[c][k] < corners; sel[c * UU + k] = on ? (T)1 : (T)0; h[c * UU + k] = on ? hs[c * UU + k] / sm[k] : (T)0; }
+#endif
+  }
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(HGLN_NO_VECTOR_EXT)
+  // units [k0, k0 + B) of top_corners as one B-lane vector
+  template <int B> HGLN_INLINE void top_block(const T* HGLN_RESTRICT hs, T* HGLN_RESTRICT h, T* HGLN_RESTRICT sel, int UU, int k0) const {
+    typedef detail::Vec<T, B> VT;
+    VT v[16];
+    for (int c = 0; c < 16; c++) v[c] = detail::vload<T, B>(hs + c * UU + k0);
+    typedef decltype(v[0] > v[0]) VM;                         // -1 / 0 lanes
+    VM r[16];
+    for (int c = 0; c < 16; c++) r[c] = v[0] != v[0];         // 0 (no NaN)
+    for (int c = 0; c < 16; c++)
+      for (int c2 = c + 1; c2 < 16; c2++) { const VM gt = v[c2] > v[c]; r[c] -= gt; r[c2] += 1 + gt; }
+    VT sm = detail::vzero<T, B>(), sl[16];
+    for (int c = 0; c < 16; c++) { sl[c] = (T)0 - __builtin_convertvector(r[c] < corners, VT); sm += v[c] * sl[c]; }   // c ascending
+    for (int c = 0; c < 16; c++) { detail::vstore<T, B>(h + c * UU + k0, (v[c] / sm) * sl[c]); detail::vstore<T, B>(sel + c * UU + k0, sl[c]); }
+  }
+#endif
   // Rule stage: rule outputs, the unit mixture of the 16 rules, the competence and the clipped unit predictions.
   template <class O, int UU> HGLN_NOINLINE void rules_k(const T* HGLN_RESTRICT in, LayerWork<T>& w, T* HGLN_RESTRICT xg) const {
     typedef typename O::V V16; typedef detail::UnitOps<O, UU> Q; typedef typename Q::V VU;
@@ -539,8 +589,13 @@ template <class T> struct Layer {
     alignas(64) T c2s[UU];
     {
       VU tot = Q::zero(), F1[4] = {tot, tot, tot, tot}, h2 = tot;
+      const bool tk = corners < 16;                          // top-K: gradient from the soft values of the selected corners
+      const T* HGLN_RESTRICT hsv = w.hs.data(); const T* HGLN_RESTRICT slv = w.sel.data();
       for (int c = 0; c < 16; c++) {
-        const VU hc = Q::load(h + c * UU), hf = hc * Q::load(f + c * UU);
+        const VU hc = Q::load(h + c * UU);
+        VU hf;
+        if (tk) hf = (Q::load(hsv + c * UU) * Q::load(f + c * UU)) * Q::load(slv + c * UU);
+        else hf = hc * Q::load(f + c * UU);
         tot += hf; h2 += hc * hc;
         if (c & 1) F1[0] += hf;
         if (c & 2) F1[1] += hf;
@@ -673,35 +728,39 @@ template <class T> struct Layer {
 #ifndef HGLN_V5_ABITS
 #define HGLN_V5_ABITS 16
 #endif
+// The defaults are version 5.0 (research/alg/tuned_v5.json, docs/ALGORITHM.md section 8): 8 units, fan-out, cross-layer
+// latch 0.1 with credit 0.5, gates on the global error, glob 0.95, top-6 corners - the same model for the float Net (CPU
+// and GPU) and the integer NetQ. Params::v43() / v42() give the earlier versions exactly.
 struct Params {
   double glr0 = 0.2, glr1 = 0.05;   // gate learning rate schedule start/end (8-input streams); use 0.02/0.02 for 64-input classification
   double tau = 1000;                // schedule time constant (samples)
-  double glob = 0.75;               // share of each unit's error taken from the global mixture error
+  double glob = 0.95;               // share of each unit's error taken from the global mixture error (4.x: 0.75)
   double mu = 0.3;                  // rule step (normalised LMS)
   int warm = 512;                   // first prune
   bool competence = false;          // true: version 4.2 competence-weighted mixture; false (4.3): plain average of the units
-  int units = 16;                   // units per layer U: 8, 12 or 16 (others throw std::invalid_argument in Net::init).
-                                    // 12 / 8 units: about 0.7x / 0.45x the work and state per network (docs/ALGORITHM.md)
-  bool fanout = false;              // true: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 then
-                                    // run side by side: 2 sequential rule stages per sample); false: the 1-2-3 chain
-  double latch = 0;                 // > 0: cross-layer latch with dead band theta = latch on layers 2 and 3 (each bit
+  int units = 8;                    // units per layer U: 8, 12 or 16 (others throw std::invalid_argument in Net::init).
+                                    // 4.x: 16; 12 / 8 units: about 0.7x / 0.45x the work and state (docs/ALGORITHM.md)
+  bool fanout = true;               // true: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 then
+                                    // run side by side: 2 sequential rule stages per sample); false (4.x): the 1-2-3 chain
+  double latch = 0.1;               // > 0: cross-layer latch with dead band theta = latch on layers 2 and 3 (each bit
                                     // holds the same unit's bit of the layer it reads from - layer 1 with fanout - when
                                     // |z| < theta; stateless in time); 0: plain gates (versions 4.x)
-  double latch_credit = 0;          // > 0: route the latch's held part of the gate gradient, times this scale, to the
-                                    // lower layer's bit (layers are then updated 3, 2, 1); 0: off
-  int gate_err = 0;                 // error that drives the gate steps: 0 the mixed error es (4.x), 1 the unit's own error,
+  double latch_credit = 0.5;        // > 0: route the latch's held part of the gate gradient, times this scale, to the
+                                    // lower layer's bit (layers are then updated 3, 2, 1); 0: off (4.x)
+  int gate_err = 2;                 // error that drives the gate steps: 0 the mixed error es (4.x), 1 the unit's own error,
                                     // 2 the global mixture error y - out (5.0). Rule steps always use es.
-  int corners = 16;                 // hard top-k corners per unit (integer net NetQ: 1..16; the float Net: 16 only)
-  int wbits = 16, abits = 16;       // integer net: effective bits of the state (W, H, p) and of the activations, 12..16
+  int corners = 6;                  // top-K corners per unit, 1..16 (16 = all, 4.x): the rules use the K largest heatmap
+                                    // values renormalised, the gates learn through those K corners
+  int wbits = HGLN_V5_WBITS, abits = HGLN_V5_ABITS;   // integer net: effective bits of the state (W, H, p) and of the
+                                    // activations, 12..16 (the float Net ignores them)
   Params(double g0 = 0.2, double g1 = 0.05) : glr0(g0), glr1(g1) {}
-  static Params v42(double g0 = 0.2, double g1 = 0.05) { Params p(g0, g1); p.competence = true; return p; }
-  // version 5.0 defaults (research/alg/tuned_v5.json): 8 units, fan-out, cross-layer latch 0.1 with credit 0.5, gates on
-  // the global error, glob 0.95, top-6 corners, the integer datapath's bit widths. Used by NetQ (hgln_q.hpp); the float
-  // Net takes it with corners = 16 (it has no top-k corners).
-  static Params v5(double g0 = 0.2, double g1 = 0.05) {
-    Params p(g0, g1); p.units = 8; p.fanout = true; p.latch = 0.1; p.latch_credit = 0.5; p.gate_err = 2; p.glob = 0.95;
-    p.corners = 6; p.wbits = HGLN_V5_WBITS; p.abits = HGLN_V5_ABITS; return p;
+  static Params v5(double g0 = 0.2, double g1 = 0.05) { return Params(g0, g1); }   // the defaults
+  // version 4.3: 16 units, the 1-2-3 chain, plain gates, glob 0.75, all 16 corners
+  static Params v43(double g0 = 0.2, double g1 = 0.05) {
+    Params p(g0, g1); p.glob = 0.75; p.units = 16; p.fanout = false; p.latch = 0; p.latch_credit = 0; p.gate_err = 0; p.corners = 16;
+    return p;
   }
+  static Params v42(double g0 = 0.2, double g1 = 0.05) { Params p = v43(g0, g1); p.competence = true; return p; }   // 4.3 + competence
 };
 
 // The network: 3 layers x U units (Params::units), mixture over all 3U units (plain average, or competence-weighted).
@@ -715,12 +774,12 @@ template <class T> struct Net {
   Work<T> ws;                                                // scratch for predict()/learn()
   void init(int d_, uint64_t seed = 1, const Params& p = Params()) {
     if (!valid_units(p.units)) throw std::invalid_argument("hgln: Params::units must be 8, 12 or 16");
-    if (p.corners != 16) throw std::invalid_argument("hgln: the float Net has no top-k corners (Params::corners must be 16; NetQ has them)");
+    if (p.corners < 1 || p.corners > 16) throw std::invalid_argument("hgln: Params::corners must be 1..16");
     if (p.gate_err < 0 || p.gate_err > 2) throw std::invalid_argument("hgln: Params::gate_err must be 0, 1 or 2");
     d = d_; P = p; t = 0;
     const int U = P.units;
     L[0].init(d, d + 1, P.competence, U); L[1].init(U, d + 1, P.competence, U); L[2].init(U, d + 1, P.competence, U);
-    for (int l = 0; l < 3; l++) { L[l].latch = (T)P.latch; L[l].credit = (T)P.latch_credit; L[l].gate_err = P.gate_err; }
+    for (int l = 0; l < 3; l++) { L[l].latch = (T)P.latch; L[l].credit = (T)P.latch_credit; L[l].gate_err = P.gate_err; L[l].corners = P.corners; }
     Rng rng(seed); for (auto& l : L) l.random_hyperplanes(rng);
     ws.init(*this);
   }
@@ -755,7 +814,7 @@ template <class T> struct Net {
   T predict(const T* x) { return infer(x, ws); }
   void learn(T y) {                   // must follow predict() on the same sample
     alignas(64) T es[3 * kMaxUnits];
-    T gl = (T)P.glr1 + (T)(P.glr0 - P.glr1) * std::exp(-(T)t / (T)P.tau);
+    T gl = (T)P.glr1 + ((T)P.glr0 - (T)P.glr1) * hgln_exp<T>(-(T)t / (T)P.tau);   // hgln_exp: the GPU kernel's bits too
     T eg = y - ws.out, glob = (T)P.glob;
     const int U = L[0].U, NU = 3 * U;
     if (P.competence) {                // es_i = own error share + responsibility share r_i / sum r^2 of the mixture error

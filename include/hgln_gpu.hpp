@@ -18,6 +18,7 @@
 // Needs the hgln_gpu library (CMake target hgln_gpu, built with FORGE). Copyright (C) Odin Loch. GNU AGPL v3.0+.
 #pragma once
 #include "hgln.hpp"
+#include "hgln_q.hpp"
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -58,7 +59,8 @@ public:
 
   // Copy networks to the device (replacing any there). All must have the same d (1..128) and the same Params
   // (Params::competence included: the kernel runs the 4.3 plain average or, with competence, the 4.2 mixture;
-  // Params::units = 8, 12 or 16 units per layer; Params::fanout: layer 3 reads layer 1, as in Net::infer).
+  // Params::units = 8, 12 or 16 units per layer; Params::fanout: layer 3 reads layer 1, as in Net::infer; and the
+  // version 5.0 options Params::latch, latch_credit, gate_err and corners, which all run on the GPU too).
   // The exact state is copied (unnormalised hyperplanes and their squared norms), so results match the CPU library.
   bool upload(const std::vector<Net<T>>& nets, std::string* why = nullptr);
   // Stream T samples through every network: predict, then learn. X: T x d, Y: nets x T, P: nets x T or nullptr.
@@ -81,5 +83,40 @@ private:
 
 extern template class Bank<double>;
 extern template class Bank<float>;
+
+// The integer network (hgln::NetQ<R>, version 5.0) on a GPU: the same calls as Bank, bit-identical to the CPU NetQ on
+// any device (the kernel, cuda/hgln_q_kernel.h, is integer arithmetic). R (float or double) is the caller's real
+// type for X, Y and P. The scratch is always in global memory (Options::scratch is ignored).
+//   hgln::gpu::BankQ<float> bank;  bank.open(hgln::gpu::Api::cuda);  bank.upload(qnets);  bank.run(X, Y, P, T);
+template <class R> class BankQ {
+public:
+  BankQ();
+  ~BankQ();
+  BankQ(BankQ&&) noexcept;
+  BankQ& operator=(BankQ&&) noexcept;
+  BankQ(const BankQ&) = delete;
+  BankQ& operator=(const BankQ&) = delete;
+  bool open(Api api, int ordinal = 0, std::string* why = nullptr, Options opt = {});
+  bool is_open() const;
+  void close();
+  std::string device_name() const;
+  std::string image() const;
+  // All networks must have the same d (1..128) and Params.
+  bool upload(const std::vector<NetQ<R>>& nets, std::string* why = nullptr);
+  bool run(const R* X, const R* Y, R* P, int samples, std::string* why = nullptr);
+  bool run(const std::vector<R>& X, const std::vector<R>& Y, std::vector<R>& P, int samples, std::string* why = nullptr);
+  bool download(std::vector<NetQ<R>>& nets, std::string* why = nullptr) const;
+  std::size_t size() const;
+  int d() const;
+  std::size_t scratch_bytes() const;        // per network (global memory)
+  long samples_seen(std::size_t net) const;
+
+  struct Impl;
+private:
+  std::unique_ptr<Impl> p_;
+};
+
+extern template class BankQ<double>;
+extern template class BankQ<float>;
 
 } // namespace hgln::gpu

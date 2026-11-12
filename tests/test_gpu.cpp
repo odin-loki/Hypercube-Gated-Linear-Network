@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // test_gpu.cpp - hgln::gpu::Bank end to end: Net -> Bank -> FORGE gpu::cuda_hip runtime -> driver -> hgln_run ->
 // results, compared with the CPU library sample by sample. Under ctest the driver is HGLN's mock (tests/mock_hgln.c),
-// which runs the real kernel source on the CPU, so float64 must agree EXACTLY (0 difference) and float32 to about
-// 1e-6. On a machine with a real GPU and no mock on the library path the same program tests the hardware (then
-// float64 can differ in the last bits: the device exp and sqrt are not the C library's).
+// which runs the real kernel source on the CPU. Float64 and float32 must agree EXACTLY (0 difference): the kernel
+// does the library's IEEE operations in the same order, with the same exp (hgln_exp) and gate (hgln_gate). On a
+// machine with a real GPU and no mock on the library path the same program tests the hardware, where the same holds
+// (checked on an RTX 3090).
 //   hgln_test_gpu cuda|hip       all checks on that API (d = 8, 64, 100; float64 and float32; shared and global
 //                                scratch; both mixtures: 4.3 plain average and 4.2 competence; several calls with
 //                                state resident; download, re-upload, continue; across the prune, the conditional
 //                                renormalisation of an out-of-range layer and the renormalisation at t = 4096)
-//   hgln_test_gpu cuda|hip units=N [fanout]   a shorter set of the same checks for Params::units = N (8, 12 or 16)
-//                                and/or Params::fanout (layer 3 reads layer 1): d = 8, 64, 100; both real types, both
-//                                scratch placements, both mixtures; across the prune, the out-of-range
-//                                renormalisation and the renormalisation at t = 4096
+//   hgln_test_gpu cuda|hip units=N [fanout] [v5=N]   a shorter set of the same checks for Params::units = N (8, 12
+//                                or 16) and/or Params::fanout (layer 3 reads layer 1) and/or the version 5.0 options
+//                                v5=N (1 the v5 options incl. top-6 corners, 2 latch + own-error gates, 3 gate_err 2
+//                                only, 4 the v5 options without top-K, 5 top-8 corners only; see set_v5 below):
+//                                d = 8, 64, 100; both real types, both scratch placements, both mixtures; across the
+//                                prune, the out-of-range renormalisation and the renormalisation at t = 4096
+//                                (the integer network has its own mode, `int`, listed next)
+//   hgln_test_gpu cuda|hip int   the integer network (NetQ) through BankQ: bit-identical predictions and state on any
+//                                driver (the kernel is integer arithmetic): v5 and the 4.3 structure, 8/12/16 units,
+//                                d = 8, 64, 100, both real types, several calls, download / re-upload, across the prune
 //   hgln_test_gpu nodriver       open() without a driver must fail with a reason (exit 77 if a driver is present)
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_gpu.hpp"
@@ -91,12 +98,22 @@ template <class T> static double ref_chunk(std::vector<Net<T>>& ref, const std::
 
 // competence: Params::competence (4.2 mixture). far: start layers 1 and 2 with |H|^2 just under 1e6 / just over 1e-6
 // (same directions), so the update soon takes them out of range and the layer renormalisation runs.
-// units, fanout: Params::units and Params::fanout.
+// units, fanout: Params::units and Params::fanout. g_v5 (option v5=N): the version 5.0 options, as cuda/cuda_emu.cpp:
+// 1 the v5 options (latch 0.1 + latch credit 0.5 + gate_err 2 + glob 0.95 + top-6 corners); 2 latch 0.1 + gate_err 1;
+// 3 gate_err 2 only; 4 = 1 with all 16 corners; 5 top-8 corners only.
+static int g_v5 = 0;
+static void set_v5(Params& p, int v5) {
+  if (v5 == 1 || v5 == 4) { p.latch = 0.1; p.latch_credit = 0.5; p.gate_err = 2; p.glob = 0.95; p.corners = v5 == 1 ? 6 : 16; }
+  else if (v5 == 2) { p.latch = 0.1; p.gate_err = 1; }
+  else if (v5 == 3) p.gate_err = 2;
+  else if (v5 == 5) p.corners = 8;
+}
 template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch scratch, int threads, const std::vector<int>& chunks,
                                    bool competence = false, bool far = false, int units = 16, bool fanout = false) {
   const bool f64 = sizeof(T) == 8;
-  const double tolP = f64 ? 0 : 1e-5, tolS = f64 ? 0 : (N > 4096 ? 1e-3 : 1e-4);
-  Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05); prm.competence = competence; prm.units = units; prm.fanout = fanout;
+  const double tolP = 0, tolS = 0;   // the kernel and the library do the same IEEE operations (hgln_gate, hgln_exp): exact
+  Params prm = Params::v43(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05); prm.competence = competence; prm.units = units; prm.fanout = fanout;
+  set_v5(prm, g_v5);
   std::vector<Net<T>> init(nets);
   for (int n = 0; n < nets; n++) {
     init[n].init(d, 7 + n, prm);
@@ -170,10 +187,59 @@ template <class T> static void one(Api api, int d, int nets, int N, gpu::Scratch
     if (!bank.download(fin, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
     for (int n = 0; n < nets; n++) wR = std::max(wR, state_diff(fin[n], ref[n]));
   }
-  std::printf("%s %s d=%d nets=%d T=%d calls=%d threads=%d scratch=%s(%zu B) image=%s competence=%d units=%d %s%s: max |P diff| = %.3g, state diff mid = %.3g, end = %.3g, after re-upload = %.3g\n",
+  std::printf("%s %s d=%d nets=%d T=%d calls=%d threads=%d scratch=%s(%zu B) image=%s competence=%d units=%d %s%s v5=%d: max |P diff| = %.3g, state diff mid = %.3g, end = %.3g, after re-upload = %.3g\n",
               gpu::api_name(api), f64 ? "float64" : "float32", d, nets, N, calls, threads, bank.shared_scratch() ? "shared" : "global",
-              bank.scratch_bytes(), bank.image().c_str(), competence ? 1 : 0, units, fanout ? "fanout" : "chain", far ? " far" : "", wP, wMid, wS, wR);
+              bank.scratch_bytes(), bank.image().c_str(), competence ? 1 : 0, units, fanout ? "fanout" : "chain", far ? " far" : "", g_v5, wP, wMid, wS, wR);
   CHECK(wP <= tolP && wMid <= tolS && wS <= tolS && wR <= std::max(tolP, tolS), "differences above tolerance (P %.3g, state %.3g)", tolP, tolS);
+  std::fflush(stdout);
+}
+
+// ---- the integer network through BankQ: everything must be bit-identical
+template <class R> static long qstate_diff(const NetQ<R>& a, const NetQ<R>& b) {
+  if (a.t != b.t || a.d != b.d || a.units() != b.units() || a.pruned() != b.pruned()) return 1L << 40;
+  long bad = 0;
+  for (int l = 0; l < 3; l++) {
+    const auto &A = a.L[l], &B = b.L[l];
+    for (int k = 0; k < A.U; k++) {
+      for (int i = 0; i < A.D; i++) { bad += A.gate_weight(k, i) != B.gate_weight(k, i); for (int q = 0; q < 4; q++) bad += A.hyperplane(k, q, i) != B.hyperplane(k, q, i); }
+      for (int j = 0; j < A.N1; j++) { bad += A.active(k, j) != B.active(k, j) || A.activity(k, j) != B.activity(k, j); for (int c = 0; c < 16; c++) bad += A.rule(k, c, j) != B.rule(k, c, j); }
+    }
+  }
+  return bad;
+}
+template <class R> static void oneq(Api api, int d, int nets, int N, int threads, const std::vector<int>& chunks, int units, bool v43) {
+  const double g0 = d > 16 ? 0.02 : 0.2, g1 = d > 16 ? 0.02 : 0.05;
+  Params prm = v43 ? Params::v43(g0, g1) : Params::v5(g0, g1); prm.units = units;
+  std::vector<NetQ<R>> init(nets); for (int n = 0; n < nets; n++) init[n].init(d, 7 + n, prm);
+  std::vector<NetQ<R>> ref = init; Stream<R> st(d, nets, N, 4321 + d);
+  gpu::BankQ<R> bank; std::string why; gpu::Options opt; opt.threads = threads;
+  if (!bank.open(api, 0, &why, opt)) { CHECK(false, "BankQ open: %s", why.c_str()); return; }
+  if (!bank.upload(init, &why)) { CHECK(false, "BankQ upload: %s", why.c_str()); return; }
+  long bp = 0, bmid = 0; int s = 0, calls = 0; std::vector<R> x, y, P;
+  for (size_t c = 0; c < chunks.size() && s < N; c++) {
+    const int len = std::min(chunks[c], N - s); st.chunk(s, len, x, y);
+    if (!bank.run(x, y, P, len, &why)) { CHECK(false, "BankQ run: %s", why.c_str()); return; }
+    calls++;
+    for (int i = 0; i < len; i++) for (int n = 0; n < nets; n++) bp += ref[n].step(&x[(size_t)i * d], y[(size_t)n * len + i]) != P[(size_t)n * len + i];
+    s += len;
+    if (c == 1) { std::vector<NetQ<R>> mid; if (!bank.download(mid, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
+      for (int n = 0; n < nets; n++) bmid += qstate_diff(mid[n], ref[n]); }
+  }
+  std::vector<NetQ<R>> got; if (!bank.download(got, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
+  long bend = 0; for (int n = 0; n < nets; n++) bend += qstate_diff(got[n], ref[n]);
+  long bre = 0;
+  {   // re-upload the downloaded networks and continue on both sides
+    const int extra = 64; Stream<R> st2(d, nets, extra, 77 + d);
+    if (!bank.upload(got, &why)) { CHECK(false, "re-upload: %s", why.c_str()); return; }
+    st2.chunk(0, extra, x, y);
+    if (!bank.run(x, y, P, extra, &why)) { CHECK(false, "run after re-upload: %s", why.c_str()); return; }
+    for (int i = 0; i < extra; i++) for (int n = 0; n < nets; n++) bre += ref[n].step(&x[(size_t)i * d], y[(size_t)n * extra + i]) != P[(size_t)n * extra + i];
+    std::vector<NetQ<R>> fin; if (!bank.download(fin, &why)) { CHECK(false, "download: %s", why.c_str()); return; }
+    for (int n = 0; n < nets; n++) bre += qstate_diff(fin[n], ref[n]);
+  }
+  std::printf("%s integer (%s inputs) d=%d nets=%d T=%d calls=%d threads=%d image=%s units=%d %s: predictions differing %ld, state differing mid %ld, end %ld, after re-upload %ld\n",
+              gpu::api_name(api), sizeof(R) == 8 ? "float64" : "float32", d, nets, N, calls, threads, bank.image().c_str(), units, v43 ? "4.3 structure" : "v5", bp, bmid, bend, bre);
+  CHECK(bp == 0 && bmid == 0 && bend == 0 && bre == 0, "integer network: GPU and CPU must agree bit for bit");
   std::fflush(stdout);
 }
 
@@ -214,24 +280,44 @@ int main(int argc, char** argv) {
   }
   using S = gpu::Scratch;
   const std::vector<int> chunks = {1, 200, 311, 3, 185};   // crosses the prune at sample 512
-  int units = 16; bool fanout = false, variant = false;
+  int units = 16; bool fanout = false, variant = false, integer = false;
   for (int i = 2; i < argc; i++) {
     const std::string a = argv[i];
     if (a == "fanout") fanout = true;
+    else if (a == "int") { integer = true; continue; }
     else if (a.rfind("units=", 0) == 0) units = std::atoi(a.c_str() + 6);
+    else if (a.rfind("v5=", 0) == 0) g_v5 = std::atoi(a.c_str() + 3);
     else { std::printf("unknown option %s\n", a.c_str()); return 1; }
     variant = true;
   }
-  if (variant) {   // Params::units / Params::fanout: a shorter set of the same checks
+  if (integer) {   // the integer network through BankQ
+    for (int u : {8, 12, 16}) {
+      oneq<double>(api, 8, 2, 700, 32, chunks, u, false);
+      oneq<float>(api, 64, 2, 600, 64, chunks, u, false);
+    }
+    oneq<double>(api, 100, 1, 560, 64, chunks, 8, false);
+    oneq<double>(api, 8, 2, 700, 16, chunks, 16, true);                                  // the 4.3 structure
+    oneq<float>(api, 8, 1, 4200, 32, {1, 200, 311, 3, 185, 3500}, 8, false);            // past t = 4096
+    {   // networks with different Params cannot share a bank
+      gpu::BankQ<double> b; std::string why; std::vector<NetQ<double>> mix(2); Params p1, p2; p2.corners = 8;
+      mix[0].init(8, 1, p1); mix[1].init(8, 2, p2);
+      CHECK(b.open(api, 0, &why) && !b.upload(mix, &why), "BankQ upload of networks with different Params must fail");
+    }
+    if (failures) { std::printf("%d FAILURES\n", failures); return 1; }
+    std::printf("ALL GPU TESTS PASSED (%s, integer network)\n", gpu::api_name(api));
+    return 0;
+  }
+  if (variant) {   // Params::units / Params::fanout / the v5 options: a shorter set of the same checks
     if (!valid_units(units)) { std::printf("units must be 8, 12 or 16\n"); return 1; }
-    {   // networks with different units (or fanout) cannot share a bank
+    {   // networks with different units (or fanout, or v5 options) cannot share a bank
       gpu::Bank<double> b; std::string why;
-      Params p1(0.2, 0.05), p2 = p1; p1.units = units; p1.fanout = fanout; p2.units = units == 16 ? 8 : 16; p2.fanout = fanout;
+      Params p1 = Params::v43(0.2, 0.05), p2 = p1; p1.units = units; p1.fanout = fanout; set_v5(p1, g_v5); p2 = p1; p2.units = units == 16 ? 8 : 16;
       std::vector<Net<double>> mix(2); mix[0].init(8, 1, p1); mix[1].init(8, 2, p2);
       CHECK(b.open(api, 0, &why) && !b.upload(mix, &why), "upload of networks with different units must fail");
       std::printf("mixed units: %s\n", why.c_str());
       p2 = p1; p2.fanout = !fanout; mix[1].init(8, 2, p2);
       CHECK(!b.upload(mix, &why), "upload of networks with different fanout must fail");
+      if (g_v5) { p2 = p1; p2.latch = p1.latch > 0 ? 0 : 0.1; mix[1].init(8, 2, p2); CHECK(!b.upload(mix, &why), "upload of networks with different latch must fail"); }
     }
     one<double>(api, 8, 2, 700, S::shared, 32, chunks, false, false, units, fanout);
     one<double>(api, 64, 2, 600, S::global, 64, chunks, true, false, units, fanout);
@@ -242,7 +328,7 @@ int main(int argc, char** argv) {
     one<double>(api, 8, 2, 300, S::shared, 32, {1, 150, 149}, true, true, units, fanout);                     // out-of-range renormalisation
     one<double>(api, 8, 1, 4200, S::global, 32, {1, 200, 311, 3, 185, 3500}, false, false, units, fanout);    // past t = 4096
     if (failures) { std::printf("%d FAILURES\n", failures); return 1; }
-    std::printf("ALL GPU TESTS PASSED (%s, units=%d %s)\n", gpu::api_name(api), units, fanout ? "fanout" : "chain");
+    std::printf("ALL GPU TESTS PASSED (%s, units=%d %s v5=%d)\n", gpu::api_name(api), units, fanout ? "fanout" : "chain", g_v5);
     return 0;
   }
   for (bool cm : {false, true})

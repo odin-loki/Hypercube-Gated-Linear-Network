@@ -1,4 +1,4 @@
-# HGLN optimisation notes (version 4.2-opt)
+# HGLN optimisation notes (version 4.2-opt, and the version 5.0 integer net in section 5)
 
 > **Update:** the CMake build now uses FORGE for run-time SIMD dispatch (faster than the native build below: 4.9 µs at d = 8, 192 µs at d = 64 with 10 nets) and for GPU execution through FORGE's CUDA/HIP runtime. See [FORGE.md](FORGE.md).
 
@@ -42,8 +42,8 @@ This page records what was changed to make the C++ library and the CUDA kernel f
 | NumPy vs C++ parity, 2,000 samples, through the prune | float64 2.9e-15 (d = 8), 1.8e-15 (d = 64); float32 1.3e-6, 1.2e-6 (tolerances 1e-12 / 1e-4). Same with clang++ 18, with no `-march`, and with the plain-C++ fallback (`-DHGLN_NO_VECTOR_EXT`) |
 | Digits, C++ classifier, one shuffle, 3 passes | 95.8 / 98.3 / 98.5% holdout, identical to the original build |
 | Threaded vs serial | `train_batch`, pooled `train()`, `predict_batch` and `run_streams` give bit-identical models and outputs to the serial calls (tests in `tests/test_api.cpp`) |
-| CUDA kernel on the CPU emulator vs the C++ library | float64: exactly 0 difference in predictions and in all live state, for d = 8, 64 and 100, with scratch in global memory and in (NaN-prefilled) shared memory. float32: about 1e-6 |
-| CUDA kernel compiled for a GPU | Compiles with clang 18 to PTX for sm_70 and sm_80, float64 and float32, with `-Wall -Werror` and no unresolved external calls (`make ptx`). **Not run on a GPU; not assembled with ptxas.** |
+| CUDA kernel on the CPU emulator vs the C++ library | float64: exactly 0 difference in predictions and in all live state, for d = 8, 64 and 100, with scratch in global memory and in (NaN-prefilled) shared memory. float32: about 1e-6 (version 4.2-opt measurement; *since then float32 is exact too, 0 difference*) |
+| CUDA kernel compiled for a GPU | Compiles with clang 18 to PTX for sm_70 and sm_80, float64 and float32, with `-Wall -Werror` and no unresolved external calls (`make ptx`). **Not run on a GPU; not assembled with ptxas.** *Since run on an RTX 3090: 0 difference (`FORGE.md`).* |
 
 ## 2. What changed in the C++ library (`include/hgln.hpp`)
 
@@ -74,7 +74,7 @@ Portability: the vector code uses GCC/Clang vector extensions. Other compilers (
 - **Dead work skipped.** The activity trace and the prune scan stop after the prune time `hg_prune_time(warm)` (sample 512).
 - **Same gate and renormalisation as the C++ library** (`hgln_gate()`, multiply by 1/|H|), so the emulator still agrees exactly.
 - **Builds without the CUDA SDK.** `cuda/hgln_ptx.cu` wraps the kernel in a header-free shim and `make ptx` builds PTX with plain clang. It uses the recipe FORGE uses for its GPU images (see `FORGE.md`). The shim supplies thread IDs through NVVM builtins and its own `exp`, so the PTX has no libdevice calls and a driver can JIT-load it directly.
-- `hgln_cuda.cu` now frees its device memory. It is still **not compiled** (no nvcc here).
+- `hgln_cuda.cu` now frees its device memory. It was then still **not compiled** (no nvcc here). *Since compiled with nvcc 12.0 and run on an RTX 3090: its selftest gives 0 difference.*
 
 The emulator (`cuda_emu d nets T threads [shared]`) now exits non-zero on a mismatch. In shared mode it fills the scratch with NaN first, so any read of scratch before it is written would show up as a difference.
 
@@ -83,11 +83,56 @@ The emulator (`cuda_emu d nets T threads [shared]`) now exits non-zero on a mism
 - **Runtime CPU dispatch.** *Now done with FORGE, see `FORGE.md`; this item describes the header-only build.* The fast path depends on the compile flags. A build without `-march` (plain SSE2) is correct but runs at the original speed (about 15 us at d = 8). `make ARCH=-march=x86-64-v3` gives a binary for any AVX2 machine. FORGE's `simd` layer picks kernels at run time, and so could HGLN (see `FORGE.md`).
 - **FMA contraction.** It is now explicitly off everywhere (`-ffp-contract=off` in the Makefile, in every SIMD and GPU translation unit, and in the PTX/AMDGPU builds). Correction: g++ defaults to `-ffp-contract=fast` for C++ even with `-std=c++17`, and clang's CUDA mode fuses multiply-adds too. So the measurements in section 1 (Makefile, g++ `-march=native`) were taken with FMAs fused, and the first PTX contained FMAs. With contraction off, every build (g++ or clang, any `-march`, any SIMD table, the fallback path) gives the same output bits.
 - **Splitting one network across threads.** One network's sample costs 2.5 to 15 us, and the layers depend on each other, so a hand-off per layer would cost about as much as it saves. Only independent networks are parallelised.
-- **GPU.** Nothing has run on a GPU. Real-hardware parity, race behaviour and speed are unknown, as before.
-- **Skipping negligible corners** (roadmap item 6 of the implementation spec) changes the algorithm and was not attempted.
+- **GPU.** *Since done:* both kernels (float and integer) have run on an NVIDIA RTX 3090 and reproduce the CPU library bit for bit, float64, float32 and int16 (see `FORGE.md`). GPU speed has not been studied.
+- **Skipping negligible corners** (roadmap item 6 of the implementation spec) changes the algorithm and was not attempted here. *Since done as top-K corners (`Params::corners`, default 6 in version 5.0, `ALGORITHM.md` section 8a).*
 - The NumPy reference (`python/hgln_ref.py`) is unchanged: it is the oracle the C++ is checked against.
 
-## 5. How to reproduce
+## 5. The version 5.0 integer net (`include/hgln_q.hpp`)
+
+**Machine.** WSL2 on a 32-core Xeon Gold 6242 (AVX-512 with VNNI), g++ 13.3, `-O3 -march=native -ffp-contract=off`, one thread. The host was about 60% busy with unrelated jobs, so single runs varied by up to ±40%. Every figure below is the **minimum over 25 rounds** in which all versions ran alternately on rotating cores (`qbench`: v5 settings, 1 net at d = 8, 4 nets at d = 64, past the prune). The float32 rows, identical code in every round, varied by about ±5%.
+
+| µs per sample (predict + learn) | d = 8 | d = 64 | Bytes per net after the prune (d = 8 / 64) |
+|---|---|---|---|
+| float32 `Net`, 4.3 settings, 8 units | 2.49 | 4.9-5.2 | 16,664 / 61,496 |
+| float32 `Net`, v5 settings but all 16 corners (measured before the float `Net` had top-K) | 3.9-4.1 | 6.5-6.9 | 16,664 / 61,496 |
+| int16 `NetQ`, stochastic rounding (before) | 14.7 | 32.9 | 8,672 / 31,872 |
+| int16 `NetQ`, round to nearest | 7.3 | 14.7 | 8,624 / 31,824 |
+| **int16 `NetQ`, now** | **5.95** | **13.4** | **8,624 / 31,824** |
+
+The "before" row is from single runs. Every change below is exact: all CPU targets (scalar, SSE2, AVX2, AVX-512 with and without VNNI, clang and g++, the plain-C++ fallback) stay bit-identical to the research reference (`tests/test_q.cpp`).
+
+1. **No random numbers.** Round-to-nearest-even replaces Philox stochastic rounding (the accuracy study is in `ALGORITHM.md` section 8c). This removed about half of `learn`.
+2. **Rule-step scalars across units.** The squared heatmap norm, the LMS denominator, the exact division and the 16 rule steps of every unit are computed with one unit per lane, through the same exact vector division the gate steps use, instead of per unit in scalar code.
+3. **Rule-weight update in double precision.** `rne(sc x, F)`: `|sc x| < 2^46` is exact in a double, the scaling by `2^-F` is exact, and an AVX-512 conversion with embedded round-to-nearest-even gives exactly the spec's `rne`. This replaces a 64-bit multiply, a 5-instruction rounding and a narrowing per element.
+4. **Top-K threshold with a compile-time sorting network.** Batcher's odd-even merge sort (63 compare-exchanges) is unrolled at compile time, so the 16 keys stay in registers; the old version read the pairs from a table and kept the keys on the stack.
+5. **Gate dot products with `vpdpwssd` / `vpmaddwd`.** `|H|` and the gate inputs fit in int16 and the spec's sums wrap mod 2^32, so inputs i and i+1 are interleaved and accumulated as int16 pairs. This cut prediction at d = 64 by about 25% (4.6 to 3.5 µs).
+6. **Fixed:** the plain-C++ fallback (`-DHGLN_NO_VECTOR_EXT`, the path MSVC would take) did not compile; scalar operands of mixed type now broadcast as they do with the vector extension.
+
+**Tried and dropped** (slower in the alternating runs): keeping the hyperplane scratch as int64 to avoid narrowing and widening (+1 to +2 µs, from the doubled memory traffic); one shared reciprocal for the latch's two divisions together with skipping the "keep H when its norm is 0" blend (+0.5 to +2 µs).
+
+**Earlier conclusion (before the mixed datapath).** The goal was the integer net at least as fast as float32 at 8 units. With exact integer learning it stayed 2.4x (d = 8) and 2.6x (d = 64) slower than float32 with the 4.3 settings. The main cost was the gate-weight / hyperplane update and its exact renormalisation, whose 64-bit intermediates (`cb x p x s` reaches 2^55) run 8 lanes per AVX-512 register where float32 runs 16. Closing the gap needed a spec change.
+
+### 5b. Mixed float / integer learning (the current spec)
+
+The integer net keeps its int16 state and its integer forward pass, which is already about as fast as float32. Learning is now mixed (`hgln_qspec.hpp` section 6, accuracy in `ALGORITHM.md` section 8c):
+- **Per-element updates in float32.** The gate-weight, hyperplane (with its renormalisation: one `sqrt` and one division per row) and rule-weight updates are float32 on 16 lanes instead of int64 on 8, rounded back to int16 with `(v + 1.5 2^23) - 1.5 2^23`.
+- **Three control-scalar divisions in double.** The latch gradient, its credit and the LMS rate use one IEEE double division rounded to nearest, instead of the exact integer division with correction steps.
+- **Implementation fixes found while profiling:** integer clamps now compile to min / max instructions instead of compare-and-select, and the renormalisation skips its "keep H" blend when no row needs it.
+
+The float `Net` was profiled at the same time. The latch's `hgln_exp` now runs in simple loops that vectorise (float32 v5 prediction 2.1 -> 1.3 us at d = 8), and the top-K ranking is a branch-free vector pass over the 120 corner pairs (1.3 -> 0.15 us per layer; the first, branchy version cost about 20 us per sample).
+
+Speed, best of 12 alternating rounds (`qbench`: one net at d = 8, four at d = 64, past the prune; �s per sample, predict + learn):
+
+| | d = 8, g++ | d = 8, clang 18 | d = 64, g++ | d = 64, clang 18 |
+|---|---|---|---|---|
+| float32 `Net`, 4.3 settings, 8 units | 2.03 | 2.21 | 4.46 | 4.44 |
+| float32 `Net`, v5 defaults (top-6 corners) | 3.12 | 3.54 | 5.57 | 5.73 |
+| int16 `NetQ`, exact integer learning | 5.77 | 5.09 | 12.01 | 11.03 |
+| **int16 `NetQ`, mixed learning (version 5.0)** | **5.34** | **4.73** | **10.89** | **10.08** |
+
+**Result.** The integer net is 1.3-1.7x (d = 8) and 1.8-2.0x (d = 64) slower than float32 running the same v5 model, while using half the memory and giving the same bits on every CPU and GPU. It is not at parity. Most of what remains is the per-element update work: float32 updates a value in place, while the integer net converts int16 to float, rounds and clamps back, and makes a second pass for the exact per-row renormalisation. Further steps that would change the spec again: norm tracking instead of per-sample renormalisation (as float 4.3 does), and processing two inputs per register for the 8-unit layers (that changes the summation order of the row norms).
+
+## 6. How to reproduce
 
     make && make test      # behavioural, parity, emulator (global + shared, float64 + float32), PTX, digits
     make bench             # the speed table above (this machine's numbers will differ)

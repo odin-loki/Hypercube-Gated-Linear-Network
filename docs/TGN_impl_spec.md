@@ -1,7 +1,7 @@
 # HGLN: C++ and CUDA Implementation Spec
 
 **Author:** Odin Loch
-**Status:** Version 2. Companion to `TGN_spec.md` (algorithm version 4.1). The C++ library is built, verified, SIMD-tuned and multithreaded (see `OPTIMISATION.md`). The CUDA kernel compiles to PTX with clang and is verified on a CPU emulator. It has **not been run on a GPU**, and the nvcc host program has not been compiled. Licence: AGPL-3.0-or-later.
+**Status:** Version 2. Companion to `TGN_spec.md` (algorithm version 4.1). The C++ library is built, verified, SIMD-tuned and multithreaded (see `OPTIMISATION.md`). The CUDA kernel compiles to PTX with clang and is verified on a CPU emulator. It has since **run on an NVIDIA RTX 3090**, bit-identical to the CPU library, and the nvcc host program has been compiled with nvcc 12.0. Licence: AGPL-3.0-or-later.
 
 ## 1. What is verified and what is not
 
@@ -10,7 +10,7 @@
 | C++17 library, float64 and float32 | Built and verified against the NumPy reference (section 6) |
 | SIMD tuning, pruned-column compaction, multithreading | Done (section 8, `OPTIMISATION.md`); verified by the same parity tests and by threaded-equals-serial tests |
 | Speed measurement | Measured before and after on one 4-vCPU machine (section 7) |
-| CUDA / HIP kernel | Runs through FORGE's CUDA/HIP runtime (`FORGE.md`) and matches the library exactly against a mock driver. Built as PTX (sm_70, sm_80) and AMD code objects with clang, no SDK. Not run on real GPU hardware |
+| CUDA / HIP kernel | Runs through FORGE's CUDA/HIP runtime (`FORGE.md`) and matches the library exactly against a mock driver. Built as PTX (sm_70, sm_80) and AMD code objects with clang, no SDK. Run on an NVIDIA RTX 3090, bit-identical to the CPU library (AMD not tested) |
 | Run-time SIMD dispatch | Done with FORGE: scalar, AVX2 and AVX-512 tables, bit-identical |
 
 The library reproduces the algorithm (differences of about 1e-15 in float64 and about 1e-6 in float32 on prediction values). It is still slower than a matched small MLP, but the gap is now 3x at d = 8 and 3 to 9x at d = 64 (section 7).
@@ -56,7 +56,7 @@ Per-sample scratch: `inp` (N1), `u` copy (D), `pu` (U x D), `a` (U x 4), `h` (U 
 
 ## 4. Exact procedure
 
-> This section is the version 4.2 procedure (`Params::v42()`). Version 4.3, the library default, makes two changes, both specified in `ALGORITHM.md` section 1. It tracks hyperplane norms in closed form, which is the same model with less work. It uses a plain average of the units with `es_i = (1 - glob)(y - o_i) + glob (y - out)` and no competence map.
+> This section is the version 4.2 procedure (`Params::v42()`). Version 4.3 (`Params::v43()`; the default is now version 5.0, `ALGORITHM.md` section 8) makes two changes, both specified in `ALGORITHM.md` section 1. It tracks hyperplane norms in closed form, which is the same model with less work. It uses a plain average of the units with `es_i = (1 - glob)(y - o_i) + glob (y - out)` and no competence map.
 
 **Predict(x).**
 1. `u = [x; 1] / ||[x; 1]||` (length D).
@@ -154,9 +154,9 @@ Items 1, 2, 4 and 5 are done, measured and verified (`OPTIMISATION.md`). Item 1 
 5. Use float32 (about 1.5 times faster at d = 64 in section 7; little change at d = 8).
 6. Skip corners with negligible `h_c`. **This changes the algorithm** and must be re-validated for accuracy before use.
 
-## 9. CUDA design (compiled to PTX and emulated; not run on a GPU)
+## 9. CUDA design (compiled to PTX, emulated, and run on an RTX 3090)
 
-The implemented kernel (`cuda/hgln_kernel.h`) uses one thread block per network, with all 48 units of that network inside the block and a block barrier between phases, rather than the per-unit mapping sketched below. That suits the target of many independent networks at once. Since version 2 the per-sample scratch can live in dynamic shared memory: 23 to 36 KB per block in float64 for d = 8 to 100. The p and hyperplane steps are fused, and dead work after the prune is skipped. `cuda/hgln_ptx.cu` builds the kernel to PTX without the CUDA SDK, using the same method as FORGE (`FORGE.md`).
+The implemented kernel (`cuda/hgln_kernel.h`) uses one thread block per network, with all 3U units of that network (`Params::units` per layer) inside the block and a block barrier between phases, rather than the per-unit mapping sketched below. That suits the target of many independent networks at once. Since version 2 the per-sample scratch can live in dynamic shared memory: 23 to 36 KB per block in float64 for d = 8 to 100. The p and hyperplane steps are fused, and dead work after the prune is skipped. `cuda/hgln_ptx.cu` builds the kernel to PTX without the CUDA SDK, using the same method as FORGE (`FORGE.md`).
 
 The original design notes:
 

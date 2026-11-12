@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Hypercube Gated Linear Network (HGLN), version 4.
+"""Hypercube Gated Linear Network (HGLN), version 4 (also implements the version 5.0 options: latch, latch_credit,
+gate_err and top-K corners).
 Stateless online learner. Each unit has 4 learned hyperplanes -> a 16-corner heatmap -> a blend of 16 local linear rules.
 The prediction is a competitive mixture over all hidden units (weights = each unit's local competence), and each unit
 learns from a blend of its own error and its responsibility-share of the mixture's error (global gradient).
@@ -133,9 +134,19 @@ class HC(GatedLayer):
 class HC2(HC):
     """Hypercube unit with a per-corner competence map m (running squared error of the unit's own prediction).
     latch > 0 (version 5.0): cross-layer latch - with a lower layer given, each bit holds the same unit's bit of the
-    lower layer inside the dead band |z| < latch: a = set + (1 - set - reset) a_lower."""
-    def __init__(s, U, n_in, K, d, rng, glr, latch=0.0):
-        super().__init__(U, n_in, K, d, rng, glr, False, 0.0); s.m = np.full((U, 16), 0.3); s.latch = latch
+    lower layer inside the dead band |z| < latch: a = set + (1 - set - reset) a_lower.
+    corners < 16 (version 5.0): top-K corners - corner c is selected iff fewer than K corners have a larger soft value
+    (ties to the lower corner); the rules use the selected values renormalised to sum 1, the gate gradient the soft
+    values of the selected corners."""
+    def __init__(s, U, n_in, K, d, rng, glr, latch=0.0, corners=16):
+        super().__init__(U, n_in, K, d, rng, glr, False, 0.0); s.m = np.full((U, 16), 0.3); s.latch = latch; s.corners = corners
+    def top_corners(s):
+        V = s.h; c = np.arange(16)
+        rank = ((V[:, None, :] > V[:, :, None]) | ((V[:, None, :] == V[:, :, None]) & (c[None, :] < c[:, None])[None])).sum(2)
+        s.hs = V.copy(); s.sel = (rank < s.corners).astype(float)
+        sm = np.array([sum(float(V[k, j]) for j in range(16) if s.sel[k, j]) for k in range(V.shape[0])])
+        s.h = np.where(s.sel > 0, s.hs / sm[:, None], 0.0)
+        s.mix = (s.h * s.f).sum(1); s.pred = np.clip(s.mix, -2, 2)
     def forward(s, a, u, lower=None):
         out = super().forward(a, u)
         s.latched = s.latch > 0 and lower is not None
@@ -148,6 +159,7 @@ class HC2(HC):
             s.mix = (s.h * s.f).sum(1); s.pred = np.clip(s.mix, -2, 2); out = s.pred
         else:
             s.kap = s.a * (1 - s.a); s.hold = np.zeros_like(s.a)
+        if s.corners < 16: s.top_corners(); out = s.pred
         return out
     def comp(s):                                           # input-dependent competence of each unit
         return 1.0 / ((s.h * s.m).sum(1) + 1e-3)
@@ -157,7 +169,8 @@ class HC2(HC):
         lower layer's bits); acc_in is added to this layer's (clipped) gate steps."""
         e = y - s.pred
         s.m = s.m + 0.02 * s.h * ((e ** 2)[:, None] - s.m)
-        hf = s.h * s.f; F1 = hf @ s.B; F0 = hf.sum(1, keepdims=True) - F1
+        hf = (s.hs * s.f) * s.sel if s.corners < 16 else s.h * s.f
+        F1 = hf @ s.B; F0 = hf.sum(1, keepdims=True) - F1
         ge = es if gate_err == 0 else (e if gate_err == 1 else np.full_like(es, eg))
         if s.latched:
             dm = F1 / s.a - F0 / (1 - s.a)
@@ -182,9 +195,9 @@ class HGLN:
     """3 hidden layers of Wd units (no separate readout). Prediction = competitive mixture over all 3*Wd units.
     fanout=True: layer 3 reads layer 1's outputs instead of layer 2's (layers 2 and 3 both fed by layer 1)."""
     def __init__(s, seed, d, Wd=16, glr0=0.2, glr1=0.05, tau=1000.0, mu=0.3, glob=0.75, warm=512, competence=True, fanout=False,
-                 latch=0.0, latch_credit=0.0, gate_err=0):
+                 latch=0.0, latch_credit=0.0, gate_err=0, corners=16):
         r = np.random.default_rng(seed)
-        s.L = [HC2(Wd, d, 16, d, r, glr0, latch), HC2(Wd, Wd, 16, d, r, glr0, latch), HC2(Wd, Wd, 16, d, r, glr0, latch)]
+        s.L = [HC2(Wd, d, 16, d, r, glr0, latch, corners), HC2(Wd, Wd, 16, d, r, glr0, latch, corners), HC2(Wd, Wd, 16, d, r, glr0, latch, corners)]
         s.latch, s.credit, s.gate_err = latch, latch_credit, gate_err
         s.Wd, s.glr0, s.glr1, s.tau, s.mu, s.glob, s.warm, s.t = Wd, glr0, glr1, tau, mu, glob, warm, 0
         s.competence = competence   # False: version 4.3, plain average of the units (no competence weighting)

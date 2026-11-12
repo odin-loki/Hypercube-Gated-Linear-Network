@@ -4,7 +4,7 @@
 #   cmake --build build/forge && ctest --test-dir build/forge
 # The plain Makefile still builds the dependency-free header-only library and its tests.
 cmake_minimum_required(VERSION 3.25)
-project(HGLN VERSION 4.3.0 LANGUAGES C CXX)
+project(HGLN VERSION 5.0.0 LANGUAGES C CXX)
 
 option(HGLN_WITH_FORGE "Build the FORGE SIMD-dispatch and GPU backends" ON)
 option(HGLN_BUILD_TESTS "Build HGLN tests" ON)
@@ -69,12 +69,17 @@ if(HGLN_BUILD_TESTS)
       add_test(NAME hgln_parity_v43f_u16_f64_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli> ${d} 1e-12 v43f 16)
       add_test(NAME hgln_parity_v43f_u16_f32_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli_f> ${d} 1e-4 v43f 16)
     endforeach()
-    foreach(u 8 12 16)   # version 5.0 float options: cross-layer latch, latch credit, gate error
-      foreach(m v5 v5c)
+    # version 5.0 options: cross-layer latch, latch credit, gate error, top-K corners. Top-K modes (v5, v5c, v43k) in
+    # float64 only: float32 rounding resolves near-ties of the hard selection differently (python/parity.py)
+    foreach(u 8 12 16)
+      foreach(m v5 v5d v5c)
         foreach(d 8 64)
           add_test(NAME hgln_parity_${m}_u${u}_f64_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli> ${d} 1e-12 ${m} ${u})
-          add_test(NAME hgln_parity_${m}_u${u}_f32_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli_f> ${d} 1e-4 ${m} ${u})
         endforeach()
+      endforeach()
+      foreach(d 8 64)
+        add_test(NAME hgln_parity_v5d_u${u}_f32_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli_f> ${d} 1e-4 v5d ${u})
+        add_test(NAME hgln_parity_v43k_u${u}_f64_d${d} COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/parity.py $<TARGET_FILE:hgln_cli> ${d} 1e-12 v43k ${u})
       endforeach()
     endforeach()
     add_test(NAME hgln_digits COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/digits_test.py $<TARGET_FILE:hgln_cli> 3)

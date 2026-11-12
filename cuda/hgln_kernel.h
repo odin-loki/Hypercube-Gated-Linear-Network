@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// hgln_kernel.h - HGLN (v4.3) batched kernel: one thread block per independent network; each block streams T samples
+// hgln_kernel.h - HGLN batched kernel (the v5.0 options; 4.3 / 4.2 through the arguments): one thread block per independent network; each block streams T samples
 // (predict + learn per sample) entirely on the device. Networks share the input stream X and have their own targets Y.
 // The same source compiles with nvcc (CUDA) and, through the macros below, as plain C++ for the CPU emulator
-// (cuda_emu.cpp), which is how the logic was tested. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
+// (cuda_emu.cpp), which is how the logic was tested; it has also run on an RTX 3090, bit-identical to the library. Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 //
 // Same algorithm and operation order as the C++ library (include/hgln.hpp), so float64 results are bit-identical:
 //   * Norm tracking (4.3): hyperplanes H are stored unnormalised with their squared norms Q. The gate uses
 //     z_b = (H_b . (p*u)) / |H_b|; the hyperplane step H_b += (cb |H_b|) p*u updates Q in closed form, so there is no
 //     renormalisation pass per sample. A layer is renormalised only when one of its Q leaves (1e-6, 1e6), and every
 //     layer every 4096 samples, exactly as Layer::update_k / Net::learn do.
-//   * competence = 0 (4.3 default): the mixture is the plain average of the 3U units and there is no competence map;
+//   * competence = 0 (default since 4.3): the mixture is the plain average of the 3U units and there is no competence map;
 //     competence = 1: the version 4.2 competence-weighted mixture (map m, responsibilities r).
 //   * The per-sample scratch can live in dynamic shared memory (pass scratch = nullptr and launch with
 //     hg_dims(d, units).scs * sizeof(hreal) bytes of dynamic shared memory) instead of global memory.
@@ -41,10 +41,17 @@ typedef HG_REAL hreal;
 #define HG_HD
 #endif
 #ifndef HG_EXP              // device maths; hgln_ptx.cu (header-free clang build) supplies its own
+#if defined(__CUDACC__)     // nvcc: the CUDA maths functions are overloaded for float
 #define HG_EXP(x) exp(x)
 #define HG_SQRT(x) sqrt(x)
 #define HG_FABS(x) fabs(x)
 #define HG_RINT(x) nearbyint(x)
+#else                       // host (the CPU emulators): std:: keeps float as float, as the library and the GPU do
+#define HG_EXP(x) std::exp(x)
+#define HG_SQRT(x) std::sqrt(x)
+#define HG_FABS(x) std::fabs(x)
+#define HG_RINT(x) std::nearbyint(x)
+#endif
 #endif
 #define HG_MAXN 128        // largest supported input size d (prune scratch)
 #define HG_FOR(i, N) for (int i = tid; i < (int)(N); i += nt)
@@ -106,34 +113,71 @@ HG_DEV hreal hg_unit_mix(const hreal* hk, const hreal* fk, const hreal* mk, hrea
   return mix < -2 ? (hreal)-2 : (mix > 2 ? (hreal)2 : mix);
 }
 
+// Cross-layer latch of one gate (Params::latch, Layer::gates_finish_k): set / reset sigmoids around +-theta, holding
+// the lower layer's bit q0 in between. a = clip(st + (1 - st - rt) q0); kap = d a / d(12 z); hold = 1 - st - rt.
+HG_DEV void hg_latch(hreal zz, hreal th, hreal q0, hreal* a, hreal* kap, hreal* hold) {
+  const hreal BETA = 12;
+  const hreal st = (hreal)1 / ((hreal)1 + hgln_exp<hreal>(-BETA * (zz - th))), rt = (hreal)1 / ((hreal)1 + hgln_exp<hreal>(-BETA * (-zz - th)));
+  const hreal v = st + ((hreal)1 - st - rt) * q0;
+  *a = v < (hreal)1e-4 ? (hreal)1e-4 : (v > (hreal)(1 - 1e-4) ? (hreal)(1 - 1e-4) : v);
+  if (kap) *kap = st * ((hreal)1 - st) * ((hreal)1 - q0) + rt * ((hreal)1 - rt) * q0;
+  if (hold) *hold = (hreal)1 - st - rt;
+}
+// Top-K corners of one unit (Params::corners = K < 16, Layer::top_corners): corner c is selected iff fewer than K
+// corners have a larger soft value (ties to the lower corner); hk becomes the selected values renormalised to sum 1
+// (sum over the selected corners, c ascending), 0 elsewhere; hs keeps the soft values and sel the selection (1 / 0).
+HG_DEV void hg_top_corners(hreal* hk, hreal* hs, hreal* sel, int K) {
+  hreal v[16], sm = 0; bool s[16];
+  for (int c = 0; c < 16; c++) v[c] = hk[c];
+  for (int c = 0; c < 16; c++) { int r = 0; for (int c2 = 0; c2 < 16; c2++) r += (int)(v[c2] > v[c]) | ((int)(v[c2] == v[c]) & (int)(c2 < c)); s[c] = r < K; }
+  for (int c = 0; c < 16; c++) if (s[c]) sm += v[c];
+  for (int c = 0; c < 16; c++) { hs[c] = v[c]; sel[c] = s[c] ? (hreal)1 : (hreal)0; hk[c] = s[c] ? v[c] / sm : (hreal)0; }
+}
+// Gate step j (= l * 4U + k * 4 + b) applied to the tracked norm (Layer::update_k): cr = cb / |H_b|, st = cb |H_b|,
+// |H_b + st pu|^2 = q + 2 st (|H_b| z_b) + st^2 |pu|^2. Returns true if the new squared norm left (1e-6, 1e6).
+HG_DEV bool hg_gate_step(int j, hreal cb, hreal* Q, hreal* cr, hreal* st, const hreal* zn, hreal pqv) {
+  const hreal q = Q[j], nq = HG_SQRT(q), rs = (hreal)1 / nq, s1 = cb * nq;
+  cr[j] = cb * rs; st[j] = s1;
+  const hreal q2 = q + (hreal)2 * s1 * (nq * zn[j]) + s1 * s1 * pqv;
+  Q[j] = q2;
+  return !(q2 > (hreal)1e-6 && q2 < (hreal)1e6);
+}
+
 // X: T x d (shared). Y, P: nets x T. State arrays: nets x per-network size (hgln_dims.h, hg_dims(d, units)).
 // tcount: samples already seen (in/out). scratch: nets x g.scs in global memory, or nullptr to use g.scs values of
 // dynamic shared memory per block. competence: 0 = plain average (4.3), 1 = competence-weighted mixture (4.2); mall
 // is only touched with 1. units: Params::units (must equal g.U; otherwise the kernel returns without doing anything).
-// fanout: Params::fanout (layer 3 reads layer 1's outputs instead of layer 2's).
+// fanout: Params::fanout (layer 3 reads layer 1's outputs instead of layer 2's). Version 5.0 options: latch =
+// Params::latch (> 0: cross-layer latch on layers 2 and 3, holding the bits of the layer each reads from), credit =
+// Params::latch_credit (> 0 with latch: the held part of the gate gradient, routed to the lower layer's gate step),
+// gate_err = Params::gate_err (gate steps from 0 the mixed error, 1 the unit's own error, 2 the global error), corners =
+// Params::corners (top-K corners per unit, 16 = all).
 //
 // Phases per sample (B = barrier; a phase's tasks are spread over the block's threads):
 //   G   all 3 layers' gates (12U tasks: z_b, a_b, |p*u|^2) and layer 1's 16U rule dot products (inputs known)  B
 //   M1  layer 1's mixture (computes its heatmap first) and the heatmaps of layers 2 and 3                      B
 //   chain:  F2 B  M2 B  F3 B  M3 B        fanout: F2+F3 B  M2+M3 B      (F = 16U dot products, M = U mixtures)
 //   U1  per-unit scalars; every thread forms the network mixture and error signals itself (no serial phase)   B
+//       (latch credit: U1 stores the gate steps and the credit, B, then U1b adds the credit to the lower layers)
 //   U2  p / hyperplane / rule / activity steps; thread 0 also prepares the next sample's u and input          B
 //   (rare: R renormalisation B, the one-off prune B)
-// = 8 barriers per sample for the chain, 6 with fanout (the earlier layer-by-layer kernel had 13).
+// = 8 barriers per sample for the chain, 6 with fanout (the earlier layer-by-layer kernel had 13); latch credit: + 1.
+// With the latch or top-K corners, M1 runs one task per unit of every layer (latched gates, kap / hold, heatmap, top-K).
 // Every value is computed with the library's operation order (Net::infer / Layer::*_k / Net::learn).
 HG_KERNEL void hgln_run(HgDims g, hreal* Hall, hreal* Qall, hreal* pall, hreal* Wall, hreal* Mall, hreal* Aall, hreal* mall,
                         hreal* scratch, const hreal* X, const hreal* Y, hreal* P, long* tcount, int T,
-                        hreal glr0, hreal glr1, hreal tau, hreal glob, hreal mu, int warm, int competence, int units, int fanout) {
+                        hreal glr0, hreal glr1, hreal tau, hreal glob, hreal mu, int warm, int competence, int units, int fanout,
+                        hreal latch, hreal credit, int gate_err, int corners) {
   HG_SMEM_DECL
   if (units != g.U) return;                                  // uniform: the whole block leaves before any barrier
   const int tid = HG_TID, nt = HG_NT, net = HG_BID, D = g.D, d = g.d, U = g.U, NU = 3 * U, U4 = 4 * U, U16 = 16 * U;
-  const bool cmp = competence != 0, fan = fanout != 0;
+  const bool cmp = competence != 0, fan = fanout != 0, lat = latch > 0, cred = lat && credit > 0, topk = corners < 16;
   hreal* H = Hall + net * g.Hs; hreal* Q = Qall + net * g.Qs; hreal* p = pall + net * g.ps; hreal* W = Wall + net * g.Ws;
   hreal* M = Mall + net * g.Ms; hreal* A = Aall + net * g.Ms; hreal* m = cmp ? mall + net * g.ms : nullptr;
   hreal* S = scratch ? scratch + net * g.scs : HG_SMEM;
   hreal *ub = S + g.o_u, *inp = S + g.o_inp, *a = S + g.o_a, *zn = S + g.o_zn, *pq = S + g.o_pp, *h = S + g.o_h,
         *f = S + g.o_f, *xm = S + g.o_xm, *pred = S + g.o_pred, *comp = S + g.o_comp, *cr = S + g.o_cb, *st = S + g.o_st,
-        *c2 = S + g.o_c2, *sc = S + g.o_sc;
+        *c2 = S + g.o_c2, *sc = S + g.o_sc, *kap = S + g.o_kap, *hold = S + g.o_hold, *cv = S + g.o_cv, *hsa = S + g.o_hs, *sela = S + g.o_sel;
   // sc[4 + l] = 1 if a squared norm of layer l left (1e-6, 1e6) this sample
   long t = tcount[net];
   const long tp = hg_prune_time(warm), RENORM = 4096;        // RENORM: hgln::Net::kRenormEvery
@@ -173,7 +217,28 @@ HG_KERNEL void hgln_run(HgDims g, hreal* Hall, hreal* Qall, hreal* pall, hreal* 
     HG_SYNC();
     // ---- M1: layer 1's heatmaps + mixtures (one task per unit) and the heatmaps of layers 2 and 3
     if (tid == 0) { sc[4] = 0; sc[5] = 0; sc[6] = 0; }      // every thread has passed the previous sample's reads
-    HG_FOR(idx, U + 2 * U16) {
+    if (lat || topk) HG_FOR(gu, NU) {                      // per unit: its 4 (latched) gates, kap / hold, heatmap, top-K
+      const int l = gu / U, k = gu % U; hreal* ak = a + gu * 4;
+      if (!lat) {}
+      else if (l == 0) for (int b = 0; b < 4; b++) { kap[gu * 4 + b] = ak[b] * ((hreal)1 - ak[b]); hold[gu * 4 + b] = 0; }
+      else for (int b = 0; b < 4; b++) {
+        // the lower layer's (final) bit: layer 1's gates are never latched; with the chain, layer 3 holds layer 2's
+        // latched bit, recomputed here from layer 2's z (another task writes it in this phase)
+        hreal q0 = a[k * 4 + b];
+        if (!fan && l == 2) hg_latch(zn[(U + k) * 4 + b], latch, q0, &q0, nullptr, nullptr);
+        hg_latch(zn[gu * 4 + b], latch, q0, &ak[b], &kap[gu * 4 + b], &hold[gu * 4 + b]);
+      }
+      hreal* hk = h + gu * 16;
+      for (int c = 0; c < 16; c++) hk[c] = hg_corner(ak, c);
+      if (topk) hg_top_corners(hk, hsa + gu * 16, sela + gu * 16, corners);
+      if (l == 0) {
+        const hreal v = hg_unit_mix(hk, f + k * 16, cmp ? m + k * 16 : nullptr, comp + k);
+        pred[k] = v;
+        inp[g.ioff[1] + k] = v;
+        if (fan) inp[g.ioff[2] + k] = v;
+      }
+    }
+    else HG_FOR(idx, U + 2 * U16) {
       if (idx < U) {
         const int k = idx; hreal* hk = h + k * 16;
         for (int c = 0; c < 16; c++) hk[c] = hg_corner(a + k * 4, c);
@@ -208,7 +273,7 @@ HG_KERNEL void hgln_run(HgDims g, hreal* Hall, hreal* Qall, hreal* pall, hreal* 
     // mixture and error signal itself from the 3U predictions (identical bits in every thread; Net::infer/learn).
     const bool need_A = t < tp;                              // activity only feeds the one-off prune
     if (tid < NU) {
-      const hreal y = Y[(long)net * T + s], gl = glr1 + (glr0 - glr1) * HG_EXP(-(hreal)t / tau);
+      const hreal y = Y[(long)net * T + s], gl = glr1 + (glr0 - glr1) * hgln_exp<hreal>(-(hreal)t / tau);
       hreal out = 0, cs = 0, sr2 = 0;
       if (cmp) {                                             // competence-weighted (4.2): r_i = comp_i / sum comp
         for (int i = 0; i < NU; i++) cs += comp[i];
@@ -230,19 +295,33 @@ HG_KERNEL void hgln_run(HgDims g, hreal* Hall, hreal* Qall, hreal* pall, hreal* 
           for (int c = 0; c < 16; c++) mk[c] += (hreal)0.02 * hk[c] * (e2 - mk[c]);
         }
         hreal tot = 0, F1[4] = {0, 0, 0, 0};
-        for (int c = 0; c < 16; c++) { hreal hf = hk[c] * fk[c]; tot += hf; for (int b = 0; b < 4; b++) if ((c >> b) & 1) F1[b] += hf; }
+        const hreal *hsk = hsa + gu * 16, *slk = sela + gu * 16;   // top-K: gradient from the soft values of the selected corners
+        for (int c = 0; c < 16; c++) { hreal hf = topk ? (hsk[c] * fk[c]) * slk[c] : hk[c] * fk[c]; tot += hf; for (int b = 0; b < 4; b++) if ((c >> b) & 1) F1[b] += hf; }
+        // error driving the gate steps (Params::gate_err): mixed, the unit's own, or the global error
+        const hreal gev = gate_err == 2 ? eg : (gate_err == 1 ? y - pred[gu] : esk);
+        const bool latched = lat && l > 0;
         bool far = false;
         for (int b = 0; b < 4; b++) {
-          hreal F0 = tot - F1[b], gg = BETA * (F1[b] * (1 - ak[b]) - F0 * ak[b]), v = gl * esk * gg;
+          const int j = gu * 4 + b;                          // = l * 4U + k * 4 + b
+          const hreal F0 = tot - F1[b];
+          hreal v;
+          if (latched) {                                     // g = 12 kap (F1/a - F0/(1-a)); credit: the held part
+            const hreal dm = F1[b] / ak[b] - F0 / ((hreal)1 - ak[b]);
+            v = gl * gev * (BETA * kap[j] * dm);
+            if (cred) {
+              const int lk = ((fan ? 0 : l - 1) * U + k) * 4 + b;   // the same unit's bit in the lower layer
+              const hreal c1 = gl * gev * (credit * BETA * kap[lk] * dm * hold[j]);
+              cv[j] = c1 < (hreal)-0.05 ? (hreal)-0.05 : (c1 > (hreal)0.05 ? (hreal)0.05 : c1);
+            }
+          } else {
+            const hreal gg = BETA * (F1[b] * (1 - ak[b]) - F0 * ak[b]);
+            v = gl * gev * gg;
+          }
           const hreal cb = v < (hreal)-0.05 ? (hreal)-0.05 : (v > (hreal)0.05 ? (hreal)0.05 : v);
           // OLD norms: p step uses H_b/|H_b| (cr = cb/|H_b|), hyperplane step H_b += (cb |H_b|) p*u (st); then
           // |H_b + st pu|^2 = q + 2 st (H_b . pu) + st^2 |pu|^2 with H_b . pu = |H_b| z_b
-          const int j = gu * 4 + b;                          // = l * 4U + k * 4 + b
-          const hreal q = Q[j], nq = HG_SQRT(q), rs = (hreal)1 / nq, s1 = cb * nq;
-          cr[j] = cb * rs; st[j] = s1;
-          const hreal q2 = q + (hreal)2 * s1 * (nq * zn[j]) + s1 * s1 * pq[gu];
-          Q[j] = q2;
-          far |= !(q2 > (hreal)1e-6 && q2 < (hreal)1e6);
+          if (cred) cr[j] = cb;                              // the credit from the upper layers is added in U1b
+          else far |= hg_gate_step(j, cb, Q, cr, st, zn, pq[gu]);
         }
         if (far) sc[4 + l] = 1;                              // several threads may store the same 1
         hreal h2 = 0, x2 = 0;
@@ -252,6 +331,15 @@ HG_KERNEL void hgln_run(HgDims g, hreal* Hall, hreal* Qall, hreal* pall, hreal* 
       }
     }
     HG_SYNC();
+    if (cred) {                                              // ---- U1b: gate step + the latch credit from the upper layers
+      HG_FOR(j, 3 * U4) {                                    // Net::learn updates layers 3, 2, 1: acc = (0 + c3) + c2
+        const int gu = j / 4, l = gu / U, k = gu % U, b = j % 4;
+        hreal acc = 0;
+        for (int up = 2; up > l; up--) if ((fan ? 0 : up - 1) == l) acc += cv[(up * U + k) * 4 + b];
+        if (hg_gate_step(j, cr[j] + acc, Q, cr, st, zn, pq[gu])) sc[4 + l] = 1;
+      }
+      HG_SYNC();
+    }
     if (tid == 0 && s + 1 < T) HG_PREPARE(s + 1);            // the other buffer: nobody reads it before the barrier
     HG_FOR(idx, NU * D) {                                    // ---- U2a: fused p step (OLD H) + hyperplane step (OLD p)
       const int gu = idx / D, i = idx % D;

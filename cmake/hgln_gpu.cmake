@@ -31,7 +31,8 @@ if(HGLN_GPU_CLANG)
   endif()
 endif()
 set(_src ${PROJECT_SOURCE_DIR}/cuda/hgln_ptx.cu)
-set(_deps ${_src} ${PROJECT_SOURCE_DIR}/cuda/hgln_kernel.h ${PROJECT_SOURCE_DIR}/cuda/hgln_dims.h ${PROJECT_SOURCE_DIR}/include/hgln_gate.h)
+set(_deps ${_src} ${PROJECT_SOURCE_DIR}/cuda/hgln_kernel.h ${PROJECT_SOURCE_DIR}/cuda/hgln_dims.h ${PROJECT_SOURCE_DIR}/include/hgln_gate.h
+          ${PROJECT_SOURCE_DIR}/cuda/hgln_q_kernel.h ${PROJECT_SOURCE_DIR}/cuda/hgln_q_dims.h)
 set(_common -O3 -ffp-contract=off -Wall -Werror -I${PROJECT_SOURCE_DIR}/cuda -I${PROJECT_SOURCE_DIR}/include)
 set(_images "")
 set(_list "")
@@ -100,6 +101,11 @@ set_target_properties(hgln_gpu_cli PROPERTIES OUTPUT_NAME hgln_gpu)
 target_compile_options(hgln_gpu_cli PRIVATE -ffp-contract=off)
 target_link_libraries(hgln_gpu_cli PRIVATE hgln_gpu)
 
+# research/nlp: the text8 / enwik8 character-level language-modelling benchmark (GPU training through Bank, CPU evaluation)
+add_executable(hgln_charlm research/nlp/charlm_hgln.cpp)
+target_compile_options(hgln_charlm PRIVATE -ffp-contract=off)
+target_link_libraries(hgln_charlm PRIVATE hgln_gpu Threads::Threads)
+
 if(HGLN_BUILD_TESTS)
   # Mock drivers: the real kernel source compiled for the CPU, once per real type, behind the cu*/hip* entry points.
   foreach(_real double float)
@@ -139,7 +145,18 @@ if(HGLN_BUILD_TESTS)
     "hip_u8|hip||units=8"
     "cuda_u16_fanout|cuda||units=16 fanout"
     "hip_u12_fanout|hip||units=12 fanout"
-    "cuda_u8_fanout_small_smem|cuda|MOCK_SMEM_OPTIN=16384|units=8 fanout")
+    "cuda_u8_fanout_small_smem|cuda|MOCK_SMEM_OPTIN=16384|units=8 fanout"
+    # version 5.0 options: v5=1 latch + credit + global-error gates (the v5 float settings), 2 latch + own error, 3 gate_err 2
+    "cuda_u8_fanout_v5|cuda||units=8 fanout v5=1"
+    "hip_u16_chain_v5|hip||units=16 v5=1"
+    "cuda_u12_fanout_v5_latch|cuda||units=12 fanout v5=2"
+    "hip_u8_chain_v5_gerr|hip||units=8 v5=3"
+    "cuda_u16_v5_dense|cuda||units=16 v5=4"
+    "hip_u12_fanout_top8|hip||units=12 fanout v5=5"
+    # the integer network (NetQ) through BankQ: bit-identical
+    "cuda_int|cuda||int"
+    "hip_int|hip||int"
+    "cuda_sm70_int|cuda|MOCK_ARCH=sm_70|int")
   foreach(_c ${_cases})
     string(REPLACE "|" ";" _f "${_c}")
     list(GET _f 0 _name)
@@ -176,4 +193,8 @@ if(HGLN_BUILD_TESTS)
   endforeach()
   add_test(NAME hgln_gpu_cli_selftest_cuda_u12_fanout COMMAND hgln_gpu_cli selftest 8 2 600 cuda units=12 fanout v42)
   set_tests_properties(hgln_gpu_cli_selftest_cuda_u12_fanout PROPERTIES ENVIRONMENT "${_mc}" LABELS gpu TIMEOUT 600)
+  add_test(NAME hgln_gpu_cli_selftest_cuda_v5 COMMAND hgln_gpu_cli selftest 8 2 600 cuda units=8 fanout v5)
+  add_test(NAME hgln_gpu_cli_selftest_cuda_int COMMAND hgln_gpu_cli selftest 8 2 600 cuda int)
+  set_tests_properties(hgln_gpu_cli_selftest_cuda_int PROPERTIES ENVIRONMENT "${_mc}" LABELS gpu TIMEOUT 600)
+  set_tests_properties(hgln_gpu_cli_selftest_cuda_v5 PROPERTIES ENVIRONMENT "${_mc}" LABELS gpu TIMEOUT 600)
 endif()

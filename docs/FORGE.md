@@ -13,7 +13,7 @@ The header-only library (`include/hgln.hpp`) still works on its own with any C++
 # FORGE needs a C++23 compiler (clang 18 or g++ 14), CMake >= 3.25, Ninja, Python 3
 CXX=clang++-18 CC=clang-18 cmake -S . -B build/forge -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build/forge
-ctest --test-dir build/forge          # 15 tests, about 90 s on 4 cores (the GPU mock tests take most of it)
+ctest --test-dir build/forge          # 100 tests; the GPU mock tests take most of the time
 ./build/forge/hgln_cli info           # SIMD table in use, CPU features, tables built
 ./build/forge/hgln_gpu info           # GPU devices, or why there are none
 ```
@@ -83,13 +83,21 @@ bank.download(nets);            // back into the CPU networks
 The ctests drive the full path: CPU `Net` → `Bank` → FORGE runtime → mock driver → download. They cover CUDA and HIP; sm_80, sm_70, gfx90a and gfx1100; d = 8, 64 and 100; shared and global scratch; five calls with state resident, crossing the prune; and a mid-stream download and re-upload. Results:
 
 - float64 predictions and state match the CPU library **exactly** (0 difference);
-- float32 is within about 1e-6;
+- float32 matches **exactly** too (0 difference);
 - a device with too little shared memory falls back to global scratch;
 - a missing driver gives a clear reason.
 
-**Not verified:** nothing has run on real GPU hardware. The PTX has not been through ptxas or a driver JIT, and the AMD code objects have not been loaded by ROCm. Real-hardware results may differ from the CPU in the last bits in float64, because the device `exp` and `sqrt` are not glibc's, so the GPU selftest uses a 1e-9 tolerance there. HIP's shared-memory limit is assumed to be 64 KB, not queried. Speed on a GPU is unknown.
+**Two kernels, one image.** Every image holds `hgln_run`, the float `Net` with every option (4.3, 4.2, and the version 5.0 latch, latch credit, gate error and top-K corners), and `hglnq_run`, the integer `NetQ` (`cuda/hgln_q_kernel.h`), which `hgln::gpu::BankQ` runs. The mock tests cover both (`*_v5*`, `*_int` cases: CUDA and HIP, sm_80 and sm_70, 8/12/16 units, fan-out and chain, several calls, download and re-upload).
 
-`cuda/hgln_cuda.cu` (the nvcc runtime-API host) is kept as an alternative for anyone with the CUDA SDK. It has never been compiled.
+**CPU and GPU give the same bits.** Every result is exact (0 difference) against the CPU library, in the mock tests and on hardware:
+- the float kernel does the library's IEEE operations in the same order, multiply-adds are never fused, and it uses no libm: the gate (`hgln_gate`) and the `exp` of the latch and the gate-rate schedule (`hgln_exp`) are HGLN's own, and `sqrt` and division are correctly rounded on every device;
+- the integer kernel is integer arithmetic, apart from the conversion of inputs and targets and the double estimates inside its exact division and square root.
+
+**Real hardware: an NVIDIA GeForce RTX 3090** (sm_86, CUDA driver under WSL2). FORGE's runtime opens it and the driver JIT-loads the sm_80 PTX. `hgln_gpu selftest` (GPU vs CPU library) gives 0 difference in predictions and state for float64, float32 and the integer net: 4.3, v4.2 and v5, 8/12/16 units, fan-out and chain, d = 8, 64 and 100, up to 4,500 samples (past the prune and the renormalisation at 4,096).
+
+**Not verified:** the AMD code objects have not been loaded by ROCm, and HIP's shared-memory limit is assumed to be 64 KB, not queried. GPU speed has not been studied. With one block per network a single stream takes tens of �s per sample; the kernels are built for many networks at once.
+
+`cuda/hgln_cuda.cu` (the nvcc runtime-API host) is kept as an alternative for anyone with the CUDA SDK. It compiles with nvcc 12.0 (`-fmad=false`, so multiply-adds are not fused) and its selftest gives 0 difference on the RTX 3090 as well (float network only).
 
 ## Other FORGE parts that could help later (not done)
 

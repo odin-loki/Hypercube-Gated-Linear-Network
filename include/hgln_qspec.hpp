@@ -24,20 +24,15 @@
 //    sat(v, M)   = min(max(v, -M), M);   >> is an arithmetic (floor) shift.
 //    div(n, d)   = n / d rounded to nearest, ties to even (d > 0), exact integer division.
 //    isqrt(n)    = floor(sqrt(n)) of a uint64 (exact).
-//    sr(Y, F, r) = stochastic rounding of Y / 2^F with a 16-bit random r:  (Y >> F) + (r < frac16), frac16 = the top
-//                  16 bits of the F fraction bits of Y (F >= 16 here).  P(round up) = frac16 / 2^16.
+//    Every rounding is round-to-nearest-even (rne), including the state updates (W, H, p): no random numbers are
+//    used after initialisation (version 5.0 study: round-to-nearest is as accurate as stochastic rounding,
+//    research/alg/results46.jsonl).
 //
-// 1. Random numbers: Philox4x32-10 (Salmon et al., SC'11 / Random123; the same algorithm as FORGE's
+// 1. Initial hyperplanes: Philox4x32-10 (Salmon et al., SC'11 / Random123; the same algorithm as FORGE's
 //    support/include/forge/rand/philox.hpp), key = (seed lo32, seed hi32) of the network seed, counter
-//    (c0, c1, c2, c3) = (element block, 4*layer + array, t lo32, t hi32); t = number of learn() calls before this one.
-//    Each block gives 4 words = 8 16-bit halves (half 0 = low 16 bits).  Element -> (c0, word, half):
-//      W  (array 0) unit k, active slot q (q-th active column of unit k, ascending; bias last), corner c:
-//                   c0 = k<<16 | (q>>3)<<4 | c,      word (q>>1)&3, half q&1
-//      H  (array 1) unit k, bit b, input i:  c0 = ((i>>3)*4 + b)<<4 | k,   word (i>>1)&3, half i&1
-//      p  (array 2) unit k, input i:         c0 = (i>>3)<<4 | k,            word (i>>1)&3, half i&1
-//      initial hyperplanes (array 3, t = 2^64 - 1): c0 = (i*4 + b)<<4 | k; v = sum of the 8 halves of words 0..3
-//                   ... see init_hyperplane() (sum of 4 halves of words 0,1 minus 131070: Irwin-Hall approximation
-//                   of a Gaussian), last (bias) component 0, then H_i = sat(div(v_i << FH, isqrt(sum v^2)), MW).
+//    (c0, c1, c2, c3) = ((i*4 + b)<<4 | k, 4*layer + 3, 2^32 - 1, 2^32 - 1) for unit k, bit b, input i:
+//    v_i = sum of the four 16-bit halves of words 0 and 1 minus 131070 (Irwin-Hall approximation of a Gaussian),
+//    last (bias) component 0, then H_i = sat(div(v_i << FH, isqrt(sum v^2)), MW)  (init_component/init_normalise).
 //
 // 2. Input.  xq_j = sat(nearbyint(x_j * 2^FA), MA)  (NaN -> 0; the conversion clamps before rounding).
 //    Side information (unit vector [x, 1] / |[x, 1]|):  nn = ONE^2 + sum xq_j^2 (int64);  g = isqrt(nn << 6);
@@ -77,24 +72,37 @@
 //    Per layer and unit (F1_b, tot over the SELECTED corners only, with the soft heatmap hs - straight-through):
 //      hf_c = hs_c f_c;  tot = sum hf;  F1_b = sum_{bit b set} hf;  num_b = F1_b (ONE - a_b) - (tot - F1_b) a_b  [int64]
 //      plain:  Gt_b = sat32(rne(12 num_b, 3 AB - 32))                                          [Q24 = d mix / d z_b]
-//      latch:  Gt_b = dz(kap14) with dz(k) = sat32(div(12 k num_b, a_b (ONE - a_b) 2^(FF-10)))  [Q24; = 12 kap (F1/a -
+//      latch:  Gt_b = dz(kap14) with dz(k) = sat32(divd(12 k num_b, a_b (ONE - a_b) 2^(FF-10))) [Q24; = 12 kap (F1/a -
 //              F0/(1-a)); for FF < 10 the numerator is multiplied by 2^(10-FF) instead]
 //      cb_b = clamp(rne(ge Gt_b, 18), +-53687091) + routed_b                               [Q30; 0.05 = 53687091]
 //      latch credit (Params::latch_credit = scale > 0; latched layers only): Gc = sat32(rne(sat32(rne(dz(kap14 of the
 //      lower layer's bit) hold14, 14)) CS, 16)), CS = round_even(scale 65536); the lower layer's routed_b (same unit
 //      and bit) += clamp(rne(ge Gc, 18), +-53687091). Layers are updated 3, 2, 1, so layer 1 gets it in the same step.
 //      ge for the gates: Params::gate_err = 0 the mixed error es, 1 the unit's own error yq - o, 2 the global eg.
-//    p step (old H) and hyperplane step (old p), all inputs i < D = d + 1:
-//      Y = p_i << (29 + AB) + s_i sum_b cb_b H_bi;   p_i' = clamp(sr(Y, 29 + AB), 0, 3 << FP)
-//      Hr_bi = (H_bi << 8) + rne(cb_b (p_i s_i), 19 + AB)                                   [Q(FH + 8), int32]
-//      N2_b = sum_i Hr_bi^2 (int64); N2 = 0: H_b unchanged; else rc = floor(2^54 / isqrt(N2_b));
-//      H_bi' = sat(sr(Hr_bi rc, 56 - WB), MW)                    (renormalised to unit length on every update)
+//    divd(n, d) = the double n / d (n, d converted to double to nearest, one IEEE division) rounded to the nearest
+//    integer, ties to even, clamped to +-(2^31 - 1) (the per-unit divisions of the gate and LMS steps; div above is
+//    the exact integer division, used for eg).
+//    MIXED LEARNING STEPS. The per-element updates of the state (p, H, W, the loops over the inputs) are float32
+//    arithmetic on the int16 state, rounded back to the grid to nearest even; everything else stays integer. Every
+//    float32 operation is IEEE single precision with round-to-nearest, no fused multiply-add (-ffp-contract=off), in
+//    the order written, so every CPU target and GPU gives the same bits. (float)v is the conversion of an integer to
+//    float32 (round to nearest); 2^-n factors are exact. rnf(v) = (v + 12582912) - 12582912 rounds a float32 |v| < 2^22
+//    to the nearest integer, ties to even (all values rounded here are below 2^21); (int) of the result is exact.
+//    p step (old H) and hyperplane step (old p), per unit, all inputs i < D = d + 1 in ascending order:
+//      cP_b = (float)cb_b 2^-(29 + AB),  cH_b = (float)cb_b 2^-(27 + AB)                        [float32, per unit]
+//      Hf_b = (float)H_bi,  pf = (float)p_i,  sf = (float)s_i
+//      ssum = ((cP_0 Hf_0 + cP_1 Hf_1) + cP_2 Hf_2) + cP_3 Hf_3;   p_i' = clamp((int)rnf(pf + sf ssum), 0, 3 << FP)
+//      Hr_bi = Hf_b + cH_b (pf sf);   N2_b += Hr_bi Hr_bi   (float32, N2_b from 0, i ascending)
+//      N2_b = 0 (not > 0): H_b unchanged; else g_b = (float)2^FH / sqrt(N2_b) (correctly rounded sqrt and division);
+//      H_bi' = sat((int)rnf(Hr_bi g_b), MW)                     (renormalised to unit length on every update)
 //    rule step (normalised LMS):  h2 = sum_c h_c^2;  x2 = sum_{active j} x_j^2                              [int64]
 //      den = rne(h2, 2 FA - 18) rne(x2, 2 FA - 12) + 1073742                                     [Q30; 1e-3 at Q30]
-//      c2 = sat32(div((M es_k) << (38 - FA), den)), M = round_even(mu 65536)                                 [Q24]
+//      c2 = sat32(divd((M es_k) << (38 - FA), den)), M = round_even(mu 65536)                                [Q24]
 //      sc_c = sat32(rne(c2 h_c, FA))                                                                         [Q24]
-//      W_cj' = sat(sr((W_cj << F) + sc_c x_j, F), MW),  F = 26 + AB - WB, for every active column j
-//      (unselected corners have sc = 0: W is unchanged, no random number is consumed).
+//      W_cj' = sat(W_cj + (int)rnf(sW_c (float)x_j), MW),  sW_c = (float)sc_c 2^-(26 + AB - WB), for every active
+//      column j (unselected corners have sc = 0: W is unchanged).
+//    (Before this mixed form the p, H and W steps were exact int64 arithmetic with the same rounding to nearest; the
+//    accuracy of both is in docs/ALGORITHM.md section 8c.)
 //    activity (until the prune; Q(FA+8), initial div(2^(FA+8), 1000)):  A_j += rne(1311 ((|x_j| << 8) - A_j), 16)
 //    t += 1.  Prune (once, the first t >= warm with t % 64 == 0): per unit, nt = n <= 4 ? n : (6 n + 5) / 10 inputs
 //    kept; score_j = (sum_c |W_cj|) A_j (int64); stable ascending sort of the active inputs (bias excluded); drop the
@@ -129,9 +137,16 @@ HGLN_QHD Philox4 philox4x32_10(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c
 }
 HGLN_QHD uint32_t half16(const Philox4& b, int word, int half) { return (b.v[word] >> (16 * half)) & 0xFFFFu; }
 
-enum : uint32_t { kArrW = 0, kArrH = 1, kArrP = 2, kArrInit = 3 };
+enum : uint32_t { kArrInit = 3 };              // Philox array id of the initial hyperplanes
 
 // ---- rounding and integer helpers (exact; any platform)
+// divd: the double quotient rounded to nearest even, clamped to +-(2^31 - 1) (deterministic: IEEE division and rounding)
+HGLN_QHD int64_t divd(int64_t n, int64_t d) {
+  const double q = std::nearbyint((double)n / (double)d);
+  return q >= 2147483647.0 ? 2147483647 : (q <= -2147483647.0 ? -2147483647 : (int64_t)q);
+}
+// float32 |v| < 2^22 -> the nearest integer (ties to even), as a float32; IEEE round-to-nearest, no fast-math
+HGLN_QHD float rnf(float v) { return (v + 12582912.0f) - 12582912.0f; }
 HGLN_QHD int64_t rne(int64_t v, int k) {                    // v / 2^k, nearest, ties to even; k <= 0: v * 2^-k
   if (k <= 0) return (int64_t)((uint64_t)v << (-k));
   return (v + ((int64_t)1 << (k - 1)) - 1 + ((v >> k) & 1)) >> k;
@@ -139,11 +154,6 @@ HGLN_QHD int64_t rne(int64_t v, int k) {                    // v / 2^k, nearest,
 HGLN_QHD int64_t sat(int64_t v, int64_t m) { return v < -m ? -m : (v > m ? m : v); }
 HGLN_QHD int64_t clampi(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
 HGLN_QHD int32_t sat32(int64_t v) { return (int32_t)clampi(v, -2147483647LL, 2147483647LL); }
-HGLN_QHD int64_t sr(int64_t Y, int F, uint32_t r16) {      // F >= 16
-  const int64_t q = Y >> F;
-  const uint32_t f16 = (uint32_t)((Y >> (F - 16)) & 0xFFFF);
-  return q + (r16 < f16 ? 1 : 0);
-}
 // div_rne and isqrt are exact; they start from a double-precision estimate (faster than a 64-bit hardware divide)
 // and correct it with integer arithmetic, so the result does not depend on how the estimate was rounded.
 HGLN_QHD int64_t div_floor(int64_t n, int64_t d, int64_t* rem) {   // floor(n / d) and n - d floor(n / d), d > 0

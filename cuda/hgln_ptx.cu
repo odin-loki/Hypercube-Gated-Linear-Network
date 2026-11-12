@@ -7,8 +7,8 @@
 //   HIP (AMDGPU code object): clang -x hip --cuda-device-only --no-gpu-bundle-output -nogpuinc -nogpulib
 //               --offload-arch=gfx90a -O3 -ffp-contract=off --ld-path=$(which ld.lld) cuda/hgln_ptx.cu -o hgln.gfx90a.hsaco
 // The output is self-contained (no libdevice / ocml calls), so a driver can load it directly (cuModuleLoadData /
-// hipModuleLoadData), e.g. through FORGE's gpu::cuda_hip runtime (include/hgln_gpu.hpp). Kernel symbol: hgln_run
-// (extern "C"). Add -DHG_REAL=float for the float32 kernel. -ffp-contract=off keeps every multiply and add separate,
+// hipModuleLoadData), e.g. through FORGE's gpu::cuda_hip runtime (include/hgln_gpu.hpp). Kernel symbols: hgln_run (the
+// float network) and hglnq_run (the integer network, cuda/hgln_q_kernel.h), extern "C". Add -DHG_REAL=float for the float32 kernel. -ffp-contract=off keeps every multiply and add separate,
 // as in the C++ library, so the GPU does the same arithmetic. Each image also holds an empty marker kernel,
 // hgln_real_f64 or hgln_real_f32, so a host can check the image's real type by looking the symbol up.
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
@@ -38,7 +38,7 @@ extern __attribute__((shared)) double hg_smem_raw[];   // dynamic shared memory 
 #define HG_SMEM (reinterpret_cast<hreal*>(hg_smem_raw))
 // Device maths without libdevice / ocml. sqrt/abs/rint map to native instructions or inline expansions
 // (NVPTX: sqrt.rn, abs, cvt.rni; AMDGPU: the correctly rounded sqrt expansion, v_rndne).
-static __attribute__((device)) inline double hg_dev_exp(double x) {   // exp(x) to ~1 ulp; used only for x <= 0
+[[maybe_unused]] static __attribute__((device)) inline double hg_dev_exp(double x) {   // exp(x) to ~1 ulp (HG_EXP; the kernels now use hgln_exp)
   if (x < -708.0) return 0.0;
   if (x > 709.0) x = 709.0;
   const double k = __builtin_rint(x * 1.4426950408889634);
@@ -59,6 +59,7 @@ static __attribute__((device)) inline double hg_dev_exp(double x) {   // exp(x) 
 #define HG_FABS(x) hg_dev_fabs(x)
 #define HG_RINT(x) __builtin_rint(x)
 #include "hgln_kernel.h"
+#include "hgln_q_kernel.h"
 #define HG_CAT2(a, b) a##b
 #define HG_CAT(a, b) HG_CAT2(a, b)
 #define HG_REAL_TAG_double f64

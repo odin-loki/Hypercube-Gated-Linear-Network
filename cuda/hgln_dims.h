@@ -18,12 +18,15 @@ struct HgDims {            // flat per-network layout, shared by host and device
   int d, D, U, N1[3];
   long wofs[3], mofs[3], ioff[3];
   long Hs, Qs, ps, ms, Ws, Ms;                               // per-network sizes of the persistent arrays
-  long o_u, o_inp, o_a, o_zn, o_pp, o_h, o_f, o_xm, o_pred, o_comp, o_cb, o_st, o_c2, o_sc, scs;   // scratch layout
+  long o_u, o_inp, o_a, o_zn, o_pp, o_h, o_f, o_xm, o_pred, o_comp, o_cb, o_st, o_c2, o_sc, o_kap, o_hold, o_cv, o_hs, o_sel, scs;   // scratch layout
 };
 // Scratch (per network, in values of the real type): u and the layer-1 input x are double-buffered (u: 2 x D at
 // o_u; inp: 2 x N1[0] for layer 1 at ioff[0] + (sample & 1) * N1[0], then layer 2's and layer 3's U + 1 inputs at
 // ioff[1], ioff[2]) so the next sample's u is computed during the current sample's update; a, zn: 3 x 4U;
-// pp, pred, comp, c2: 3U; h, f: 3 x 16U; xm: the masked inputs, like M; cb, st: 3U x 4; sc: 8 flags.
+// pp, pred, comp, c2: 3U; h, f: 3 x 16U; xm: the masked inputs, like M; cb, st: 3U x 4; sc: 8 flags; version 5.0
+// options (Params::latch, latch_credit): kap, hold (d a / d(12 z) and the latch's held part) and cv (the clipped latch
+// credit each unit of layers 2 and 3 routes to its lower layer): 3U x 4 each; top-K corners (Params::corners < 16): hs, sel
+// (the soft heatmap and the selection), 3 x 16U each.
 HG_HD inline HgDims hg_dims(int d, int U = 16) {
   HgDims g; g.d = d; g.D = d + 1; g.U = U; g.N1[0] = d + 1; g.N1[1] = U + 1; g.N1[2] = U + 1;
   const long R = 16L * U;                                    // rule rows per layer (U units x 16 corners)
@@ -34,6 +37,7 @@ HG_HD inline HgDims hg_dims(int d, int U = 16) {
   long o = 0; g.o_u = o; o += 2L * g.D; g.o_inp = o; o += g.ioff[2] + g.N1[2]; g.o_a = o; o += 12L * U; g.o_zn = o; o += 12L * U;
   g.o_pp = o; o += 3L * U; g.o_h = o; o += 3 * R; g.o_f = o; o += 3 * R; g.o_xm = o; o += g.Ms; g.o_pred = o; o += 3L * U;
   g.o_comp = o; o += 3L * U; g.o_cb = o; o += 12L * U; g.o_st = o; o += 12L * U; g.o_c2 = o; o += 3L * U; g.o_sc = o; o += 8;
+  g.o_kap = o; o += 12L * U; g.o_hold = o; o += 12L * U; g.o_cv = o; o += 12L * U; g.o_hs = o; o += 3 * R; g.o_sel = o; o += 3 * R;
   g.scs = o;
   return g;
 }

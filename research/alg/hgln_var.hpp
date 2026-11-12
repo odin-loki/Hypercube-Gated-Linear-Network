@@ -299,8 +299,6 @@ struct QNet {
   } L[3];
   std::vector<int32_t> s; int32_t S = 0;
   static constexpr int32_t CB = 53687091;               // 0.05 at Q30
-  uint32_t k0() const { return (uint32_t)seed; }
-  uint32_t k1() const { return (uint32_t)(seed >> 32); }
   void init(int d_, uint64_t seed_, const Var& V) {
     if (!V.uniform) throw std::invalid_argument("intspec needs uniform=1");
     if (V.hybrid != 0 && V.hybrid != 3) throw std::invalid_argument("intspec: hybrid must be 0 or 3 (fan-out)");
@@ -403,7 +401,6 @@ struct QNet {
     const int64_t yq = qs::quantise(y, F.FA, 1 << (F.FA + 6));
     const int64_t eg = qs::div_rne(NU * yq - S, NU), G = qs::round_param(glob, 16), Mq = qs::round_param(mu, 16);
     const int64_t glq = qs::gl_q24(t, glr0, glr1, tau);
-    const uint32_t tl = (uint32_t)t, th = (uint32_t)((uint64_t)t >> 32);
     for (auto& q : L) std::fill(q.acc.begin(), q.acc.end(), 0);
     for (int l = 2; l >= 0; l--) {               // upper layers first: credit reaches the lower layer in this sample
       QL& q = L[l]; QL* lo = lower(l); const int D = q.D, N1 = q.N1;
@@ -425,7 +422,7 @@ struct QNet {
             auto dz = [&](int64_t kap) {             // 12 kap (F1/a - F0/(1-a)) at Q24
               const int sh = F.FF - 10; int64_t nu = 12 * kap * num, de = den;
               if (sh >= 0) de <<= sh; else nu *= (int64_t)1 << -sh;
-              return (int64_t)qs::sat32(qs::div_rne(nu, de));
+              return (int64_t)qs::sat32(qs::divd(nu, de));
             };
             Gt = dz(q.kap[kb]);
             if (credit) {
@@ -435,26 +432,27 @@ struct QNet {
           } else Gt = qs::sat32(qs::rne(12 * num, 3 * F.AB - 32));
           cb[b] = qs::clampi(qs::rne(ge * Gt, 18), -CB, CB) + q.acc[kb];
         }
-        // p step (old H) and hyperplane step (old p), then exact renormalisation
-        std::vector<int64_t> Hr((size_t)4 * D); int64_t N2[4] = {0, 0, 0, 0};
-        for (int i = 0; i < D; i++) {
-          int64_t ssum = 0; const int64_t cp = (int64_t)q.p[(size_t)k * D + i] * s[i];
-          for (int b = 0; b < 4; b++) {
-            const int64_t Hv = q.H[((size_t)k * 4 + b) * D + i];
-            ssum += cb[b] * Hv;
-            const int64_t hr = (Hv << 8) + qs::rne(cb[b] * cp, 19 + F.AB);
-            Hr[(size_t)b * D + i] = hr; N2[b] += hr * hr;
-          }
-          const int64_t Y = ((int64_t)q.p[(size_t)k * D + i] << (29 + F.AB)) + s[i] * ssum;
-          const qs::Philox4 r = qs::philox4x32_10((uint32_t)(((i >> 3) << 4) | k), 4 * l + qs::kArrP, tl, th, k0(), k1());
-          q.p[(size_t)k * D + i] = (int32_t)qs::clampi(qs::sr(Y, 29 + F.AB, qs::half16(r, (i >> 1) & 3, i & 1)), 0, 3 << F.FP);
-        }
-        for (int b = 0; b < 4; b++) {
-          if (N2[b] == 0) continue;
-          const int64_t rc = (int64_t)(((uint64_t)1 << 54) / qs::isqrt((uint64_t)N2[b]));
+        // p step (old H) and hyperplane step (old p), then renormalisation: float32 on the int16 state (the spec's
+        // mixed learning steps), rounded back to the grid to nearest even
+        {
+          const float KP = std::ldexp(1.0f, -(29 + F.AB)), KH = std::ldexp(1.0f, -(27 + F.AB));
+          float cP[4], cH[4];
+          for (int b = 0; b < 4; b++) { cP[b] = (float)cb[b] * KP; cH[b] = (float)cb[b] * KH; }
+          std::vector<float> Hr((size_t)4 * D); float N2[4] = {0, 0, 0, 0};
           for (int i = 0; i < D; i++) {
-            const qs::Philox4 r = qs::philox4x32_10((uint32_t)((((i >> 3) * 4 + b) << 4) | k), 4 * l + qs::kArrH, tl, th, k0(), k1());
-            q.H[((size_t)k * 4 + b) * D + i] = (int32_t)qs::sat(qs::sr(Hr[(size_t)b * D + i] * rc, 56 - F.WB, qs::half16(r, (i >> 1) & 3, i & 1)), F.MW);
+            float Hf[4];
+            for (int b = 0; b < 4; b++) Hf[b] = (float)q.H[((size_t)k * 4 + b) * D + i];
+            const float pf = (float)q.p[(size_t)k * D + i], sf = (float)s[i];
+            const float ssum = ((cP[0] * Hf[0] + cP[1] * Hf[1]) + cP[2] * Hf[2]) + cP[3] * Hf[3];
+            q.p[(size_t)k * D + i] = (int32_t)qs::clampi((int64_t)qs::rnf(pf + sf * ssum), 0, 3 << F.FP);
+            const float ps = pf * sf;
+            for (int b = 0; b < 4; b++) { const float hr = Hf[b] + cH[b] * ps; Hr[(size_t)b * D + i] = hr; N2[b] += hr * hr; }
+          }
+          for (int b = 0; b < 4; b++) {
+            if (!(N2[b] > 0)) continue;
+            const float g = (float)(1 << F.FH) / std::sqrt(N2[b]);
+            for (int i = 0; i < D; i++)
+              q.H[((size_t)k * 4 + b) * D + i] = (int32_t)qs::sat((int64_t)qs::rnf(Hr[(size_t)b * D + i] * g), F.MW);
           }
         }
         // rule step
@@ -462,18 +460,17 @@ struct QNet {
         for (int c = 0; c < 16; c++) h2 += (int64_t)q.h[k * 16 + c] * q.h[k * 16 + c];
         for (int j = 0; j < N1; j++) if (q.M[(size_t)k * N1 + j]) x2 += (int64_t)q.x[j] * q.x[j];
         const int64_t den = qs::rne(h2, 2 * F.FA - 18) * qs::rne(x2, 2 * F.FA - 12) + 1073742;
-        const int64_t c2 = qs::sat32(qs::div_rne((Mq * es) * ((int64_t)1 << (38 - F.FA)), den));
+        const int64_t c2 = qs::sat32(qs::divd((Mq * es) * ((int64_t)1 << (38 - F.FA)), den));
         const int FWs = 26 + F.AB - F.WB;
+        const float KW = std::ldexp(1.0f, -FWs);
         for (int c = 0; c < 16; c++) {
           const int64_t sc = qs::sat32(qs::rne(c2 * q.h[k * 16 + c], F.FA));
           if (sc == 0) continue;
-          int slot = 0;
-          for (int j = 0; j < N1; j++) {
+          const float sW = (float)sc * KW;
+          for (int j = 0; j < N1; j++) {               // W' = sat(W + rnf(sW x), MW) (the mixed rule step)
             if (!q.M[(size_t)k * N1 + j]) continue;
-            const qs::Philox4 r = qs::philox4x32_10((uint32_t)((k << 16) | ((slot >> 3) << 4) | c), 4 * l + qs::kArrW, tl, th, k0(), k1());
             int32_t& w = q.W[((size_t)k * 16 + c) * N1 + j];
-            w = (int32_t)qs::sat(qs::sr(((int64_t)w << FWs) + sc * q.x[j], FWs, qs::half16(r, (slot >> 1) & 3, slot & 1)), F.MW);
-            slot++;
+            w = (int32_t)qs::sat(w + (int64_t)qs::rnf(sW * (float)q.x[j]), F.MW);
           }
         }
         if (!pruned) for (int j = 0; j < N1; j++) {

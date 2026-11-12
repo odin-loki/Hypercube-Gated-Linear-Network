@@ -6,7 +6,7 @@ Header-only C++17. It needs only the standard library, and `-pthread` for the th
 
 ```cpp
 hgln::Net<double> net;
-net.init(d, seed);                  // d inputs; Params() default: gate rate 0.2 -> 0.05 (suits ~8-input streams)
+net.init(d, seed);                  // d inputs; Params(): version 5.0, gate rate 0.2 -> 0.05 (suits ~8-input streams)
 net.init(d, seed, hgln::Params(0.02, 0.02));   // fixed gate rate 0.02 (suited 64-input classification)
 double yhat = net.predict(x);       // x: d values, scaled to about [-1, 1]
 net.learn(y);                       // exactly once after each predict(), same sample
@@ -18,13 +18,41 @@ double p = net.step(x, y);          // predict then learn
 | `T predict(const T* x)` | Forward pass. Stores what `learn` needs in the network's own `Work` |
 | `void learn(T y)` | One online update from the last `predict`. The one-off prune runs inside it at sample 512 |
 | `T infer(const T* x, Work<T>& w) const` | Forward pass into a caller-owned `Work`. Does not touch the model, so it is safe from many threads at once |
-| `const T* outputs()`, `T out()` | The 48 unit predictions and the mixture output from the last `predict` |
+| `const T* outputs()`, `T out()` | The 3 x `units` unit predictions and the mixture output from the last `predict` |
 | `bool pruned()`, `long t` | Whether the prune has run; samples learned |
 | `size_t model_bytes()` | Bytes held by the model |
 
-`Params`: `glr0`, `glr1`, `tau` (gate-rate schedule), `glob` (global-error share, 0.75), `mu` (rule step, 0.3) and `warm` (prune time, 512). `units` (units per layer: 16 by default, or 12 or 8, the cost/accuracy trade-off in `ALGORITHM.md` section 4b; anything else throws `std::invalid_argument`). `fanout` (default `false`; `true` makes layers 2 and 3 both read layer 1, so a sample has 2 sequential rule stages instead of 3; it re-adapts a little more slowly after a drift). `competence` (default `false`, version 4.3: the mixture is a plain average of the units; `true`, or `Params::v42()`, gives the 4.2 competence-weighted mixture exactly). The constants are documented in `docs/TGN_impl_spec.md` section 2.
+`Params` defaults are **version 5.0** (`Params()` = `Params::v5()`, `docs/ALGORITHM.md` section 8); `Params::v43()` and `Params::v42()` give versions 4.3 and 4.2 exactly. The constructor `Params(glr0, glr1)` sets the gate-rate schedule and keeps the other defaults. Fields, with the v5 value and the 4.3 value:
+
+| Field | v5 | 4.3 | Meaning |
+|---|---|---|---|
+| `glr0`, `glr1`, `tau` | 0.2, 0.05, 1000 | same | gate-rate schedule `glr1 + (glr0 - glr1) exp(-t / tau)`; use 0.02 / 0.02 for 64-input classification |
+| `glob` | 0.95 | 0.75 | share of each unit's error taken from the global mixture error |
+| `mu`, `warm` | 0.3, 512 | same | rule step (normalised LMS); time of the one-off prune |
+| `units` | 8 | 16 | units per layer: 8, 12 or 16 (anything else throws `std::invalid_argument`) |
+| `fanout` | `true` | `false` | layers 2 and 3 both read layer 1 (2 sequential rule stages per sample instead of 3) |
+| `latch` | 0.1 | 0 | > 0: cross-layer latch with that dead band on layers 2 and 3 |
+| `latch_credit` | 0.5 | 0 | > 0 with the latch: the held part of the gate gradient goes to the lower layer |
+| `gate_err` | 2 | 0 | error driving the gate steps: 0 the mixed error, 1 the unit's own error, 2 the global error |
+| `corners` | 6 | 16 | top-K corners per unit, 1 to 16: the rules use the K largest heatmap values renormalised, the gates learn through them |
+| `competence` | `false` | `false` | `true` (or `Params::v42()`): the 4.2 competence-weighted mixture |
+| `wbits`, `abits` | 16, 16 | | integer net only: bits of the state and of the activations, 12 to 16 |
+
+All of them work the same in the float `Net`, the integer `NetQ` (except `competence`, float only), on the CPU and on the GPU. The constants of the original algorithm are documented in `docs/TGN_impl_spec.md` section 2.
 
 `Work<T>`: per-sample scratch. Make one with `Work<T> w; w.init(net);`. One `Work` can serve any number of networks with the same `d`.
+
+## Integer network (`include/hgln_q.hpp`, version 5.0)
+
+```cpp
+#include "hgln_q.hpp"
+hgln::NetQ<float> q;                 // the caller's real type for x, y and predictions (float or double)
+q.init(d, seed);                     // Params::v5() by default: 8 units, fan-out, latch, top-6 corners, int16
+float yhat = q.predict(x);
+q.learn(y);
+```
+
+`NetQ<R>` has the same API as `Net<T>`: `predict`, `learn`, `step`, `infer(x, WorkQ&) const`, `out()`, `pruned()`, `t`, `model_bytes()`, and it works with `run_streams` and as `Classifier<R, NetQ<R>>`. State and activations are int16 (`Params::wbits` / `abits`, 12 to 16 bits), about half the memory of a float32 `Net`. The forward pass is integer arithmetic (int16 multiply-add dot products, a sigmoid table); learning is mixed: the per-unit control scalars stay integer (with three double-precision divisions), and the per-element updates of the gate weights, hyperplanes and rules are float32 on the int16 state, rounded back to the grid to nearest even. Everything is specified in `include/hgln_qspec.hpp` with a fixed operation order and no fused multiply-adds, so results are bit-identical on every CPU target (scalar, SSE2, AVX2, AVX-512 with or without VNNI, the plain-C++ fallback), on the GPU (`BankQ`) and to the research reference. Build with `-ffp-contract=off` (the Makefile and CMake builds do). It needs `Params::competence = false`; other out-of-range settings throw `std::invalid_argument`. `q.L[l]` has the inspection accessors `hyperplane`, `gate_weight`, `rule`, `active` and `activity`, returning the stored integers; `q.output(i)` is unit `i`'s last prediction.
 
 ## Classifier (one-vs-rest)
 
@@ -100,3 +128,5 @@ See [FORGE.md](FORGE.md) for the build. Both need the CMake build; the header-on
 | `image()`, `device_name()`, `shared_scratch()`, `scratch_bytes()` | What was chosen |
 
 Environment: `HGLN_GPU_IMAGE` (force an image), `HGLN_GPU_SCRATCH=shared|global`, `HGLN_GPU_THREADS`. A `Bank` is not thread-safe; use one per thread.
+
+`Bank<T>` runs the float `Net<T>`; **`BankQ<R>`** has the same calls for the integer `NetQ<R>` (its scratch is always in global memory). Both reproduce the CPU library **bit for bit** on the GPU, float64, float32 and int16, predictions and state (checked on an RTX 3090): the float kernel does the library's IEEE operations in the same order with the same `exp` (`hgln_exp`, `hgln_gate`), and the integer kernel is integer arithmetic.

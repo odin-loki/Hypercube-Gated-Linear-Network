@@ -6,6 +6,7 @@
 // Copyright (C) Odin Loch. GNU AGPL v3.0 or later (see LICENSE).
 #include "hgln_gpu.hpp"
 #include "hgln_dims.h"
+#include "hgln_q_host.h"
 #include "hgln_gpu_images.gen.hpp"   // generated at build time (cmake/hgln_gpu.cmake): hgln::gpu::images::table
 #include <forge/gpu/cuda.hpp>
 #include <cstdint>
@@ -66,10 +67,10 @@ template <class T> Bank<T>::~Bank() = default;
 template <class T> Bank<T>::Bank(Bank&&) noexcept = default;
 template <class T> Bank<T>& Bank<T>::operator=(Bank&&) noexcept = default;
 
-template <class T> bool Bank<T>::open(Api api, int ordinal, std::string* why, Options opt) {
-  close();
-  if (opt.threads < 1 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024");
-  constexpr int real = (int)sizeof(T);
+// Open device `ordinal` and load the first embedded image for this API and real type (8 / 4 bytes) that the device
+// accepts and that has kernel `kname`. Shared by Bank (hgln_run) and BankQ (hglnq_run).
+static bool load_image(Api api, int ordinal, int real, const char* kname, std::unique_ptr<fg::runtime>& rt, void*& mod_out,
+                       void*& fn_out, std::string& image, std::string* why) {
   const char* rname = real == 8 ? "float64" : "float32";
   std::vector<const images::image*> cand;
   const char* force = std::getenv("HGLN_GPU_IMAGE");
@@ -82,23 +83,29 @@ template <class T> bool Bank<T>::open(Api api, int ordinal, std::string* why, Op
   if (cand.empty())
     return fail(why, std::string(api_name(api)) + ": this build has no HGLN " + rname + " image" +
                          (force && *force ? std::string(" matching HGLN_GPU_IMAGE=") + force : std::string(" (clang lacked the GPU backend or lld at build time)")));
+  std::string e;
+  rt = fg::runtime::open(to_forge(api), &e, ordinal);
+  if (!rt) return fail(why, e);
+  std::string tried;
+  for (auto* c : cand) {
+    std::string me;
+    void* mod = rt->load_module(std::string_view(reinterpret_cast<const char*>(c->data), c->size), &me);
+    if (!mod) { tried += std::string(tried.empty() ? "" : "; ") + c->arch + ": " + me; continue; }
+    void* fn = rt->module_function(mod, kname);
+    void* tag = rt->module_function(mod, real == 8 ? "hgln_real_f64" : "hgln_real_f32");
+    if (!fn || !tag) { rt->unload_module(mod); tried += std::string(tried.empty() ? "" : "; ") + c->arch + ": no " + kname + " for " + rname; continue; }
+    mod_out = mod; fn_out = fn; image = c->arch; return true;
+  }
+  return fail(why, std::string(api_name(api)) + ": the device accepted no HGLN " + rname + " image (" + tried + ")");
+}
+
+template <class T> bool Bank<T>::open(Api api, int ordinal, std::string* why, Options opt) {
+  close();
+  if (opt.threads < 1 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024");
   auto im = std::make_unique<Impl>();
   im->api = api; im->opt = opt;
   try {
-    std::string e;
-    im->rt = fg::runtime::open(to_forge(api), &e, ordinal);
-    if (!im->rt) return fail(why, e);
-    std::string tried;
-    for (auto* c : cand) {
-      std::string me;
-      void* mod = im->rt->load_module(std::string_view(reinterpret_cast<const char*>(c->data), c->size), &me);
-      if (!mod) { tried += std::string(tried.empty() ? "" : "; ") + c->arch + ": " + me; continue; }
-      void* fn = im->rt->module_function(mod, "hgln_run");
-      void* tag = im->rt->module_function(mod, real == 8 ? "hgln_real_f64" : "hgln_real_f32");
-      if (!fn || !tag) { im->rt->unload_module(mod); tried += std::string(tried.empty() ? "" : "; ") + c->arch + ": no hgln_run for " + rname; continue; }
-      im->mod = mod; im->fn = fn; im->image = c->arch; break;
-    }
-    if (!im->mod) return fail(why, std::string(api_name(api)) + ": the device accepted no HGLN " + rname + " image (" + tried + ")");
+    if (!load_image(api, ordinal, (int)sizeof(T), "hgln_run", im->rt, im->mod, im->fn, im->image, why)) return false;
     im->max_smem = im->rt->max_dynamic_smem();
   } catch (const std::exception& ex) {
     return fail(why, ex.what());
@@ -121,7 +128,7 @@ template <class T> long Bank<T>::samples_seen(std::size_t n) const { return p_ &
 static bool same_params(const Params& a, const Params& b) {
   return a.glr0 == b.glr0 && a.glr1 == b.glr1 && a.tau == b.tau && a.glob == b.glob && a.mu == b.mu && a.warm == b.warm &&
          a.competence == b.competence && a.units == b.units && a.fanout == b.fanout &&
-         a.latch == b.latch && a.latch_credit == b.latch_credit && a.gate_err == b.gate_err;
+         a.latch == b.latch && a.latch_credit == b.latch_credit && a.gate_err == b.gate_err && a.corners == b.corners;
 }
 
 template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::string* why) {
@@ -129,8 +136,6 @@ template <class T> bool Bank<T>::upload(const std::vector<Net<T>>& nets, std::st
   Impl& I = *p_;
   if (nets.empty()) return fail(why, "no networks");
   const int d = nets[0].d;
-  if (nets[0].P.latch != 0 || nets[0].P.latch_credit != 0 || nets[0].P.gate_err != 0)
-    return fail(why, "the GPU kernel does not support the version 5 latch / latch credit / gate_err options yet");
   if (d < 1 || d > HG_MAXN) return fail(why, "d must be 1.." + std::to_string(HG_MAXN) + " (got " + std::to_string(d) + ")");
   for (auto& n : nets) {
     if (n.d != d) return fail(why, "all networks must have the same d");
@@ -200,8 +205,10 @@ template <class T> bool Bank<T>::run(const T* X, const T* Y, T* P, int samples, 
     std::uint64_t S = I.use_smem ? 0 : I.S;
     int Ts = samples, warm = I.prm.warm, competence = I.prm.competence ? 1 : 0, units = g.U, fanout = I.prm.fanout ? 1 : 0;
     T glr0 = (T)I.prm.glr0, glr1 = (T)I.prm.glr1, tau = (T)I.prm.tau, glob = (T)I.prm.glob, mu = (T)I.prm.mu;
+    T latch = (T)I.prm.latch, credit = (T)I.prm.latch_credit; int gate_err = I.prm.gate_err, corners = I.prm.corners;   // version 5.0 options
     // kernelParams in hgln_run's parameter order (cuda/hgln_kernel.h)
-    void* args[] = {&g, &I.H, &I.Q, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm, &competence, &units, &fanout};
+    void* args[] = {&g, &I.H, &I.Q, &I.p, &I.W, &I.M, &I.A, &I.m, &S, &I.X, &I.Y, &I.P, &I.tc, &Ts, &glr0, &glr1, &tau, &glob, &mu, &warm, &competence, &units, &fanout,
+                    &latch, &credit, &gate_err, &corners};
     const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.opt.threads, 1, 1};
     I.rt->launch_kernel(I.fn, grid, block, I.use_smem ? (unsigned)((std::size_t)g.scs * sizeof(T)) : 0u, args);
     if (P) I.rt->download(P, I.P, yb);
@@ -254,5 +261,162 @@ template <class T> bool Bank<T>::download(std::vector<Net<T>>& nets, std::string
 
 template class Bank<double>;
 template class Bank<float>;
+
+// ---- BankQ: the integer network (cuda/hgln_q_kernel.h), state in its dense int32 layout (cuda/hgln_q_dims.h)
+template <class R> struct BankQ<R>::Impl {
+  std::unique_ptr<fg::runtime> rt;
+  Options opt;
+  void* mod = nullptr; void* fn = nullptr;
+  std::string image;
+  int nets = 0, d = 0; Params prm; HgQDims g{}; HgQCfg C{};
+  std::vector<long> t;
+  std::uint64_t H = 0, p = 0, W = 0, M = 0, A = 0, S = 0, tc = 0, lut = 0, ex = 0;
+  std::uint64_t X = 0, Y = 0, P = 0; std::size_t capX = 0, capY = 0, capP = 0;
+  void free_state() {
+    if (!rt) return;
+    for (std::uint64_t* b : {&H, &p, &W, &M, &A, &S, &tc, &lut, &ex}) if (*b) { rt->device_free(*b); *b = 0; }
+    nets = 0; t.clear();
+  }
+  ~Impl() {
+    try {
+      free_state();
+      if (rt) for (std::uint64_t* b : {&X, &Y, &P}) if (*b) rt->device_free(*b);
+      if (rt && mod) rt->unload_module(mod);
+    } catch (...) {}
+  }
+  void grow(std::uint64_t& b, std::size_t& cap, std::size_t bytes) {
+    if (bytes <= cap) return;
+    if (b) rt->device_free(b);
+    b = 0; cap = 0; b = rt->device_alloc(bytes); cap = bytes;
+  }
+};
+
+template <class R> BankQ<R>::BankQ() = default;
+template <class R> BankQ<R>::~BankQ() = default;
+template <class R> BankQ<R>::BankQ(BankQ&&) noexcept = default;
+template <class R> BankQ<R>& BankQ<R>::operator=(BankQ&&) noexcept = default;
+template <class R> bool BankQ<R>::is_open() const { return p_ != nullptr; }
+template <class R> void BankQ<R>::close() { p_.reset(); }
+template <class R> std::string BankQ<R>::device_name() const { return p_ ? p_->rt->device_name() : std::string(); }
+template <class R> std::string BankQ<R>::image() const { return p_ ? p_->image : std::string(); }
+template <class R> std::size_t BankQ<R>::size() const { return p_ ? (std::size_t)p_->nets : 0; }
+template <class R> int BankQ<R>::d() const { return p_ ? p_->d : 0; }
+template <class R> std::size_t BankQ<R>::scratch_bytes() const { return p_ && p_->nets ? (std::size_t)p_->g.scs * 8 : 0; }
+template <class R> long BankQ<R>::samples_seen(std::size_t n) const { return p_ && n < p_->t.size() ? p_->t[n] : 0; }
+
+template <class R> bool BankQ<R>::open(Api api, int ordinal, std::string* why, Options opt) {
+  close();
+  if (opt.threads < 1 || opt.threads > 1024) return fail(why, "threads per block must be 1..1024");
+  auto im = std::make_unique<Impl>();
+  im->opt = opt;
+  try {
+    if (!load_image(api, ordinal, (int)sizeof(R), "hglnq_run", im->rt, im->mod, im->fn, im->image, why)) return false;
+  } catch (const std::exception& ex) {
+    return fail(why, ex.what());
+  }
+  p_ = std::move(im);
+  return true;
+}
+
+static bool same_params_q(const Params& a, const Params& b) {
+  return same_params(a, b) && a.wbits == b.wbits && a.abits == b.abits;
+}
+
+template <class R> bool BankQ<R>::upload(const std::vector<NetQ<R>>& nets, std::string* why) {
+  if (!p_) return fail(why, "bank is not open");
+  Impl& I = *p_;
+  if (nets.empty()) return fail(why, "no networks");
+  const int d = nets[0].d;
+  if (d < 1 || d > HG_MAXN) return fail(why, "d must be 1.." + std::to_string(HG_MAXN) + " (got " + std::to_string(d) + ")");
+  for (auto& n : nets) {
+    if (n.d != d) return fail(why, "all networks must have the same d");
+    if (!same_params_q(n.P, nets[0].P)) return fail(why, "all networks must have the same Params (the kernel takes them once)");
+    if (n.units() != nets[0].P.units) return fail(why, "a network's layers do not match its Params (not initialised?)");
+    // the kernel derives the prune from t (it prunes once, at t == the prune time): the network must agree
+    if (n.pruned() != (n.t >= hg_prune_time(n.P.warm)))
+      return fail(why, "a network's prune state does not match its sample count and Params::warm (was warm changed after the prune?)");
+  }
+  const HgQDims g = hq_dims(d, nets[0].P.units);
+  HqHostState st; hq_pack(g, nets, st, false);
+  const std::size_t N = nets.size();
+  const std::vector<short> lut = hq_sig_table(); const std::vector<long long> ex = hq_exp_table();
+  try {
+    I.free_state();
+    auto put = [&](std::uint64_t& b, const void* src, std::size_t bytes) { b = I.rt->device_alloc(bytes); I.rt->upload(b, src, bytes); };
+    put(I.H, st.H.data(), st.H.size() * 4); put(I.p, st.p.data(), st.p.size() * 4); put(I.W, st.W.data(), st.W.size() * 4);
+    put(I.M, st.M.data(), st.M.size() * 4); put(I.A, st.A.data(), st.A.size() * 4); put(I.tc, st.t.data(), st.t.size() * sizeof(long));
+    put(I.lut, lut.data(), lut.size() * sizeof(short)); put(I.ex, ex.data(), ex.size() * sizeof(long long));
+    I.S = I.rt->device_alloc(N * (std::size_t)g.scs * 8);
+    I.g = g; I.C = hq_cfg(nets[0]); I.d = d; I.prm = nets[0].P; I.nets = (int)N; I.t = st.t;
+  } catch (const std::exception& e) {
+    I.free_state();
+    return fail(why, e.what());
+  }
+  return true;
+}
+
+template <class R> bool BankQ<R>::run(const R* X, const R* Y, R* P, int samples, std::string* why) {
+  if (!p_) return fail(why, "bank is not open");
+  Impl& I = *p_;
+  if (!I.nets) return fail(why, "no networks uploaded");
+  if (samples < 0) return fail(why, "negative sample count");
+  if (samples == 0) return true;
+  if (!X || !Y) return fail(why, "X and Y are required (every sample is predicted and then learned)");
+  try {
+    const std::size_t xb = (std::size_t)samples * I.d * sizeof(R), yb = (std::size_t)I.nets * samples * sizeof(R);
+    I.grow(I.X, I.capX, xb); I.grow(I.Y, I.capY, yb); I.grow(I.P, I.capP, yb);
+    I.rt->upload(I.X, X, xb); I.rt->upload(I.Y, Y, yb);
+    HgQDims g = I.g; HgQCfg C = I.C; int Ts = samples;
+    // kernelParams in hglnq_run's parameter order (cuda/hgln_q_kernel.h)
+    void* args[] = {&g, &C, &I.H, &I.p, &I.W, &I.M, &I.A, &I.S, &I.lut, &I.ex, &I.X, &I.Y, &I.P, &I.tc, &Ts};
+    const unsigned grid[3] = {(unsigned)I.nets, 1, 1}, block[3] = {(unsigned)I.opt.threads, 1, 1};
+    I.rt->launch_kernel(I.fn, grid, block, 0u, args);
+    if (P) I.rt->download(P, I.P, yb);
+    else I.rt->wait();
+    for (auto& t : I.t) t += samples;
+  } catch (const std::exception& ex) {
+    return fail(why, ex.what());
+  }
+  return true;
+}
+
+template <class R> bool BankQ<R>::run(const std::vector<R>& X, const std::vector<R>& Y, std::vector<R>& P, int samples, std::string* why) {
+  if (!p_ || !p_->nets) return run(nullptr, nullptr, nullptr, samples, why);
+  if (X.size() < (std::size_t)samples * p_->d || Y.size() < (std::size_t)samples * p_->nets) return fail(why, "X or Y is too short");
+  P.resize((std::size_t)samples * p_->nets);
+  return run(X.data(), Y.data(), P.data(), samples, why);
+}
+
+template <class R> bool BankQ<R>::download(std::vector<NetQ<R>>& nets, std::string* why) const {
+  if (!p_) return fail(why, "bank is not open");
+  const Impl& I = *p_;
+  if (!I.nets) return fail(why, "no networks uploaded");
+  const HgQDims& g = I.g; const std::size_t N = (std::size_t)I.nets;
+  HqHostState st;
+  st.H.resize(N * g.Hs); st.p.resize(N * g.ps); st.W.resize(N * g.Ws); st.M.resize(N * g.Ms); st.A.resize(N * g.Ms); st.t.resize(N);
+  try {
+    I.rt->download(st.H.data(), I.H, st.H.size() * 4); I.rt->download(st.p.data(), I.p, st.p.size() * 4);
+    I.rt->download(st.W.data(), I.W, st.W.size() * 4); I.rt->download(st.M.data(), I.M, st.M.size() * 4);
+    I.rt->download(st.A.data(), I.A, st.A.size() * 4); I.rt->download(st.t.data(), I.tc, st.t.size() * sizeof(long));
+  } catch (const std::exception& ex) {
+    return fail(why, ex.what());
+  }
+  try {
+    const std::size_t old = nets.size();
+    if (old != N) nets.resize(N);
+    for (std::size_t n = 0; n < N; n++) {
+      auto& net = nets[n];
+      // shapes and formats; an existing network with the same d and Params keeps its own (seed included)
+      if (n >= old || net.d != I.d || !same_params_q(net.P, I.prm)) net.init(I.d, n < old ? net.seed : 1, I.prm);
+      hq_unpack(g, st, n, net);                              // the state is overwritten
+    }
+  } catch (const std::exception& ex) {
+    return fail(why, ex.what());
+  }
+  return true;
+}
+
+template class BankQ<double>;
+template class BankQ<float>;
 
 } // namespace hgln::gpu

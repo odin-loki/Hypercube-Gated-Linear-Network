@@ -39,6 +39,8 @@ static int trace(void) { return getenv("MOCK_TRACE") != NULL; }
 
 int hgln_emu_launch_f64(unsigned grid, unsigned block, unsigned smem, void** args);
 int hgln_emu_launch_f32(unsigned grid, unsigned block, unsigned smem, void** args);
+int hglnq_emu_launch_f64(unsigned grid, unsigned block, unsigned smem, void** args);
+int hglnq_emu_launch_f32(unsigned grid, unsigned block, unsigned smem, void** args);
 
 /* ---- module images */
 typedef struct { int hgln, real; char arch[16]; } module;           /* real: 8 float64, 4 float32, 0 not HGLN */
@@ -79,7 +81,7 @@ MOCK_API int N_(cuModuleLoadData, hipModuleLoadData)(void** m, const void* img) 
 MOCK_API int N_(cuModuleUnload, hipModuleUnload)(void* m) { free(m); return 0; }
 MOCK_API int N_(cuModuleGetFunction, hipModuleGetFunction)(void** f, void* m, const char* name) {
     module* mod = (module*)m;
-    if (mod->hgln && strcmp(name, "hgln_run") && strcmp(name, mod->real == 8 ? "hgln_real_f64" : "hgln_real_f32")) return 500;   /* NOT_FOUND */
+    if (mod->hgln && strcmp(name, "hgln_run") && strcmp(name, "hglnq_run") && strcmp(name, mod->real == 8 ? "hgln_real_f64" : "hgln_real_f32")) return 500;   /* NOT_FOUND */
     function* fn = calloc(1, sizeof(function)); snprintf(fn->name, sizeof fn->name, "%s", name); fn->mod = mod; fn->max_dyn = 48 << 10;
     *f = fn; return 0;   /* (leaked, like the handles of a real driver until the module is unloaded) */
 }
@@ -140,6 +142,11 @@ MOCK_API int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, uns
     if (trace()) fprintf(stderr, "mock: launch %s grid %u block %u smem %u (limit %u)\n", fn->name, gx, bx, sh, limit);
     if (!fn->mod->hgln) return 1;                                   /* FORGE's own kernels are not emulated here */
     if (extra || gy != 1 || gz != 1 || by != 1 || bz != 1 || bx * by * bz > 1024 || sh > limit) return 1;
+    if (!strcmp(fn->name, "hglnq_run")) {                          /* the integer kernel */
+        g_last.launches++; g_last.grid = gx; g_last.block = bx; g_last.smem = sh; g_last.real = (unsigned)fn->mod->real;
+        memcpy(g_last.arch, fn->mod->arch, 16);
+        return fn->mod->real == 8 ? hglnq_emu_launch_f64(gx, bx, sh, args) : hglnq_emu_launch_f32(gx, bx, sh, args);
+    }
     if (strcmp(fn->name, "hgln_run")) return 0;                     /* the empty marker kernel */
     g_last.launches++; g_last.grid = gx; g_last.block = bx; g_last.smem = sh; g_last.real = (unsigned)fn->mod->real;
     memcpy(g_last.arch, fn->mod->arch, 16);

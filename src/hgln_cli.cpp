@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // hgln_cli.cpp - command-line tool for HGLN. Copyright (C) Odin Loch. Licensed under the GNU AGPL v3.0 or later (see LICENSE).
-//   hgln_cli parity in.bin out.bin [glr0 glr1 [competence [units [fanout [latch latch_credit gate_err glob]]]]]
-//                                                          replay a stream from given initial hyperplanes (parity vs NumPy)
-//   Built with -DUSE_INT (binary hgln_q): the version 5.0 integer net hgln::NetQ<float> with Params::v5() (8 units by
-//   default); bench and classify as below, and
+//   hgln_cli parity in.bin out.bin [glr0 glr1 [competence [units [fanout [latch latch_credit gate_err glob [corners]]]]]]
+//                                                          replay a stream from given initial hyperplanes (parity vs NumPy);
+//                                                          options not given are the 4.3 values (Params::v43)
+//   Built with -DUSE_INT (binary hgln_q): the version 5.0 integer net hgln::NetQ<float>; bench and classify as below, and
 //   hgln_q parity d N [units [bits [seed]]]                 library vs the research reference of the integer
 //                                                          specification (research/alg/hgln_var.hpp): bit-identical?
 //   hgln_cli bench d nets nsamples [threads [units]]       speed: single thread vs a matched 3x16 MLP, then all nets in
@@ -11,7 +11,7 @@
 //   hgln_cli classify train.csv test.csv passes [threads [units]]
 //                                                          one-vs-rest classifier, heads trained in parallel;
 //                                                          CSV rows: label,f1..fd (features scaled to about [-1,1])
-//   units: units per layer, 8, 12 or 16 (default 16; Params::units)
+//   bench and classify use the defaults (Params(): version 5.0); units: units per layer, 8, 12 or 16 (default 8)
 //   hgln_cli info                                          build and CPU: SIMD kernel table in use (FORGE build)
 #include "hgln.hpp"
 #ifdef USE_INT
@@ -112,11 +112,12 @@ int main(int argc, char** argv) {
   if (mode == "parity" && argc >= 4) {            // in.bin: int32 d, int32 N, H0,H1,H2 (doubles, units x 4 x (d+1) each), X (N*d), y (N)
     FILE* f = fopen(argv[2], "rb"); if (!f) { perror("in.bin"); return 1; }
     int32_t d, N; if (fread(&d, 4, 1, f) != 1 || fread(&N, 4, 1, f) != 1) return 1;
-    Params P(argc > 5 ? atof(argv[4]) : 0.2, argc > 5 ? atof(argv[5]) : 0.05);
+    Params P = Params::v43(argc > 5 ? atof(argv[4]) : 0.2, argc > 5 ? atof(argv[5]) : 0.05);
     P.competence = argc > 6 && atoi(argv[6]) != 0;
     P.units = argc > 7 ? atoi(argv[7]) : 16;
     P.fanout = argc > 8 && atoi(argv[8]) != 0;
     if (argc > 12) { P.latch = atof(argv[9]); P.latch_credit = atof(argv[10]); P.gate_err = atoi(argv[11]); P.glob = atof(argv[12]); }
+    if (argc > 13) P.corners = atoi(argv[13]);
     if (!valid_units(P.units)) { fprintf(stderr, "units must be 8, 12 or 16\n"); return 1; }
     Net<real> g; g.init(d, 1, P);
     for (int l = 0; l < 3; l++) { std::vector<double> buf((size_t)g.L[l].U * 4 * g.L[l].D);
@@ -188,9 +189,9 @@ int main(int argc, char** argv) {
   fprintf(stderr, "usage: hgln_q parity d N [units [bits [seed]]] | bench d nets nsamples [threads [units]] |\n"
                   "       classify train.csv test.csv passes [threads [units]] | info      (Params::v5(); units 8, 12 or 16; default 8)\n");
 #else
-  fprintf(stderr, "usage: hgln_cli parity in.bin out.bin [glr0 glr1 [competence [units [fanout [latch credit gate_err glob]]]]] |\n"
+  fprintf(stderr, "usage: hgln_cli parity in.bin out.bin [glr0 glr1 [competence [units [fanout [latch credit gate_err glob [corners]]]]]] |\n"
                   "       bench d nets nsamples [threads [units]] | classify train.csv test.csv passes [threads [units]] | info\n"
-                  "       (units per layer: 8, 12 or 16; default 16)\n");
+                  "       (bench / classify: Params() = version 5.0; units per layer 8, 12 or 16, default 8)\n");
 #endif
   return 1;
 }

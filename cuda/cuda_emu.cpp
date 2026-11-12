@@ -9,7 +9,9 @@
 //     far = 1: start layer 1's hyperplanes at |H|^2 just under 1e6 and layer 2's just over 1e-6, so the conditional
 //              layer renormalisation (norm out of range) runs; T > 4096 also crosses the periodic renormalisation
 //     units = Params::units (8, 12 or 16; default 16); fanout = 1: Params::fanout (layer 3 reads layer 1)
-// float64 must match the C++ library exactly (0 difference), predictions and the full state including |H|^2.
+//     v5 = version 5.0 options: 1 the v5 defaults (latch 0.1, latch credit 0.5, gate_err 2, glob 0.95, top-6 corners); 2 latch 0.1
+//          without credit, gate_err 1; 3 gate_err 2 without the latch; 4 = 1 with all 16 corners; 5 top-8 corners only; 0 (default) none (4.3)
+// float64 and float32 must match the C++ library exactly (0 difference), predictions and the full state including |H|^2.
 #define HGLN_EMULATE
 #include <barrier>
 #include <thread>
@@ -32,7 +34,8 @@ static thread_local double* hg_smem_v = nullptr;
 using hgln::Net;
 int main(int argc, char** argv) {
   int d = argc > 1 ? atoi(argv[1]) : 8, nets = argc > 2 ? atoi(argv[2]) : 3, T = argc > 3 ? atoi(argv[3]) : 1500, NT = argc > 4 ? atoi(argv[4]) : 8, SH = argc > 5 ? atoi(argv[5]) : 0,
-      CM = argc > 6 ? atoi(argv[6]) : 0, FAR = argc > 7 ? atoi(argv[7]) : 0, UN = argc > 8 ? atoi(argv[8]) : 16, FO = argc > 9 ? atoi(argv[9]) : 0;
+      CM = argc > 6 ? atoi(argv[6]) : 0, FAR = argc > 7 ? atoi(argv[7]) : 0, UN = argc > 8 ? atoi(argv[8]) : 16, FO = argc > 9 ? atoi(argv[9]) : 0,
+      V5 = argc > 10 ? atoi(argv[10]) : 0;
   if (!hg_valid_units(UN) || d < 1 || d > HG_MAXN) { fprintf(stderr, "cuda_emu: need units 8, 12 or 16 and 1 <= d <= %d\n", HG_MAXN); return 2; }
   HgDims g = hg_dims(d, UN); hgln::Rng rng(12345);
   std::vector<hreal> X((size_t)T * d), Y((size_t)nets * T);
@@ -41,7 +44,12 @@ int main(int argc, char** argv) {
     hreal y = std::sin(3 * X[(size_t)t * d]) * std::cos(2 * X[(size_t)t * d + 1]) + 0.5 * X[(size_t)t * d + 2 % d] * X[(size_t)t * d + 3 % d];
     for (int n = 0; n < nets; n++) Y[(size_t)n * T + t] = n % 3 == 0 ? y : (n % 3 == 1 ? -y : 0.5 * y);   // different targets per network
   }
-  hgln::Params prm(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05); prm.competence = CM != 0; prm.units = UN; prm.fanout = FO != 0;
+  hgln::Params prm = hgln::Params::v43(d > 16 ? 0.02 : 0.2, d > 16 ? 0.02 : 0.05); prm.competence = CM != 0; prm.units = UN; prm.fanout = FO != 0;
+  if (V5 == 1) { prm.latch = 0.1; prm.latch_credit = 0.5; prm.gate_err = 2; prm.glob = 0.95; prm.corners = 6; }
+  else if (V5 == 2) { prm.latch = 0.1; prm.gate_err = 1; }
+  else if (V5 == 3) prm.gate_err = 2;
+  else if (V5 == 4) { prm.latch = 0.1; prm.latch_credit = 0.5; prm.gate_err = 2; prm.glob = 0.95; }   // v5 without top-K
+  else if (V5 == 5) prm.corners = 8;   // 4.3 with top-8 corners
   std::vector<Net<hreal>> init(nets), ref(nets);
   for (int n = 0; n < nets; n++) {
     init[n].init(d, 7 + n, prm);
@@ -63,7 +71,7 @@ int main(int argc, char** argv) {
       hg_tid_v = k; hg_nt_v = NT; hg_bid_v = b; hg_bar = &bar; hg_smem_v = smem.data();
       hgln_run(g, st.H.data(), st.Q.data(), st.p.data(), st.W.data(), st.M.data(), st.A.data(), st.m.data(), SH ? nullptr : st.scratch.data(),
                X.data(), Y.data(), P.data(), st.t.data(), T, (hreal)prm.glr0, (hreal)prm.glr1, (hreal)prm.tau, (hreal)prm.glob, (hreal)prm.mu, prm.warm,
-               st.competence, st.units, st.fanout); });
+               st.competence, st.units, st.fanout, st.latch, st.credit, st.gate_err, st.corners); });
     for (auto& t : th) t.join();
   }
   double worstP = 0, worstS = 0;
@@ -79,7 +87,7 @@ int main(int argc, char** argv) {
   }
   char farmsg[64] = "";
   if (FAR) snprintf(farmsg, sizeof farmsg, ", far: %d/%d layers renormalised", renormed, 2 * nets);
-  printf("cuda_emu d=%d nets=%d T=%d threads=%d real=%s scratch=%s (%ld bytes/block) competence=%d units=%d %s%s: max |prediction diff| = %.3g, max |state diff| = %.3g\n",
-         d, nets, T, NT, sizeof(hreal) == 4 ? "float32" : "float64", SH ? "shared" : "global", (long)(g.scs * sizeof(hreal)), CM, UN, FO ? "fanout" : "chain", farmsg, worstP, worstS);
-  return (worstP <= (sizeof(hreal) == 4 ? 1e-4 : 0) && worstS <= (sizeof(hreal) == 4 ? 1e-3 : 0)) ? 0 : 1;
+  printf("cuda_emu d=%d nets=%d T=%d threads=%d real=%s scratch=%s (%ld bytes/block) competence=%d units=%d %s%s v5=%d: max |prediction diff| = %.3g, max |state diff| = %.3g\n",
+         d, nets, T, NT, sizeof(hreal) == 4 ? "float32" : "float64", SH ? "shared" : "global", (long)(g.scs * sizeof(hreal)), CM, UN, FO ? "fanout" : "chain", farmsg, V5, worstP, worstS);
+  return worstP == 0 && worstS == 0 ? 0 : 1;
 }
